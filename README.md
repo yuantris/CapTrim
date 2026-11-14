@@ -4,7 +4,7 @@ Android 与 HarmonyOS 共用的视频剪辑核心 SDK。**Rust 描述时间线�
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI / 鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖「剪映基础剪辑」：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-当前状态：**P0 骨架、P1 调度内核与鸿蒙硬解上屏已跑通**（见[验证状态](#验证状态)）。预览的帧计划、时钟与状态机已实现并有测试覆盖；鸿蒙侧已用 AVCodec 硬解把帧真正画到 XComponent 上（真机实测），GPU 合成器仍未实现。
+当前状态：**P0 骨架、P1 调度内核与鸿蒙硬解 + GL 合成上屏已跑通**（见[验证状态](#验证状态)）。预览的帧计划、时钟与状态机已实现并有测试覆盖；鸿蒙侧已用 AVCodec 硬解把帧送进 GPU 纹理，再由 GLES 按 transform 合成到 XComponent（真机实测，含缩放/平移/旋转）。
 
 ---
 
@@ -108,7 +108,7 @@ cd platforms/android && ./gradlew :captrim:assembleRelease
 
 **5. 鸿蒙真机自检**
 
-`platforms/ohos/entry` 是个可直接装到手机上的 App：打开即在设备上跑 9 项检查，把每一行结果写进 hilog。
+`platforms/ohos/entry` 是个可直接装到手机上的 App：打开即在设备上跑 9 项检查，把每一行结果写进 hilog。下半部分是真机预览：`播放 / 回到 0s / 跳到 4s` 走时间线与源切换，`缩放 + 平移` 通过 `set_transform` 改草稿，验证 `engine → plan → C ABI → GL 合成` 整条链路都按 `Transform` 契约工作。
 
 ```bash
 export DEVECO_HOME="/path/to/DevEco Studio"   # 未设置时按 hdc 位置推断
@@ -141,6 +141,7 @@ hdc shell "hilog -x" | grep CapTrimDemo      # 看 check PASS/FAIL
 | `set_speed` | `clip_id` · `speed{num,den}` |
 | `set_volume` | `clip_id` · `volume` |
 | `set_out_point` | `clip_id` · `out_us` |
+| `set_transform` | `clip_id` · `transform{scale,dx,dy,rotation_deg}` |
 | `set_canvas` | `width` · `height` · `frame_rate{num,den}` |
 
 ### 两端用法
@@ -213,25 +214,38 @@ when (step.kind) {
 - 合成器：按 `z` 从小到大画，`transform` / `opacity` / `effects` 直接消费；`kind` 区分视频、字幕、贴纸，决定走解码器还是文字引擎。
 - 音频：`AudioMix` 是全轨混合后的输入，先统一重采样到 48kHz/立体声/f32 再叠加；播完后把音频位置回灌给 `syncAudio`。
 
-### 鸿蒙侧实现：渲染线程 + AVCodec
+`Transform` 的单位是跨端契约，写在 `crates/captrim-core/src/model.rs`：`scale` 是**相对「适配画布后的尺寸」**的倍数（1.0 = 不裁切地填满，与分辨率无关），`dx`/`dy` 是画布归一化平移（1.0 = 一整个画布宽/高，+dy 向下），`rotation_deg` 绕层中心顺时针。预览与导出必须用同一套，否则「预览所见」和「文件所得」会不一致。
 
-`platforms/ohos/captrim/src/main/cpp/presenter.{h,cpp}` 是 P1 的平台半边，做法和 Android 将要用的一致：
+### 鸿蒙侧实现：渲染线程 + AVCodec + GL 合成
+
+`platforms/ohos/captrim/src/main/cpp/` 是 P1 的平台半边，做法和 Android 将要用的一致：
+
+- `presenter.{h,cpp}`：解码器生命周期、demuxer、喂帧节奏、渲染线程、命令队列
+- `gl_compositor.{h,cpp}`：EGL 上下文、OES 纹理、按 transform 画 quad
 
 ```
-ArkTS 页面                        native 渲染线程                 解码器回调线程
+ArkTS 页面                        native 渲染线程                  解码器回调线程
 presentStart(preview, now) ───▶ LoopMain ──┐
 presentControl(playing,seek) ─▶ 命令队列 ──┤
                                           ├─ step_frame() → PRESENT
-                                          ├─ RenderAt(source_us) ─────▶ 喂帧/Stop-Start 定位
-                                          │        ▲ reached / eos     ◀── 上屏 / 丢帧
+                                          ├─ ComposePlan() ──────────▶ eglSwapBuffers
+                                          │    ▲ UpdateSurfaceImage          ▲
+                                          ├─ RequestFrame(source_us) ──▶ 喂帧 / Stop-Start 定位
+                                          │    ▲ reached / eos               │
+                                          │                              RenderOutputBuffer
+                                          │                                    │
+                                          └──────────── OH_NativeImage ◀───────┘
 presentStatus() ◀── 快照(非阻塞) ──────────┘
 ```
 
-三条约束决定了这个形状：
+关键点：**解码器不直接写 XComponent**。它写到 `OH_NativeImage`（鸿蒙的 SurfaceTexture），帧变成 GPU 纹理，再由合成器按计划画成 quad。直出更快，但只能画一个全屏画面 —— 一旦有缩放、位移、第二个图层，就必须合成。
+
+四条约束决定了这个形状：
 
 1. **`present` 会阻塞**。它要等解码器把帧交给 surface（最多 ~120 ms）。早期版本在 ArkUI 的 `setInterval` 里直接调，系统判定主线程无响应并杀掉进程（`THREAD_BLOCK_6S`, `signal:9`）。现在循环跑在自己的线程，页面只发命令 + 读快照。
 2. **预览会话只有一个所有者**。`seek` / `setPlaying` 若从 UI 线程直接打进去，会和正在解码的循环抢时钟锚点。命令通过队列交给渲染线程执行（`PresenterControl` 只是入队 + 唤醒条件变量）。
 3. **不能跨 codec 调用持锁**。`OH_VideoDecoder_Flush/Stop` 会等回调线程返回，而回调要拿同一把锁去 signal —— 死锁后循环彻底静默。现在 `lock` 只保护状态与条件变量，`demux_lock` 单独保护 demuxer。
+4. **surface 队列很浅，先取帧再等帧**。`NativeImage` 只缓冲两三帧，若先在 `RenderAt` 里等「目标帧」，队列会一直满着，解码器被反压停住，而它要产的正是那个目标帧 —— 互相等待。实测表现为 8 秒素材只上屏 51 帧；改成「先 `ComposePlan` 排空队列，再请求下一帧」后恢复到 460+ 帧。
 
 ## 七、已完成 / 未完成
 
@@ -245,12 +259,12 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 - **P1 调度内核**：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
 - 鸿蒙真机自检 App：9 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘
-- **鸿蒙硬解上屏**：`presenter` 用 AVCodec Surface 模式直出 XComponent，native 渲染线程 + 命令队列，源切换/跳转/暂停落点已真机验证
+- **鸿蒙硬解 + GL 合成上屏**：解码器输出到 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按计划把每个视频层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列，源切换/跳转/暂停落点/transform 已真机验证
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包
 
 **未完成（按优先级）**
 
-- P1 收尾：GPU 合成器（多图层叠加；当前只画最底层视频，`layer_overflow` 如实上报）
+- P1 收尾：多源同时解码（画中画需要第二个 codec + demuxer，属于 core 的调度问题；合成器本身已按多图层写成循环，当前每个 presenter 只有一个 image 源）
 - P2：滤镜/转场/画中画/字幕渲染、音频混合、**重编码导出**（`ExportPlan`/`Segment` 抽象）
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
@@ -263,10 +277,10 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 89 通过 | core 单元 55 + P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16 |
+| `cargo test --workspace` | ✅ 91 通过 | core 单元 57 + P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 含 `--features ffmpeg`，`-D warnings` 可用 |
-| `check-native-abi.sh` | ✅ 通过 | 27 个 C 函数、30 个 NAPI 函数，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入 |
+| `check-native-abi.sh` | ✅ 通过 | 27 个 C 函数、31 个 NAPI 函数，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
 | `libcaptrim.so` 交叉链接 | ✅ 通过 | ELF64 / AArch64 / DYN，27 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so` |
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK；依赖仅 `libcaptrim.so` / `libace_napi.z.so` / `libc.so` |
@@ -274,7 +288,7 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 | 鸿蒙构建脚本端到端 | ✅ 通过 | Windows + Git Bash 实测产出、暂存、`hdc install` 一条命令 |
 | **鸿蒙 HAP 打包** | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内仅 `libcaptrim.so` + `libcaptrim_napi.so`，无 `libc++_shared.so` |
 | **鸿蒙真机自检** | ✅ 9/9 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a，详见下节 |
-| **鸿蒙硬解上屏** | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（壁钟 8.07 s），暂停落点与拖动位置误差 ≤1 帧 |
+| **鸿蒙硬解 + GL 合成** | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（468 次合成，解码 458 帧仅 7 帧未上屏）；暂停落点误差 ≤1 帧；缩放/平移/旋转经 `set_transform` 全链路生效（截图对比） |
 | **Android AAR 编译** | ⚠️ 未验证 | 本机有 SDK/NDK/Gradle 但无 Android 真机；Kotlin 与 JNI 签名（含 P1 新增 11 个）已逐一手工核对 |
 | **FFmpeg 实际编译** | ⚠️ 未验证 | 本机无 FFmpeg 源码树；FFmpeg 官方要求 make + 宿主 C 编译器 |
 
@@ -327,3 +341,7 @@ CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workf
 20. **暂停要主动回跳一次**。解码器总比播放头快一个喂帧前瞻，用户在「播放中途」按下暂停时，surface 上还停着领先的那一帧且之后再也不会有新帧（暂停时 `step` 返回 idle）。暂停时按当前播放位置做一次 seek，才能让画面落在用户按下的那一帧。
 21. **present 必须离开 UI 线程**。ArkUI 的 `setInterval` 里同步调阻塞的 `present`，主线程被卡住，系统直接杀进程（`THREAD_BLOCK_6S` + `signal:9`，日志里没有任何崩溃栈，很容易误判成「解码崩了」）。判断依据是 `pidof` 点击前后是否一致——进程消失才是被杀，进程还在就是逻辑问题。
 22. **hilog 的 `%s` 会被打码成 `<private>`**，诊断字符串参数需要用 `%{public}s`；但 `%{public}s` 对 `OH_LOG_Print` 的字符串参数在部分版本会输出乱码，最稳的办法是用 `OH_AVFormat_DumpInfo` 直接打印整份结构体文本。
+23. **surface 模式下 `FreeOutputBuffer` 只归还、不渲染**。把 `RenderOutputBuffer` 改成 `FreeOutputBuffer` 想「不直接上屏、改成自己合成」是错的：解码器照样出帧（`output #1 pts=0` 照常打印），但帧根本进不了 `NativeImage` 队列，表现为 `UpdateSurfaceImage` 一直返回 `40601000`。要自己合成，仍然用 `RenderOutputBuffer`——只是把 `SetSurface` 的目标从 XComponent 换成 `OH_NativeImage_AcquireNativeWindow()`。
+24. **`OH_NativeImage` 的队列很浅，等帧会把自己等死**。先在 `RenderAt` 里等「目标帧」再去合成，队列始终满着→解码器被反压→它产不出那个目标帧。实测：8 秒素材只上屏 51 帧。改成「每次循环先 `UpdateSurfaceImage` 排空队列，再请求下一帧」后恢复到 207 帧。同理，用 `OnFrameAvailable` 回调做门限也不行——回调按队列刷新触发，中间的帧全被漏掉（25 帧）。
+25. **`UpdateSurfaceImage` 没有 buffer 时是立即返回，不是阻塞**。返回 `NATIVE_ERROR_NO_BUFFER`（`40601000`）就能当作「这轮没新帧」，所以可以每帧无条件调，不必维护 frame-available 状态机。
+26. **`OH_AVFormat_GetStringValue` 在本机取不到 track mime**（返回非空指针但内容是乱码），要靠 `OH_AVFormat_DumpInfo` 的文本兜底解析，见 `FormatString()`。

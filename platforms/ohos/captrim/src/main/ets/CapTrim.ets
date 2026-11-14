@@ -24,6 +24,7 @@ import {
   previewSyncAudio,
   previewStats,
   presentCreate,
+  presentResize,
   presentStart,
   presentStop,
   presentControl,
@@ -433,13 +434,29 @@ export class CapTrimPresenter {
     this.handle = handle;
   }
 
-  /** Returns null when the surface is not ready yet; retry on the next callback. */
-  static create(editor: CapTrim, surfaceId: string): CapTrimPresenter | null {
-    const result: HandleResult = presentCreate(editor.nativeHandle(), surfaceId);
+  /**
+   * Returns null when the surface is not ready yet; retry on the next callback.
+   * `width` / `height` are the surface's size in physical pixels -- the canvas
+   * that every layer's scale and offset are relative to, so they must be real
+   * values rather than zeros.
+   */
+  static create(editor: CapTrim, surfaceId: string, width: number, height: number): CapTrimPresenter | null {
+    const result: HandleResult = presentCreate(editor.nativeHandle(), surfaceId, width, height);
     if (result.code !== 0 || result.handle === 0) {
       return null;
     }
     return new CapTrimPresenter(result.handle);
+  }
+
+  /**
+   * Tell the loop the canvas changed, e.g. on rotation or a split-screen relayout.
+   * Layer geometry follows immediately; the next composed frame is what shows.
+   */
+  resize(width: number, height: number): void {
+    const result: CodeResult = presentResize(this.handle, width, height);
+    if (result.code !== 0) {
+      throw new CapTrimError(result.code, presenterMessage(result.code));
+    }
   }
 
   /**

@@ -11,7 +11,8 @@ set_target_properties(captrim PROPERTIES
 
 add_library(captrim_napi SHARED
     napi_bridge.cpp
-    presenter.cpp)
+    presenter.cpp
+    gl_compositor.cpp)
 target_include_directories(captrim_napi PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(captrim_napi PRIVATE cxx_std_17)
 
@@ -27,6 +28,10 @@ target_link_options(captrim_napi PRIVATE -nostdlib++)
 
 # Decoding and presentation are platform work: the Rust core only says which
 # source instant belongs on screen. These are the system libraries that do it.
+#
+# EGL/GLES/native_image are what make the frame composable: the decoder renders
+# into an OH_NativeImage instead of straight onto the XComponent, so the picture
+# can be scaled, moved and stacked per the plan. See gl_compositor.h.
 target_link_libraries(captrim_napi
     captrim
     libace_napi.z.so
@@ -36,4 +41,7 @@ target_link_libraries(captrim_napi
     libnative_media_vdec.so
     libnative_media_avsource.so
     libnative_media_avdemuxer.so
-    libnative_window.so)
+    libnative_window.so
+    libnative_image.so
+    libEGL.so
+    libGLESv3.so)

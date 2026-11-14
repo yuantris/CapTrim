@@ -78,21 +78,38 @@ export interface PresentResult extends CodeResult {
   /** Layers in the plan, and layers dropped because the fixed array is full. */
   layers: number;
   overflow: number;
-  /** 1 when a decoded frame was rendered during the latest step. */
+  /**
+   * 1 when the latest step changed the picture -- a newly decoded frame, or a
+   * redraw of the current one after an edit. 0 when the window already showed
+   * the right frame.
+   */
   drawn: number;
   /** 1 while the render loop thread is alive. */
   running: number;
   /** Sticky loop exit code: 0 while healthy. */
   error: number;
-  /** Frames pushed to the surface, and frames the scheduler dropped. */
+  /** Frames composited onto the window, and frames the scheduler dropped. */
   frames: number;
   dropped: number;
   /** Playhead in timeline time. */
   position_us: number;
 }
 
-/** Bind a presenter to an XComponent surface id (decimal string). */
-export const presentCreate: (engine: number, surfaceId: string) => HandleResult;
+/**
+ * Bind a presenter to an XComponent surface.
+ *
+ * `surfaceId` is the decimal string from getXComponentSurfaceId(); `width` and
+ * `height` are that surface's size in physical pixels. They are the canvas every
+ * layer's transform is relative to, so pass real values, not zeros.
+ */
+export const presentCreate: (
+  engine: number,
+  surfaceId: string,
+  width: number,
+  height: number
+) => HandleResult;
+/** Canvas size changed (rotation, split screen). Applied by the render loop. */
+export const presentResize: (presenter: number, width: number, height: number) => CodeResult;
 /**
  * Start the render loop on its own thread. The loop owns `preview` from then
  * on: drive it with presentControl, never by calling preview* directly.

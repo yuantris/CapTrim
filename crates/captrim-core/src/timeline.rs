@@ -50,6 +50,12 @@ pub enum Command {
         height: u32,
         frame_rate: Rational,
     },
+    /// Reposition a clip on the canvas. See [`crate::model::Transform`] for the
+    /// units; the preview compositor and the export path both read them.
+    SetTransform {
+        clip_id: Id,
+        transform: crate::model::Transform,
+    },
     RemoveTrack {
         track_id: Id,
     },
@@ -193,6 +199,22 @@ impl Timeline {
             Command::SetOutPoint { clip_id, out_us } => {
                 let clip = find_clip_mut(self, *clip_id)?;
                 clip.out_us = *out_us;
+                clip.validate()?;
+                Ok(None)
+            }
+
+            Command::SetTransform { clip_id, transform } => {
+                if !transform.scale.is_finite() || transform.scale <= 0.0 {
+                    return Err(Error::invalid("transform scale must be positive"));
+                }
+                if !transform.dx.is_finite()
+                    || !transform.dy.is_finite()
+                    || !transform.rotation_deg.is_finite()
+                {
+                    return Err(Error::invalid("transform must be finite"));
+                }
+                let clip = find_clip_mut(self, *clip_id)?;
+                clip.transform = transform.clone();
                 clip.validate()?;
                 Ok(None)
             }
@@ -445,6 +467,64 @@ mod tests {
         let err = e.apply(&Command::InsertClip {
             track_id: track,
             clip: Clip::new(media, 0, 5_000_000, 1_000_000),
+        });
+        assert!(err.is_err());
+        assert_eq!(*e.timeline(), before);
+    }
+
+    #[test]
+    fn set_transform_reaches_the_frame_plan() {
+        use crate::model::Transform;
+        let (mut e, media, track) = seeded();
+        let clip_id = e
+            .apply(&Command::InsertClip {
+                track_id: track,
+                clip: Clip::new(media, 0, 4_000_000, 0),
+            })
+            .unwrap()
+            .unwrap();
+        e.apply(&Command::SetTransform {
+            clip_id,
+            transform: Transform {
+                scale: 0.5,
+                dx: 0.25,
+                dy: -0.5,
+                rotation_deg: 90.0,
+            },
+        })
+        .unwrap();
+
+        // The plan is what the compositor draws, so the check belongs there
+        // rather than on the clip that was written.
+        let plan = crate::render::plan_frame(e.timeline(), 1_000_000);
+        let layer = &plan.layers[0];
+        assert_eq!(layer.transform.scale, 0.5);
+        assert_eq!(layer.transform.dx, 0.25);
+        assert_eq!(layer.transform.dy, -0.5);
+        assert_eq!(layer.transform.rotation_deg, 90.0);
+    }
+
+    #[test]
+    fn set_transform_rejects_degenerate_values() {
+        use crate::model::Transform;
+        let (mut e, media, track) = seeded();
+        let clip_id = e
+            .apply(&Command::InsertClip {
+                track_id: track,
+                clip: Clip::new(media, 0, 4_000_000, 0),
+            })
+            .unwrap()
+            .unwrap();
+        let before = e.timeline().clone();
+        // A zero scale would make every vertex of the layer coincide, which the
+        // compositor draws as nothing at all -- an invisible clip with no error
+        // is worse than a rejected edit.
+        let err = e.apply(&Command::SetTransform {
+            clip_id,
+            transform: Transform {
+                scale: 0.0,
+                ..Transform::default()
+            },
         });
         assert!(err.is_err());
         assert_eq!(*e.timeline(), before);

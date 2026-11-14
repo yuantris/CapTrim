@@ -72,6 +72,12 @@ int64_t GetInt64(napi_env env, napi_value value) {
     return result;
 }
 
+int32_t GetInt32(napi_env env, napi_value value) {
+    int32_t result = 0;
+    napi_get_value_int32(env, value, &result);
+    return result;
+}
+
 captrim_engine_t *AsEngine(int64_t handle) {
     return reinterpret_cast<captrim_engine_t *>(static_cast<intptr_t>(handle));
 }
@@ -460,20 +466,36 @@ napi_value PresentReportResult(napi_env env, int32_t code, const captrim::Presen
     return object;
 }
 
-/// Surface id arrives as a decimal string from XComponent.onSurfaceCreated.
+/// Surface id arrives as a decimal string from XComponent.onSurfaceCreated;
+/// `width` / `height` are its size in physical pixels (the compositing canvas).
 napi_value PresentCreate(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2] = {nullptr, nullptr};
+    size_t argc = 4;
+    napi_value args[4] = {nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    if (argc < 2) return HandleResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    if (argc < 4) return HandleResult(env, CAPTRIM_ERR_INVALID, nullptr);
 
     JsString surface = JsString::From(env, args[1]);
     unsigned long long surface_id = strtoull(surface.c_str(), nullptr, 10);
-    captrim::Presenter *presenter =
-        captrim::PresenterCreate(AsEngine(GetInt64(env, args[0])), surface_id);
+    captrim::Presenter *presenter = captrim::PresenterCreate(
+        AsEngine(GetInt64(env, args[0])), surface_id, GetInt32(env, args[2]),
+        GetInt32(env, args[3]));
     // The surface is not attached yet during the first layout pass; the caller
     // retries once onSurfaceChanged. Not an error worth an exception.
     return HandleResult(env, presenter ? CAPTRIM_OK : CAPTRIM_ERR_INVALID, presenter);
+}
+
+/// presentResize(presenter, width, height): canvas size changed, e.g. rotation.
+napi_value PresentResize(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    auto *presenter = reinterpret_cast<captrim::Presenter *>(
+        static_cast<intptr_t>(GetInt64(env, args[0])));
+    if (presenter == nullptr) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    return CodeResult(env,
+                      captrim::PresenterResize(presenter, GetInt32(env, args[1]),
+                                               GetInt32(env, args[2])));
 }
 
 napi_value PresentStart(napi_env env, napi_callback_info info) {
@@ -573,6 +595,7 @@ napi_value Init(napi_env env, napi_value exports) {
          nullptr},
         {"previewStats", nullptr, PreviewStats, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"presentCreate", nullptr, PresentCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"presentResize", nullptr, PresentResize, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"presentStart", nullptr, PresentStart, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"presentStop", nullptr, PresentStop, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"presentControl", nullptr, PresentControl, nullptr, nullptr, nullptr, napi_default,

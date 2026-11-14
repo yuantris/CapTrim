@@ -15,7 +15,10 @@
 #include <multimedia/player_framework/native_avdemuxer.h>
 #include <multimedia/player_framework/native_avformat.h>
 #include <multimedia/player_framework/native_avsource.h>
+#include <native_image/native_image.h>
 #include <native_window/external_window.h>
+
+#include "gl_compositor.h"
 
 namespace captrim {
 namespace {
@@ -74,6 +77,28 @@ struct PresenterState {
     OHNativeWindow *window;
     captrim_engine_t *engine;
 
+    /// EGL context bound to `window`, owned by the render thread. Null until the
+    /// loop starts: EGL contexts are per-thread, so it cannot be created here on
+    /// the UI thread and used there.
+    GlCompositor *compositor;
+
+    /// Canvas size in physical pixels, as reported by the XComponent.
+    int32_t surface_width;
+    int32_t surface_height;
+
+    /// Where the decoder's output goes: a texture the compositor samples, not
+    /// the window. Its native window is what OH_VideoDecoder_SetSurface() gets.
+    /// It also owns the frame-available flag, so there is no second clock to
+    /// keep in step with the codec.
+    CompSource *comp_source;
+
+    /// Forces a redraw without a new decoded frame: the surface needs one after
+    /// a resize, when its contents are gone but the picture is not.
+    volatile int32_t compose_dirty;
+    /// The last plan drawn, so a redraw after a resize has geometry to reuse.
+    captrim_frame_desc_t last_desc;
+    volatile int32_t has_last_desc;
+
     uint64_t bound_source;
     char uri[kUriMax];
     int32_t fd;
@@ -104,11 +129,23 @@ struct PresenterState {
     volatile int32_t playing;
 
     int64_t last_rendered_us;
-    uint64_t frames_rendered;
-    uint64_t frames_dropped;
+    /// Frames the decoder produced and handed to the NativeImage. This is the
+    /// decode frontier, not what the viewer saw: the loop still has to composite
+    /// them.
+    uint64_t frames_decoded;
+    /// Times a frame was actually drawn onto the window. A paused preview
+    /// composites once per new target, so this lags frames_decoded by design.
+    uint64_t frames_composited;
+    /// Frames decoded but deliberately not shown while paused, to land on the
+    /// playhead. Not a performance figure; kept apart from the drop count so an
+    /// exact scrub does not look like a device that cannot keep up.
+    uint64_t frames_skipped;
     uint32_t input_calls;
     uint32_t output_calls;
     uint32_t wait_timeouts;
+    uint32_t present_calls;
+    uint32_t acquire_ok;
+    uint32_t acquire_empty;
 
     // Two locks, deliberately:
     //   `lock` guards loop state and the condition. It is never held across a
@@ -141,6 +178,9 @@ struct PresenterState {
     volatile int32_t cmd_playing; // -1 none, 0 pause, 1 play
     volatile int32_t cmd_seek;
     volatile int64_t cmd_seek_us;
+    volatile int32_t cmd_resize;
+    int32_t cmd_width;
+    int32_t cmd_height;
 
     // Latest snapshot, guarded by `lock`, so status() never blocks on a decode.
     PresentReport last;
@@ -274,35 +314,58 @@ void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
         // Paused or scrubbing: draw exactly the frame at the playhead. The
         // decoder emits its whole pipeline (about ten frames) after a seek, so
         // anything else would leave the freeze frame off the scrub position.
-        p->frames_dropped++;
+        //
+        // Counted separately from `frames_dropped`: these frames are not lost to
+        // slowness, they are deliberately skipped to land precisely. Rolling
+        // them into the same counter made the status line read "丢帧 217" on a
+        // device that never missed a deadline.
+        p->frames_skipped++;
         OH_VideoDecoder_FreeOutputBuffer(codec, index);
         return;
     }
 
-    // The wait is satisfied only by a frame that actually covers the target;
-    // older frames are still drawn -- they are the best picture available at
-    // this instant -- so the surface ends on the newest frame at or before the
-    // playhead instead of jumping straight to a future one.
+    // FreeOutputBuffer is not "discard" in surface mode: it hands the buffer to
+    // the surface the decoder was configured with, which is now the compositor's
+    // NativeImage rather than the XComponent. Its frame-available callback fires
+    // during that call and the render thread picks the frame up from there.
+    // RenderOutputBuffer, not FreeOutputBuffer: the latter only returns the
+    // buffer to the codec, while the former also hands it to the surface the
+    // decoder was configured with. That surface is now the compositor's
+    // NativeImage, so this call is what queues the frame for the render thread
+    // to latch -- using FreeOutputBuffer here decodes every frame and shows
+    // none (observed: three outputs, zero buffers in the image).
     int32_t covers = attr.pts + kFrameToleranceUs >= p->target_us ? 1 : 0;
-
-    if (OH_VideoDecoder_RenderOutputBuffer(codec, index) == AV_ERR_OK) {
+    OH_AVErrCode render_rc = OH_VideoDecoder_RenderOutputBuffer(codec, index);
+    if (render_rc == AV_ERR_OK) {
         p->last_rendered_us = attr.pts;
-        p->frames_rendered++;
+        p->frames_decoded++;
+        // The wait is satisfied only by a frame that actually covers the target;
+        // older frames are still drawn -- they are the best picture available at
+        // this instant -- so the surface ends on the newest frame at or before
+        // the playhead instead of jumping straight to a future one.
         if (covers != 0) {
             p->reached = 1;
             Signal(p);
         }
-    } else {
-        OH_VideoDecoder_FreeOutputBuffer(codec, index);
+    } else if (p->output_calls <= 5) {
+        CAPTRIM_LOGE("RenderOutputBuffer #%{public}u failed (%{public}d) pts=%{public}lld",
+                     p->output_calls, (int32_t)render_rc, (long long)attr.pts);
     }
 }
 
 void TeardownSource(PresenterState *p) {
     p->abort = 1;
     if (p->codec != nullptr) {
+        // Stop before the image goes away: the codec still holds buffers that
+        // belong to the NativeImage's queue, and dropping the queue first is a
+        // use-after-free inside the decoder.
         OH_VideoDecoder_Stop(p->codec);
         OH_VideoDecoder_Destroy(p->codec);
         p->codec = nullptr;
+    }
+    if (p->comp_source != nullptr) {
+        CompositorDestroySource(p->comp_source);
+        p->comp_source = nullptr;
     }
     if (p->demuxer != nullptr) {
         OH_AVDemuxer_Destroy(p->demuxer);
@@ -529,9 +592,20 @@ int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
         return -6;
     }
 
-    // Surface output mode: the decoder writes straight into the XComponent
-    // buffer, so the pixels never pass through user space.
-    OH_AVErrCode surface_code = OH_VideoDecoder_SetSurface(p->codec, p->window);
+    // Surface output mode, but the surface is the compositor's NativeImage
+    // rather than the XComponent: the pixels still never pass through user
+    // space, and they end up in a texture that can be scaled, moved and stacked.
+    if (p->comp_source == nullptr) {
+        p->comp_source = CompositorNewSource(p->compositor);
+        if (p->comp_source == nullptr) {
+            CAPTRIM_LOGE("cannot create an image source");
+            OH_AVFormat_Destroy(track_format);
+            TeardownSource(p);
+            return -6;
+        }
+    }
+    OH_AVErrCode surface_code =
+        OH_VideoDecoder_SetSurface(p->codec, CompositorSourceWindow(p->comp_source));
     if (surface_code != AV_ERR_OK) {
         CAPTRIM_LOGE("SetSurface failed (%{public}d)", surface_code);
         OH_AVFormat_Destroy(track_format);
@@ -664,6 +738,132 @@ int32_t RenderAt(PresenterState *p, int64_t target_us) {
     return result;
 }
 
+/// Ask for `target_us`, waiting only when the transport is paused.
+///
+/// Playback is real-time: the clock is authoritative and the decoder is allowed
+/// to lag. Waiting for the exact frame is what broke it -- the clock ran ahead of
+/// a decoder that was itself stalled by a full surface queue, so every step spent
+/// its 120 ms budget, which made the consumer slower, which kept the queue full.
+/// Measured before this change: 95 presents and 51 frames over a 12 s window,
+/// against 357 decoded. Without the wait the loop keeps draining the queue and the
+/// viewer sees the newest frame the decoder has.
+///
+/// Paused is the opposite case: nothing is moving, so waiting is the only way to
+/// land on the scrub position, and there is no clock to fall behind.
+int32_t RequestFrame(PresenterState *p, int64_t target_us) {
+    if (p->playing == 0) {
+        return RenderAt(p, target_us);
+    }
+    // Playing: only restart the pipeline at end of stream.
+    //
+    // An earlier version also seeked when the playhead got more than a second
+    // ahead of the decode frontier. That is a trap: the decoder falls behind
+    // because the surface queue is full because the loop is slow, and a seek
+    // makes the loop much slower (Stop/Start plus refilling the pipeline costs
+    // hundreds of milliseconds), so it falls further behind and seeks again.
+    // Measured: Present averaged 87 ms with 22 calls in a 2 s window, and the
+    // decoded-frame counter moved by zero. Lagging during playback is caught up
+    // by dropping frames, which is what realtime means.
+    if (p->eos != 0) {
+        SeekTo(p, target_us);
+        return 0;
+    }
+    pthread_mutex_lock(&p->lock);
+    p->target_us = target_us;
+    p->reached = 0;
+    pthread_mutex_unlock(&p->lock);
+    return 0;
+}
+
+/// Latch the newest decoded frame and draw the plan onto the window.
+///
+/// Returns 1 when a new frame reached the screen, 0 when there was nothing new
+/// to draw, and -1 when the draw itself failed (lost EGL surface, which means
+/// the compositor has to be recreated).
+///
+/// `force` redraws even without a newly decoded frame. The scheduler only
+/// returns Present when the plan changed, and a plan can change without the
+/// picture's source instant moving -- a transform, an opacity, a clip trimmed
+/// under the playhead. Skipping the draw in that case would leave the pre-edit
+/// picture on screen until the playhead moved, which reads as "the edit did
+/// nothing".
+///
+/// Deliberately independent of whether RenderAt() met its deadline: if the wait
+/// expired, the newest frame the decoder did produce still belongs on screen.
+/// Withholding it is what makes a slow decoder look like a freeze.
+int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t force) {
+    if (p->compositor == nullptr || p->comp_source == nullptr) {
+        return 0;
+    }
+
+    // Always try to latch. Gating this on the frame-available callback lost most
+    // of the video: the callback fires once per queue flush, while the decoder
+    // runs ~300 ms ahead and recycles buffers in between, so the loop saw one
+    // notification and missed the frames behind it (observed: 25 frames
+    // composited for an 8 s timeline that had 323 decoded). UpdateSurfaceImage
+    // returns NATIVE_ERROR_NO_BUFFER immediately when the queue is empty, so an
+    // unconditional attempt costs a function call and nothing else.
+    int32_t acquired = 0;
+    p->present_calls++;
+    if (CompositorSourceAcquire(p->comp_source) == 0) {
+        acquired = 1;
+        p->acquire_ok++;
+    } else {
+        p->acquire_empty++;
+    }
+    if (acquired == 0 && p->compose_dirty == 0 && force == 0) {
+        // Nothing new, nothing to repair: the window already shows this frame.
+        return 0;
+    }
+
+    // A resize wipes the window but not the plan, so a redraw without a fresh
+    // step falls back to the last one drawn.
+    const captrim_frame_desc_t *plan = desc;
+    if (plan == nullptr || plan->layer_count == 0) {
+        if (p->has_last_desc == 0) {
+            return 0;
+        }
+        plan = &p->last_desc;
+    }
+
+    // One quad per video layer this presenter can actually feed. Only the bound
+    // source has a decoder, so a plan with two video layers (picture-in-picture)
+    // draws the one it owns and reports the rest through the layer counters --
+    // a second source needs a second codec and a second demuxer, which is a
+    // scheduling problem in the core rather than a drawing problem here.
+    CompLayer layers[CAPTRIM_MAX_LAYERS];
+    int32_t count = 0;
+    for (int32_t i = 0; i < plan->layer_count && count < CAPTRIM_MAX_LAYERS; i++) {
+        const captrim_layer_desc_t *layer = &plan->layers[i];
+        if (layer->kind != CAPTRIM_LAYER_VIDEO || layer->source_id != p->bound_source) {
+            continue;
+        }
+        CompLayer &out = layers[count++];
+        memset(&out, 0, sizeof(out));
+        out.texture = CompositorSourceTexture(p->comp_source);
+        out.tex_matrix = CompositorSourceMatrix(p->comp_source);
+        out.src_w = p->width;
+        out.src_h = p->height;
+        out.scale = layer->scale;
+        out.dx = layer->dx;
+        out.dy = layer->dy;
+        out.rotation_deg = layer->rotation_deg;
+        out.opacity = layer->opacity;
+    }
+    if (count == 0) {
+        return 0;
+    }
+
+    if (CompositorDraw(p->compositor, layers, count) != 0) {
+        return -1;
+    }
+    p->compose_dirty = 0;
+    p->last_desc = *plan;
+    p->has_last_desc = 1;
+    p->frames_composited++;
+    return acquired;
+}
+
 /// Wait up to `us` on the presenter condition, so a transport command or a
 /// decoder event wakes the loop immediately instead of after a fixed sleep.
 void WaitOn(PresenterState *p, int64_t us) {
@@ -690,8 +890,17 @@ int32_t ApplyCommands(PresenterState *p, int64_t now) {
     int32_t playing = -1;
     int32_t seek = 0;
     int64_t seek_us = 0;
+    int32_t resize = 0;
+    int32_t width = 0;
+    int32_t height = 0;
 
     pthread_mutex_lock(&p->lock);
+    if (p->cmd_resize != 0) {
+        resize = 1;
+        width = p->cmd_width;
+        height = p->cmd_height;
+        p->cmd_resize = 0;
+    }
     if (p->cmd_playing >= 0) {
         playing = p->cmd_playing;
         p->cmd_playing = -1;
@@ -702,6 +911,17 @@ int32_t ApplyCommands(PresenterState *p, int64_t now) {
         p->cmd_seek = 0;
     }
     pthread_mutex_unlock(&p->lock);
+
+    if (resize != 0 && width > 0 && height > 0) {
+        p->surface_width = width;
+        p->surface_height = height;
+        if (p->compositor != nullptr && CompositorResize(p->compositor, width, height) != 0) {
+            CAPTRIM_LOGE("resize to %{public}dx%{public}d failed", width, height);
+        }
+        // The window lost its contents with the new geometry, so the next step
+        // has to draw even if the playhead has not moved.
+        p->compose_dirty = 1;
+    }
 
     if (seek != 0) {
         int32_t rc = captrim_preview_seek(p->loop_preview, seek_us, now);
@@ -734,18 +954,37 @@ void *LoopMain(void *arg) {
     PresenterState *p = static_cast<PresenterState *>(arg);
     CAPTRIM_LOGI("render loop running");
 
+    // The EGL context is created here, on the thread that draws, and dies with
+    // it: a context belongs to the thread that made it current, so it cannot be
+    // created up in PresenterCreate and used down here.
+    p->compositor = CompositorCreate(p->window, p->surface_width, p->surface_height);
+    if (p->compositor == nullptr) {
+        CAPTRIM_LOGE("cannot set up the compositor; the window has nothing to draw with");
+        p->loop_error = -8;
+        p->loop_running = 0;
+        return nullptr;
+    }
+
     // Periodic progress line. On a device a frozen surface and a decoded frame
     // look identical in a screenshot, so "is it actually playing?" has to be
     // answered by numbers, not by looking.
     int64_t next_beat_us = MonoUs() + 2000000;
+    // Time spent inside Present since the last beat. Without this the loop rate
+    // is a single number with no attribution, and "26 fps" could be the decoder,
+    // the swap, or the wait.
+    int64_t busy_us = 0;
+    int64_t busy_count = 0;
 
     while (p->loop_running != 0) {
         int64_t now = p->clock_base_us + (MonoUs() - p->mono_base_us);
         ApplyCommands(p, now);
 
         PresentReport report;
+        int64_t enter_us = MonoUs();
         int32_t rc = PresenterPresent(reinterpret_cast<Presenter *>(p), p->loop_preview, now,
                                       &report);
+        busy_us += MonoUs() - enter_us;
+        busy_count++;
         if (rc != 0) {
             // Structural failure (no video track, cannot open the file, no
             // decoder). Record it and stop: retrying at 60 Hz would just flood
@@ -757,13 +996,20 @@ void *LoopMain(void *arg) {
 
         if (MonoUs() >= next_beat_us) {
             next_beat_us = MonoUs() + 2000000;
+            unsigned long long not_shown =
+                p->frames_decoded > p->acquire_ok ? p->frames_decoded - p->acquire_ok : 0;
             CAPTRIM_LOGI("loop: pos=%{public}lldms src=%{public}lldms kind=%{public}d "
-                         "drawn=%{public}llu dropped=%{public}llu in=%{public}u out=%{public}u "
-                         "win=%{public}lldms",
+                         "drawn=%{public}llu unseen=%{public}llu skipped=%{public}llu "
+                         "in=%{public}u out=%{public}u calls=%{public}u ok=%{public}u "
+                         "empty=%{public}u busy=%{public}lldus/%{public}lld win=%{public}lldms",
                          (long long)(report.position_us / 1000), (long long)(report.source_us / 1000),
-                         report.kind, (unsigned long long)p->frames_rendered,
-                         (unsigned long long)p->frames_dropped, p->input_calls, p->output_calls,
+                         report.kind, (unsigned long long)p->frames_composited, not_shown,
+                         (unsigned long long)p->frames_skipped, p->input_calls, p->output_calls,
+                         p->present_calls, p->acquire_ok, p->acquire_empty,
+                         (long long)busy_us, (long long)busy_count,
                          (long long)((now - p->clock_base_us) / 1000));
+            busy_us = 0;
+            busy_count = 0;
         }
 
         if (report.kind == CAPTRIM_STEP_WAIT_FRAME) {
@@ -784,16 +1030,30 @@ void *LoopMain(void *arg) {
         WaitOn(p, 2000);
     }
 
-    CAPTRIM_LOGI("render loop stopped (drawn %{public}llu, dropped %{public}llu, err %{public}d)",
-                 (unsigned long long)p->frames_rendered, (unsigned long long)p->frames_dropped,
-                 p->loop_error);
+    CAPTRIM_LOGI("render loop stopped (drawn %{public}llu, decoded %{public}llu, "
+                 "latched %{public}u, err %{public}d)",
+                 (unsigned long long)p->frames_composited,
+                 (unsigned long long)p->frames_decoded, p->acquire_ok, p->loop_error);
+
+    // The image source has to go before the context that owns its texture, and
+    // the context before the thread that made it current.
+    if (p->comp_source != nullptr) {
+        CompositorDestroySource(p->comp_source);
+        p->comp_source = nullptr;
+    }
+    if (p->compositor != nullptr) {
+        CompositorDestroy(p->compositor);
+        p->compositor = nullptr;
+    }
+    p->bound_source = 0;
     p->loop_running = 0;
     return nullptr;
 }
 
 } // namespace
 
-Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id) {
+Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_t width,
+                           int32_t height) {
     if (engine == nullptr) {
         return nullptr;
     }
@@ -805,6 +1065,11 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id) {
     p->fd = -1;
     p->last_rendered_us = -1;
     p->cmd_playing = -1;
+    // Layer geometry is relative to the canvas, so a zero size here would make
+    // every layer degenerate. The page knows the XComponent's size; ask for it
+    // rather than guessing from the window, which is still unconfigured.
+    p->surface_width = width > 0 ? width : 1;
+    p->surface_height = height > 0 ? height : 1;
     pthread_mutex_init(&p->lock, nullptr);
     pthread_mutex_init(&p->demux_lock, nullptr);
     pthread_cond_init(&p->cond, nullptr);
@@ -819,7 +1084,8 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id) {
         free(p);
         return nullptr;
     }
-    CAPTRIM_LOGI("presenter ready for surface %llu", (unsigned long long)surface_id);
+    CAPTRIM_LOGI("presenter ready for surface %llu %{public}dx%{public}d",
+                 (unsigned long long)surface_id, p->surface_width, p->surface_height);
     return reinterpret_cast<Presenter *>(p);
 }
 
@@ -844,12 +1110,22 @@ void PresenterDestroy(Presenter *opaque) {
 
 namespace {
 
+/// Frames the decoder produced that never reached the screen.
+///
+/// Deliberately computed rather than accumulated: the two counters are updated
+/// on different threads (the output callback and the render loop), so a running
+/// tally drifts. The subtraction is exact as long as the loop is the only
+/// consumer, which it is.
+uint64_t FramesNotShown(const PresenterState *p) {
+    return p->frames_decoded > p->acquire_ok ? p->frames_decoded - p->acquire_ok : 0;
+}
+
 /// Publish a snapshot and attach the counters the loop owns.
 void Publish(PresenterState *p, PresentReport *report) {
     report->running = p->loop_running;
     report->error = p->loop_error;
-    report->frames = p->frames_rendered;
-    report->dropped = p->frames_dropped;
+    report->frames = p->frames_composited;
+    report->dropped = FramesNotShown(p);
     pthread_mutex_lock(&p->lock);
     p->last = *report;
     pthread_mutex_unlock(&p->lock);
@@ -925,6 +1201,20 @@ int32_t PresenterControl(Presenter *opaque, int32_t playing, int32_t has_seek,
     return 0;
 }
 
+int32_t PresenterResize(Presenter *opaque, int32_t width, int32_t height) {
+    if (opaque == nullptr || width <= 0 || height <= 0) {
+        return -1;
+    }
+    PresenterState *p = reinterpret_cast<PresenterState *>(opaque);
+    pthread_mutex_lock(&p->lock);
+    p->cmd_width = width;
+    p->cmd_height = height;
+    p->cmd_resize = 1;
+    pthread_mutex_unlock(&p->lock);
+    Signal(p);
+    return 0;
+}
+
 int32_t PresenterStatus(Presenter *opaque, PresentReport *out_report) {
     if (opaque == nullptr || out_report == nullptr) {
         return -1;
@@ -938,8 +1228,8 @@ int32_t PresenterStatus(Presenter *opaque, PresentReport *out_report) {
     // reads as a slightly older frame count, never as a wrong one.
     out_report->running = p->loop_running;
     out_report->error = p->loop_error;
-    out_report->frames = p->frames_rendered;
-    out_report->dropped = p->frames_dropped;
+    out_report->frames = p->frames_composited;
+    out_report->dropped = FramesNotShown(p);
     return 0;
 }
 
@@ -985,6 +1275,15 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
         out_report->source_us = on_screen.source_us;
         out_report->layer_count = on_screen.layer_count;
         out_report->layer_overflow = on_screen.layer_overflow;
+        // A frame can arrive even when the clock did not ask for one: paused on
+        // a still frame, the decoder still finishes the pipeline it was fed.
+        // Those frames have to be published, otherwise the surface keeps the
+        // picture from before the last seek and the viewer sees a stale freeze
+        // frame. ComposePlan() no-ops when there is nothing queued, so this
+        // costs a flag check per idle tick.
+        if (ComposePlan(p, nullptr, 0) > 0) {
+            out_report->drawn = 1;
+        }
         Publish(p, out_report);
         return 0;
     }
@@ -1024,11 +1323,27 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
         return 0;
     }
 
-    rc = RenderAt(p, chosen->source_us);
-    if (rc == 0) {
-        out_report->drawn = 1;
+    // Latch and draw before waiting for the exact frame.
+    //
+    // The decoder writes into a NativeImage, whose buffer queue holds only a
+    // couple of frames. Waiting on RenderAt() first means the queue stays full
+    // while the loop waits, the decoder stalls behind it, and the frame it is
+    // waiting for is the one that cannot be produced -- a mutual stall that
+    // showed up as 12 fps and 37 frames on screen for an 8 s clip. Draining the
+    // queue first keeps the decoder moving; the wait below then usually finds
+    // its frame already there.
+    int32_t composed = ComposePlan(p, &desc, 1);
+    if (composed < 0) {
+        // The EGL surface is gone (the XComponent detached). Nothing can be
+        // drawn until it comes back, so say so instead of spinning quietly.
+        Publish(p, out_report);
+        return -7;
     }
-    Publish(p, out_report);
+
+    RequestFrame(p, chosen->source_us);
+    if (composed > 0) {
+        out_report->drawn = 1;
+    }    Publish(p, out_report);
     // A missed deadline is not fatal -- the loop just tries the next frame.
     // Only structural failures (no track, no decoder, unreadable file) propagate
     // as a non-zero return, and those are reported above.

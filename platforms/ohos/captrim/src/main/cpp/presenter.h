@@ -3,7 +3,8 @@
 //
 // Division of labour (the same one Android follows):
 //   Rust owns *when* and *what*       -> captrim_preview_step_frame
-//   this file owns *how* it is drawn  -> AVCodec hardware decode onto the window
+//   this file owns *how* it is drawn  -> AVCodec hardware decode into an
+//                                        OH_NativeImage, composited by GL
 //
 // Deliberately free of the C++ standard library: no std::string, no new/delete,
 // no exceptions. The HAR must not drag libc++_shared.so into the host app, so
@@ -32,7 +33,9 @@ struct PresentReport {
     /// CAPTRIM_MAX_LAYERS (never silently).
     int32_t layer_count;
     int32_t layer_overflow;
-    /// 1 when a decoded frame was rendered during this step.
+    /// 1 when this step put something on the window -- either a newly decoded
+    /// frame or a redraw of the current one after an edit. 0 when the display
+    /// already showed the right picture.
     int32_t drawn;
 
     /// 1 while the render loop thread is alive.
@@ -40,7 +43,7 @@ struct PresentReport {
     /// Sticky loop exit code: 0 while healthy, otherwise the error that stopped
     /// it. The loop never dies silently.
     int32_t error;
-    /// Frames pushed to the surface since the presenter was created.
+    /// Frames composited onto the window since the presenter was created.
     uint64_t frames;
     /// Frames the Rust scheduler asked to drop (device cannot keep up).
     uint64_t dropped;
@@ -53,8 +56,21 @@ struct Presenter;
 /// `surface_id` comes from ArkTS XComponent's onSurfaceCreated. Returns nullptr
 /// when the window cannot be created from it (usually: the surface is not ready
 /// yet, or the id belongs to a destroyed surface).
-Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id);
+///
+/// `width` / `height` are the surface's size in physical pixels, as ArkUI reports
+/// it. They are the canvas that every layer's transform is relative to, so they
+/// cannot be left to a guess; a zero is treated as 1 and every layer then
+/// degenerates, which is visible rather than silent.
+Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_t width,
+                           int32_t height);
 void PresenterDestroy(Presenter *presenter);
+
+/// Resize the compositing canvas, e.g. on rotation or a split-screen relayout.
+///
+/// Thread-safe: the size is handed to the render loop, because the EGL surface
+/// belongs to that thread. Layer geometry follows immediately; the window is
+/// cleared, so the next composed frame is what the viewer sees.
+int32_t PresenterResize(Presenter *presenter, int32_t width, int32_t height);
 
 /// Start the render loop on its own thread.
 ///
@@ -95,9 +111,10 @@ int32_t PresenterStatus(Presenter *presenter, PresentReport *out_report);
 /// up. Debug/tooling only -- it blocks the calling thread for up to ~120 ms, so
 /// never call it from the UI thread. The page uses PresenterLoopStart().
 ///
-/// For a plan with several layers only the bottom-most video layer is decoded:
-/// compositing needs the GPU path that does not exist yet, and silently drawing
-/// "some layer" would look like an editing bug rather than a missing feature.
+/// For a plan with several layers only the video layers belonging to the bound
+/// source are drawn: one decoder feeds one image, so a picture-in-picture plan
+/// needs a second codec in the core's scheduler before this can honour it. The
+/// layer counters report what was planned so the gap is visible, not silent.
 int32_t PresenterPresent(Presenter *presenter, captrim_preview_t *preview,
                          int64_t now_wall_us, PresentReport *out_report);
 

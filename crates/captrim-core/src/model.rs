@@ -22,6 +22,25 @@ pub enum TrackKind {
     Subtitle,
 }
 
+/// How a layer is placed on the canvas.
+///
+/// The compositor is the only consumer, and it applies these in this order:
+/// fit, scale, rotate, translate.
+///
+/// * `scale` multiplies the layer's *fitted* size, where fitted means "as large
+///   as it goes inside the canvas without cropping"
+///   (`min(canvas_w / src_w, canvas_h / src_h)`). So 1.0 is the default framing
+///   for any aspect ratio, 2.0 is twice that, and 0.5 is a half-size inset --
+///   it is not a multiple of native pixels, which would make the same value
+///   mean different things on different phones.
+/// * `dx` / `dy` translate in canvas-normalised units: 1.0 is one full canvas
+///   width / height, and positive `dy` moves *down* (screen convention). The
+///   magnitude is deliberately independent of resolution so a draft looks the
+///   same on every device.
+/// * `rotation_deg` rotates around the layer's centre, clockwise on screen.
+///
+/// Both the HarmonyOS GL compositor and the future export path must agree on
+/// this; a mismatch shows up as a preview that does not match the file.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Transform {
     pub scale: f32,

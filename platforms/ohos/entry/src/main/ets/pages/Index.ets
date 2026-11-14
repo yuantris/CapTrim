@@ -55,6 +55,12 @@ interface AddTrackCmd {
   kind: string;
 }
 
+interface SetTransformCmd {
+  type: string;
+  clip_id: number;
+  transform: TransformJson;
+}
+
 function clipSpec(source: number, inUs: number, outUs: number, startUs: number): ClipSpec {
   const clip: ClipSpec = {
     id: 0,
@@ -78,6 +84,7 @@ struct Index {
   @State summary: string = '点「运行自检」验证这台设备上的核心库';
   @State mediaState: string = '未准备';
   @State playing: boolean = false;
+  @State transformed: boolean = false;
   @State positionMs: number = 0;
   @State dropped: number = 0;
   @State drawnFrames: number = 0;
@@ -90,6 +97,11 @@ struct Index {
   private pollId: number = -1;
   private filesDir: string = '';
   private mediaReady: boolean = false;
+  /** Ids of the two demo clips, so a transform can be applied to them. */
+  private clipIds: number[] = [];
+  /** Surface size in physical pixels, kept in step with onAreaChange. */
+  private canvasWidth: number = 0;
+  private canvasHeight: number = 0;
 
   aboutToAppear(): void {
     this.version = CapTrim.version();
@@ -163,8 +175,8 @@ struct Index {
     const second: InsertClipCmd = {
       type: 'insert_clip', track_id: trackId, clip: clipSpec(b, 0, CLIP_US, CLIP_US)
     };
-    editor.apply(JSON.stringify(first));
-    editor.apply(JSON.stringify(second));
+    this.clipIds.push(editor.apply(JSON.stringify(first)));
+    this.clipIds.push(editor.apply(JSON.stringify(second)));
     this.demo = editor;
     hilog.info(DOMAIN, TAG, 'demo timeline %{public}dus / %{public}d frames',
       editor.duration(), editor.frameCount());
@@ -172,6 +184,32 @@ struct Index {
   }
 
   // ---- surface -----------------------------------------------------------
+
+  /**
+   * The compositor works in physical pixels, ArkUI lays out in vp. Every layer's
+   * scale and offset is relative to this canvas, so the conversion has to happen
+   * once, here, rather than being guessed at from the window.
+   */
+  private updateCanvas(widthVp: number, heightVp: number): void {
+    if (widthVp <= 0 || heightVp <= 0) {
+      return;
+    }
+    const w = Math.round(this.getUIContext().vp2px(widthVp));
+    const h = Math.round(this.getUIContext().vp2px(heightVp));
+    if (w === this.canvasWidth && h === this.canvasHeight) {
+      return;
+    }
+    this.canvasWidth = w;
+    this.canvasHeight = h;
+    if (this.presenter !== null) {
+      try {
+        this.presenter.resize(w, h);
+      } catch (err) {
+        const error = err as Error;
+        hilog.error(DOMAIN, TAG, 'resize failed: %{public}s', error.message);
+      }
+    }
+  }
 
   private attachSurface(): void {
     if (!this.mediaReady) {
@@ -183,7 +221,12 @@ struct Index {
       return;
     }
     this.releasePresenter();
-    const presenter = CapTrimPresenter.create(this.ensureDemo(), surfaceId);
+    // onAreaChange may not have run yet on the very first layout pass. A zero
+    // canvas would make every layer degenerate, so fall back to the display size
+    // and let the next layout report correct it.
+    const width = this.canvasWidth > 0 ? this.canvasWidth : 1080;
+    const height = this.canvasHeight > 0 ? this.canvasHeight : 1920;
+    const presenter = CapTrimPresenter.create(this.ensureDemo(), surfaceId, width, height);
     if (presenter === null) {
       this.frameInfo = 'presenter 创建失败（surface 可能还没挂上）';
       hilog.error(DOMAIN, TAG, 'presenter create failed for surface %{public}s', surfaceId);
@@ -269,6 +312,40 @@ struct Index {
     // frame under the playhead.
     this.presenter.control(-1, tUs);
     this.positionMs = tUs / 1000;
+  }
+
+  /**
+   * Push a non-identity transform through the whole chain: the engine rewrites
+   * the clip, the plan carries it, and the GL compositor applies it. If the
+   * picture does not shrink and shift, one of those three is ignoring the
+   * contract -- which is what this button exists to catch.
+   *
+   * No seek afterwards: the preview pulls the editor's timeline whenever its
+   * revision changes, so the next step returns Present for the same instant and
+   * the compositor redraws with the new geometry.
+   */
+  private toggleTransform(): void {
+    if (this.demo === null || this.clipIds.length === 0) {
+      return;
+    }
+    const next: boolean = !this.transformed;
+    const transform: TransformJson = next
+      ? { scale: 0.6, dx: 0.15, dy: 0.1, rotation_deg: 10 }
+      : { scale: 1, dx: 0, dy: 0, rotation_deg: 0 };
+    for (const id of this.clipIds) {
+      const cmd: SetTransformCmd = { type: 'set_transform', clip_id: id, transform: transform };
+      try {
+        this.demo.apply(JSON.stringify(cmd));
+      } catch (err) {
+        const error = err as Error;
+        this.frameInfo = '设置变换失败: ' + error.message;
+        hilog.error(DOMAIN, TAG, 'set_transform failed: %{public}s', error.message);
+        return;
+      }
+    }
+    this.transformed = next;
+    this.frameInfo = next ? '变换已应用（scale 0.6 / dx 0.15 / 旋转 10°）' : '变换已复位';
+    hilog.info(DOMAIN, TAG, 'transform toggled: %{public}s', next ? 'on' : 'off');
   }
 
   /** Read the loop's latest snapshot. Never blocks: no decode happens here. */
@@ -412,6 +489,9 @@ struct Index {
           .onLoad((): void => {
             this.attachSurface();
           })
+          .onAreaChange((_old: Area, area: Area): void => {
+            this.updateCanvas(Number(area.width), Number(area.height));
+          })
           .onDestroy((): void => {
             this.releasePresenter();
           })
@@ -451,6 +531,20 @@ struct Index {
             })
         }
         .width('100%')
+
+        Row({ space: 8 }) {
+          Button(this.transformed ? '复位变换' : '缩放 + 平移')
+            .height(32)
+            .fontSize(13)
+            .layoutWeight(1)
+            .backgroundColor('#E8E8ED')
+            .fontColor('#1B1B1F')
+            .onClick((): void => {
+              this.toggleTransform();
+            })
+        }
+        .width('100%')
+        .margin({ top: 8 })
       }
       .width('100%')
       .padding(12)
