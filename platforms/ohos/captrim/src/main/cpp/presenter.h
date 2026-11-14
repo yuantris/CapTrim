@@ -111,10 +111,12 @@ int32_t PresenterStatus(Presenter *presenter, PresentReport *out_report);
 /// up. Debug/tooling only -- it blocks the calling thread for up to ~120 ms, so
 /// never call it from the UI thread. The page uses PresenterLoopStart().
 ///
-/// For a plan with several layers only the video layers belonging to the bound
-/// source are drawn: one decoder feeds one image, so a picture-in-picture plan
-/// needs a second codec in the core's scheduler before this can honour it. The
-/// layer counters report what was planned so the gap is visible, not silent.
+/// For a plan with several video layers, each one gets its own decoder and its
+/// own NativeImage, and the compositor draws them in plan order (bottom first).
+/// That is what a picture-in-picture needs, and it costs two hardware decoders.
+/// Layers whose decoder cannot be opened -- the usual cause is the SoC having no
+/// instance left -- are skipped and counted, so the gap is visible rather than
+/// silently drawn as a missing picture.
 int32_t PresenterPresent(Presenter *presenter, captrim_preview_t *preview,
                          int64_t now_wall_us, PresentReport *out_report);
 

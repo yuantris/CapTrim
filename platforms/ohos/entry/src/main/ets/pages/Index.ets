@@ -61,7 +61,8 @@ interface SetTransformCmd {
   transform: TransformJson;
 }
 
-function clipSpec(source: number, inUs: number, outUs: number, startUs: number): ClipSpec {
+function clipSpec(source: number, inUs: number, outUs: number, startUs: number,
+                  transform?: TransformJson): ClipSpec {
   const clip: ClipSpec = {
     id: 0,
     source: source,
@@ -70,7 +71,7 @@ function clipSpec(source: number, inUs: number, outUs: number, startUs: number):
     start_us: startUs,
     speed: { num: 1, den: 1 },
     volume: 1,
-    transform: { scale: 1, dx: 0, dy: 0, rotation_deg: 0 },
+    transform: transform ?? { scale: 1, dx: 0, dy: 0, rotation_deg: 0 },
     effects: []
   };
   return clip;
@@ -97,8 +98,12 @@ struct Index {
   private pollId: number = -1;
   private filesDir: string = '';
   private mediaReady: boolean = false;
-  /** Ids of the two demo clips, so a transform can be applied to them. */
+  /** Ids of the two main-track demo clips. The transform button only touches
+   * these, so the picture-in-picture clip keeps its own placement and the two
+   * layers stay visually distinguishable. */
   private clipIds: number[] = [];
+  /** The picture-in-picture clip: second decoder, second NativeImage. */
+  private pipClipId: number = 0;
   /** Surface size in physical pixels, kept in step with onAreaChange. */
   private canvasWidth: number = 0;
   private canvasHeight: number = 0;
@@ -160,6 +165,17 @@ struct Index {
   }
 
   /** Two clips back to back, so a source switch happens at 4 s. */
+  /**
+   * The demo timeline: two clips back to back on the main track (so a source
+   * switch at 4 s exercises decoder teardown), plus a picture-in-picture clip on
+   * an overlay track for the first 4 s.
+   *
+   * The PiP exists to prove the part that cannot be faked: two decoders running
+   * at once, each writing into its own NativeImage, composited by z order. Its
+   * transform is set at insert time so the picture is visibly not the main one
+   * the moment the app opens -- if it were identity and full size, a broken
+   * second decoder would be indistinguishable from a working one.
+   */
   private ensureDemo(): CapTrim {
     if (this.demo !== null) {
       return this.demo;
@@ -169,17 +185,28 @@ struct Index {
     const b = editor.addMedia(`file://${this.filesDir}/b.mp4`);
     const track: AddTrackCmd = { type: 'add_track', kind: 'main_video' };
     const trackId = editor.apply(JSON.stringify(track));
+    const overlay: AddTrackCmd = { type: 'add_track', kind: 'overlay' };
+    const overlayId = editor.apply(JSON.stringify(overlay));
+
     const first: InsertClipCmd = {
       type: 'insert_clip', track_id: trackId, clip: clipSpec(a, 0, CLIP_US, 0)
     };
     const second: InsertClipCmd = {
       type: 'insert_clip', track_id: trackId, clip: clipSpec(b, 0, CLIP_US, CLIP_US)
     };
+    // Bottom-right, about 42% of the canvas wide, nudged down and right. Units
+    // are canvas-relative (see Transform in captrim-core/model.rs), so this
+    // looks the same whatever size the XComponent ends up being.
+    const pipTransform: TransformJson = { scale: 0.42, dx: 0.28, dy: 0.33, rotation_deg: 0 };
+    const pip: InsertClipCmd = {
+      type: 'insert_clip', track_id: overlayId, clip: clipSpec(b, 0, CLIP_US, 0, pipTransform)
+    };
     this.clipIds.push(editor.apply(JSON.stringify(first)));
     this.clipIds.push(editor.apply(JSON.stringify(second)));
+    this.pipClipId = editor.apply(JSON.stringify(pip));
     this.demo = editor;
-    hilog.info(DOMAIN, TAG, 'demo timeline %{public}dus / %{public}d frames',
-      editor.duration(), editor.frameCount());
+    hilog.info(DOMAIN, TAG, 'demo timeline %{public}dus / %{public}d frames, pip clip %{public}d',
+      editor.duration(), editor.frameCount(), this.pipClipId);
     return editor;
   }
 
@@ -466,7 +493,7 @@ struct Index {
 
       Column() {
         Row() {
-          Text('硬件解码预览')
+          Text('硬件解码 + GL 合成预览')
             .fontSize(15)
             .fontWeight(FontWeight.Medium)
             .fontColor('#1B1B1F')
@@ -533,7 +560,7 @@ struct Index {
         .width('100%')
 
         Row({ space: 8 }) {
-          Button(this.transformed ? '复位变换' : '缩放 + 平移')
+          Button(this.transformed ? '主视频复位' : '主视频缩放')
             .height(32)
             .fontSize(13)
             .layoutWeight(1)
@@ -541,6 +568,15 @@ struct Index {
             .fontColor('#1B1B1F')
             .onClick((): void => {
               this.toggleTransform();
+            })
+          Button('切到 2s')
+            .height(32)
+            .fontSize(13)
+            .layoutWeight(1)
+            .backgroundColor('#E8E8ED')
+            .fontColor('#1B1B1F')
+            .onClick((): void => {
+              this.seekTo(2_000_000);
             })
         }
         .width('100%')

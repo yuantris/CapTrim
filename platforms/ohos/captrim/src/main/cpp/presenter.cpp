@@ -73,6 +73,91 @@ constexpr const char *kKeyHeight = "height";
 constexpr const char *kKeyTrackCount = "track_count";
 constexpr const char *kKeyPixelFormat = "pixel_format";
 
+/// How many layers can be decoded at once.
+///
+/// Four is a guess at the ceiling that matters in practice (main + one PiP +
+/// one sticker video + one spare) rather than a hardware limit: the real limit
+/// is how many instances the SoC's decoder will hand out, which is discovered
+/// the hard way -- OH_VideoDecoder_CreateByMime() returning null. Exceeding
+/// this evicts the least recently used slot instead.
+constexpr int32_t kMaxSources = 4;
+
+struct PresenterState;
+
+/// One decoder's worth of state: a demuxer, a codec, and the NativeImage its
+/// frames land in.
+///
+/// There is one slot per *layer*, not per media. The same file can appear twice
+/// at two different instants (a picture-in-picture of the same clip), and a
+/// decoder can only be at one position at a time, so two layers of one file
+/// legitimately need two slots. That is also the honest cost of a PiP: two
+/// hardware decoders running at once.
+struct SourceSlot {
+    PresenterState *owner;
+
+    /// Clip this slot is decoding; 0 means the slot is free.
+    uint64_t clip_id;
+    uint64_t source_id;
+
+    char uri[kUriMax];
+    int32_t fd;
+    OH_AVSource *source;
+    OH_AVDemuxer *demuxer;
+    OH_AVCodec *codec;
+    uint32_t track;
+    int32_t width;
+    int32_t height;
+
+    /// Where this slot's decoded frames go: a texture the compositor samples,
+    /// not the window. Its native window is what OH_VideoDecoder_SetSurface()
+    /// is given.
+    CompSource *comp_source;
+    /// 1 once at least one frame has been latched into `comp_source`. Drawing
+    /// before that samples an uninitialised texture, which is not black -- it
+    /// is whatever happened to be in that memory.
+    int32_t has_frame;
+
+    // Touched by this slot's codec callbacks, hence volatile.
+    volatile int64_t target_us;
+    volatile int64_t fed_pts_us;
+    volatile int32_t reached;
+    volatile int32_t eos;
+    volatile int32_t failed;
+    volatile int32_t abort;
+    /// Set while this slot's codec is being restarted. Its callbacks must not
+    /// touch the codec or the demuxer meanwhile: Stop() reclaims every buffer
+    /// it handed out, and feeding one back is an AV_ERR_INVALID_STATE at best.
+    volatile int32_t seeking;
+    /// Set when the layer comes back into the plan after being absent. Playback
+    /// never seeks to catch up (that self-locks, see RequestSlotFrame), but a
+    /// layer that was simply not on screen for a while has a decoder parked far
+    /// behind the playhead with no way to know it -- so it gets exactly one
+    /// seek on re-entry.
+    volatile int32_t resume;
+
+    int64_t last_rendered_us;
+    /// Plan instant this slot last appeared in. Doubles as the age used when a
+    /// new layer needs a slot and every one of them is busy.
+    int64_t last_plan_us;
+    /// 1 while this slot's layer is part of the current plan. Compared against
+    /// the previous present to notice a layer coming back on screen, which is
+    /// the one case that earns a seek during playback.
+    int32_t in_plan;
+
+    uint64_t frames_decoded;
+    /// Frames decoded and deliberately not shown, to land on the playhead while
+    /// paused. Not a performance figure.
+    uint64_t frames_skipped;
+    uint32_t input_calls;
+    uint32_t output_calls;
+    uint32_t acquire_ok;
+    uint32_t acquire_empty;
+
+    /// Guards `demuxer`, which this slot's input callback reads on one thread
+    /// while a seek repositions it on another.
+    pthread_mutex_t demux_lock;
+};
+
 struct PresenterState {
     OHNativeWindow *window;
     captrim_engine_t *engine;
@@ -86,11 +171,12 @@ struct PresenterState {
     int32_t surface_width;
     int32_t surface_height;
 
-    /// Where the decoder's output goes: a texture the compositor samples, not
-    /// the window. Its native window is what OH_VideoDecoder_SetSurface() gets.
-    /// It also owns the frame-available flag, so there is no second clock to
-    /// keep in step with the codec.
-    CompSource *comp_source;
+    /// Live decoders. A plan with more layers than this evicts the slot that
+    /// has gone unused longest.
+    SourceSlot slots[kMaxSources];
+    /// Slots that could not be opened this session (no decoder instance left,
+    /// missing file). Reported, never fatal while another layer still draws.
+    int32_t slot_failures;
 
     /// Forces a redraw without a new decoded frame: the surface needs one after
     /// a resize, when its contents are gone but the picture is not.
@@ -99,64 +185,31 @@ struct PresenterState {
     captrim_frame_desc_t last_desc;
     volatile int32_t has_last_desc;
 
-    uint64_t bound_source;
-    char uri[kUriMax];
-    int32_t fd;
-    OH_AVSource *source;
-    OH_AVDemuxer *demuxer;
-    OH_AVCodec *codec;
-    uint32_t track;
-    int32_t width;
-    int32_t height;
-
-    // Shared with the codec's callback threads, hence volatile.
-    volatile int64_t target_us;
-    volatile int64_t fed_pts_us;
-    volatile int32_t reached;
-    volatile int32_t eos;
-    volatile int32_t failed;
-    volatile int32_t abort;
-    /// Set while the codec is being restarted. The callbacks must not touch the
-    /// codec or the demuxer meanwhile: Stop() reclaims every buffer it handed
-    /// out, and feeding one back is an AV_ERR_INVALID_STATE at best.
-    volatile int32_t seeking;
-
-    /// Mirror of the transport state, so the output callback knows whether the
+    /// Mirror of the transport state, so the output callbacks know whether the
     /// playhead is moving. While it is not, only the frame at the playhead is
     /// allowed on screen -- the decoder hands out its pipeline worth of frames
     /// on every seek, and drawing all of them would park a paused preview ten
     /// frames past the scrub position.
     volatile int32_t playing;
 
-    int64_t last_rendered_us;
-    /// Frames the decoder produced and handed to the NativeImage. This is the
-    /// decode frontier, not what the viewer saw: the loop still has to composite
-    /// them.
-    uint64_t frames_decoded;
     /// Times a frame was actually drawn onto the window. A paused preview
-    /// composites once per new target, so this lags frames_decoded by design.
+    /// composites once per new target, so this outruns the latch counter by
+    /// design (one draw covers every layer).
     uint64_t frames_composited;
-    /// Frames decoded but deliberately not shown while paused, to land on the
-    /// playhead. Not a performance figure; kept apart from the drop count so an
-    /// exact scrub does not look like a device that cannot keep up.
-    uint64_t frames_skipped;
-    uint32_t input_calls;
-    uint32_t output_calls;
     uint32_t wait_timeouts;
     uint32_t present_calls;
-    uint32_t acquire_ok;
-    uint32_t acquire_empty;
 
-    // Two locks, deliberately:
+    // One lock plus one per slot, deliberately:
     //   `lock` guards loop state and the condition. It is never held across a
     //   codec call -- OH_VideoDecoder_Flush() waits for the callback threads to
     //   finish, and those callbacks take `lock` to signal, so holding it across
     //   a flush deadlocks the render loop on the first seek (observed: the loop
     //   went silent forever right after "Demuxer seek").
-    //   `demux_lock` guards the demuxer, which the input callback reads on one
-    //   thread while a seek repositions it on another.
+    //   Each slot's `demux_lock` guards its demuxer, which its own input
+    //   callback reads on one thread while a seek repositions it on another.
+    //   They are per slot because the decoders run concurrently: one lock for
+    //   all of them would serialise two independent pipelines.
     pthread_mutex_t lock;
-    pthread_mutex_t demux_lock;
     pthread_cond_t cond;
 
     // The render loop. It lives on its own thread because present() blocks until
@@ -194,13 +247,16 @@ void Signal(PresenterState *p) {
 
 void OnError(OH_AVCodec *codec, int32_t error_code, void *user_data) {
     (void)codec;
-    PresenterState *p = static_cast<PresenterState *>(user_data);
-    if (p == nullptr) {
+    // user_data is the slot, not the presenter: two decoders run at once, and a
+    // failure has to be attributed to the layer it belongs to.
+    SourceSlot *slot = static_cast<SourceSlot *>(user_data);
+    if (slot == nullptr || slot->owner == nullptr) {
         return;
     }
-    p->failed = 1;
-    CAPTRIM_LOGE("decoder error %{public}d", error_code);
-    Signal(p);
+    slot->failed = 1;
+    CAPTRIM_LOGE("decoder error %{public}d on clip %llu (source %llu)", error_code,
+                 (unsigned long long)slot->clip_id, (unsigned long long)slot->source_id);
+    Signal(slot->owner);
 }
 
 void OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *user_data) {
@@ -213,17 +269,24 @@ void OnStreamChanged(OH_AVCodec *codec, OH_AVFormat *format, void *user_data) {
 
 void OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
                        void *user_data) {
-    PresenterState *p = static_cast<PresenterState *>(user_data);
-    if (p == nullptr || p->abort) {
+    SourceSlot *slot = static_cast<SourceSlot *>(user_data);
+    if (slot == nullptr || slot->owner == nullptr || slot->abort) {
         return;
     }
+    PresenterState *p = slot->owner;
 
     // Backpressure. The playhead is the only clock that matters, so hold the
-    // input buffer until the decoder has caught up with it.
-    while (!p->abort && p->fed_pts_us > p->target_us + kFeedAheadUs) {
+    // input buffer until this slot has caught up with it. A layer that is not
+    // in the current plan stops being advanced (`target_us` is left where it
+    // was), so its decoder parks here rather than decoding frames nobody will
+    // see. `stop_requested` is part of the guard because this loop spins: a
+    // shutdown while a decoder is this far ahead would otherwise wait forever
+    // for a join that cannot happen.
+    while (!slot->abort && p->stop_requested == 0 &&
+           slot->fed_pts_us > slot->target_us + kFeedAheadUs) {
         usleep(2000);
     }
-    if (p->abort || p->demuxer == nullptr || p->seeking != 0) {
+    if (slot->abort || slot->demuxer == nullptr || slot->seeking != 0) {
         // During a codec restart the codec owns every buffer again; it
         // re-requests the ones it still needs, so dropping this call is
         // harmless.
@@ -233,17 +296,18 @@ void OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
     OH_AVCodecBufferAttr attr;
     memset(&attr, 0, sizeof(attr));
 
-    pthread_mutex_lock(&p->demux_lock);
-    if (p->demuxer == nullptr) {
-        pthread_mutex_unlock(&p->demux_lock);
+    pthread_mutex_lock(&slot->demux_lock);
+    if (slot->demuxer == nullptr) {
+        pthread_mutex_unlock(&slot->demux_lock);
         return;
     }
-    OH_AVErrCode rc = OH_AVDemuxer_ReadSampleBuffer(p->demuxer, p->track, buffer);
-    pthread_mutex_unlock(&p->demux_lock);
+    OH_AVErrCode rc = OH_AVDemuxer_ReadSampleBuffer(slot->demuxer, slot->track, buffer);
+    pthread_mutex_unlock(&slot->demux_lock);
 
     if (rc != AV_ERR_OK) {
-        CAPTRIM_LOGE("demux rc=%{public}d at fed=%{public}lld target=%{public}lld",
-                     rc, (long long)p->fed_pts_us, (long long)p->target_us);
+        CAPTRIM_LOGE("demux rc=%{public}d clip=%llu at fed=%{public}lld target=%{public}lld", rc,
+                     (unsigned long long)slot->clip_id, (long long)slot->fed_pts_us,
+                     (long long)slot->target_us);
         // End of stream: push an empty, EOS-flagged buffer so the codec drains
         // and reports EOS through the output callback.
         attr.size = 0;
@@ -256,26 +320,28 @@ void OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
     }
 
     OH_AVBuffer_GetBufferAttr(buffer, &attr);
-    p->fed_pts_us = attr.pts;
-    p->input_calls++;
+    slot->fed_pts_us = attr.pts;
+    slot->input_calls++;
     OH_AVErrCode push = OH_VideoDecoder_PushInputBuffer(codec, index);
-    // First few samples only: enough to prove the demuxer is feeding the codec
-    // the right thing (keyframe, sane size, accepted push) without logging at
-    // frame rate.
-    if (p->input_calls <= 3) {
-        CAPTRIM_LOGI("push #%{public}u size=%{public}d pts=%{public}lld key=%{public}d rc=%{public}d",
-                     p->input_calls, attr.size, (long long)attr.pts,
-                     (attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0, push);
+    // First few samples of each slot only: enough to prove the demuxer is
+    // feeding the codec the right thing (keyframe, sane size, accepted push)
+    // without logging at frame rate.
+    if (slot->input_calls <= 3) {
+        CAPTRIM_LOGI("push clip=%llu #%{public}u size=%{public}d pts=%{public}lld "
+                     "key=%{public}d rc=%{public}d",
+                     (unsigned long long)slot->clip_id, slot->input_calls, attr.size,
+                     (long long)attr.pts, (attr.flags & AVCODEC_BUFFER_FLAGS_SYNC_FRAME) != 0, push);
     }
 }
 
 void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
                        void *user_data) {
-    PresenterState *p = static_cast<PresenterState *>(user_data);
-    if (p == nullptr || p->abort) {
-        CAPTRIM_LOGE("output cb ignored (abort=%{public}d)", p != nullptr ? p->abort : -1);
+    SourceSlot *slot = static_cast<SourceSlot *>(user_data);
+    if (slot == nullptr || slot->owner == nullptr || slot->abort) {
+        CAPTRIM_LOGE("output cb ignored (abort=%{public}d)", slot != nullptr ? slot->abort : -1);
         return;
     }
+    PresenterState *p = slot->owner;
 
     OH_AVCodecBufferAttr attr;
     memset(&attr, 0, sizeof(attr));
@@ -285,20 +351,21 @@ void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
         return;
     }
 
-    if (p->seeking != 0) {
+    if (slot->seeking != 0) {
         // The flush is recycling this buffer; rendering it would race the seek.
         OH_VideoDecoder_FreeOutputBuffer(codec, index);
         return;
     }
 
-    p->output_calls++;
-    if (p->output_calls <= 3) {
-        CAPTRIM_LOGI("output #%{public}u pts=%{public}lld flags=%{public}u",
-                     p->output_calls, (long long)attr.pts, attr.flags);
+    slot->output_calls++;
+    if (slot->output_calls <= 3) {
+        CAPTRIM_LOGI("output clip=%llu #%{public}u pts=%{public}lld flags=%{public}u",
+                     (unsigned long long)slot->clip_id, slot->output_calls, (long long)attr.pts,
+                     attr.flags);
     }
 
     if ((attr.flags & AVCODEC_BUFFER_FLAGS_EOS) != 0) {
-        p->eos = 1;
+        slot->eos = 1;
         OH_VideoDecoder_FreeOutputBuffer(codec, index);
         Signal(p);
         return;
@@ -310,81 +377,91 @@ void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
     // playhead, which turned a short decode backlog into a slideshow (observed:
     // 57 frames drawn and 471 dropped over an 8 s timeline). Only frames that
     // cannot be what the playhead asked for are skipped, and only while paused.
-    if (p->playing == 0 && (attr.pts + 5000 < p->target_us || attr.pts > p->target_us + 1000)) {
+    if (p->playing == 0 && (attr.pts + 5000 < slot->target_us || attr.pts > slot->target_us + 1000)) {
         // Paused or scrubbing: draw exactly the frame at the playhead. The
         // decoder emits its whole pipeline (about ten frames) after a seek, so
         // anything else would leave the freeze frame off the scrub position.
         //
-        // Counted separately from `frames_dropped`: these frames are not lost to
+        // Counted separately from `dropped`: these frames are not lost to
         // slowness, they are deliberately skipped to land precisely. Rolling
         // them into the same counter made the status line read "丢帧 217" on a
         // device that never missed a deadline.
-        p->frames_skipped++;
+        slot->frames_skipped++;
         OH_VideoDecoder_FreeOutputBuffer(codec, index);
         return;
     }
 
-    // FreeOutputBuffer is not "discard" in surface mode: it hands the buffer to
-    // the surface the decoder was configured with, which is now the compositor's
-    // NativeImage rather than the XComponent. Its frame-available callback fires
-    // during that call and the render thread picks the frame up from there.
     // RenderOutputBuffer, not FreeOutputBuffer: the latter only returns the
     // buffer to the codec, while the former also hands it to the surface the
-    // decoder was configured with. That surface is now the compositor's
-    // NativeImage, so this call is what queues the frame for the render thread
-    // to latch -- using FreeOutputBuffer here decodes every frame and shows
-    // none (observed: three outputs, zero buffers in the image).
-    int32_t covers = attr.pts + kFrameToleranceUs >= p->target_us ? 1 : 0;
+    // decoder was configured with. That surface is this slot's NativeImage, so
+    // this call is what queues the frame for the render thread to latch --
+    // using FreeOutputBuffer here decodes every frame and shows none (observed:
+    // three outputs, zero buffers in the image).
+    int32_t covers = attr.pts + kFrameToleranceUs >= slot->target_us ? 1 : 0;
     OH_AVErrCode render_rc = OH_VideoDecoder_RenderOutputBuffer(codec, index);
     if (render_rc == AV_ERR_OK) {
-        p->last_rendered_us = attr.pts;
-        p->frames_decoded++;
+        slot->last_rendered_us = attr.pts;
+        slot->frames_decoded++;
         // The wait is satisfied only by a frame that actually covers the target;
         // older frames are still drawn -- they are the best picture available at
         // this instant -- so the surface ends on the newest frame at or before
         // the playhead instead of jumping straight to a future one.
         if (covers != 0) {
-            p->reached = 1;
+            slot->reached = 1;
             Signal(p);
         }
-    } else if (p->output_calls <= 5) {
-        CAPTRIM_LOGE("RenderOutputBuffer #%{public}u failed (%{public}d) pts=%{public}lld",
-                     p->output_calls, (int32_t)render_rc, (long long)attr.pts);
+    } else if (slot->output_calls <= 5) {
+        CAPTRIM_LOGE("RenderOutputBuffer #%{public}u failed (%{public}d) clip=%llu pts=%{public}lld",
+                     slot->output_calls, (int32_t)render_rc, (unsigned long long)slot->clip_id,
+                     (long long)attr.pts);
     }
 }
 
-void TeardownSource(PresenterState *p) {
-    p->abort = 1;
-    if (p->codec != nullptr) {
-        // Stop before the image goes away: the codec still holds buffers that
-        // belong to the NativeImage's queue, and dropping the queue first is a
-        // use-after-free inside the decoder.
-        OH_VideoDecoder_Stop(p->codec);
-        OH_VideoDecoder_Destroy(p->codec);
-        p->codec = nullptr;
+/// Release everything a slot holds and mark it free.
+///
+/// Order matters: the codec has to be stopped before its NativeImage goes away,
+/// because it still holds buffers that live in that image's queue -- dropping
+/// the queue first is a use-after-free inside the decoder.
+void TeardownSlot(SourceSlot *slot) {
+    slot->abort = 1;
+    if (slot->codec != nullptr) {
+        OH_VideoDecoder_Stop(slot->codec);
+        OH_VideoDecoder_Destroy(slot->codec);
+        slot->codec = nullptr;
     }
-    if (p->comp_source != nullptr) {
-        CompositorDestroySource(p->comp_source);
-        p->comp_source = nullptr;
+    if (slot->comp_source != nullptr) {
+        CompositorDestroySource(slot->comp_source);
+        slot->comp_source = nullptr;
     }
-    if (p->demuxer != nullptr) {
-        OH_AVDemuxer_Destroy(p->demuxer);
-        p->demuxer = nullptr;
+    if (slot->demuxer != nullptr) {
+        OH_AVDemuxer_Destroy(slot->demuxer);
+        slot->demuxer = nullptr;
     }
-    if (p->source != nullptr) {
-        OH_AVSource_Destroy(p->source);
-        p->source = nullptr;
+    if (slot->source != nullptr) {
+        OH_AVSource_Destroy(slot->source);
+        slot->source = nullptr;
     }
-    if (p->fd >= 0) {
-        close(p->fd);
-        p->fd = -1;
+    if (slot->fd >= 0) {
+        close(slot->fd);
+        slot->fd = -1;
     }
-    p->bound_source = 0;
-    p->eos = 0;
-    p->reached = 0;
-    p->failed = 0;
-    p->fed_pts_us = 0;
-    p->abort = 0;
+    slot->clip_id = 0;
+    slot->source_id = 0;
+    slot->uri[0] = '\0';
+    slot->track = 0;
+    slot->width = 0;
+    slot->height = 0;
+    slot->has_frame = 0;
+    slot->eos = 0;
+    slot->reached = 0;
+    slot->failed = 0;
+    slot->resume = 0;
+    slot->seeking = 0;
+    slot->fed_pts_us = 0;
+    slot->target_us = 0;
+    slot->last_rendered_us = -1;
+    slot->last_plan_us = -1;
+    slot->abort = 0;
 }
 
 
@@ -447,75 +524,77 @@ bool FormatString(OH_AVFormat *format, const char *key, char *out, int32_t out_l
     return false;
 }
 
-/// Open `source_id`, positioned at `target_us`, and leave the decoder started.
+/// Open `source_id` for one layer in `slot`, positioned at `target_us`, and
+/// leave the decoder started.
 ///
 /// The playhead is applied *before* Start(): Start() immediately issues the
 /// first input callbacks, and those feed whatever the demuxer is sitting on. An
 /// earlier version started at 0 and let RenderAt() seek afterwards, which meant
 /// every source switch decoded and threw away everything from 0 to the playhead
 /// -- 0.66 s of dead time and a burst of dropped frames at each cut.
-int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
-    TeardownSource(p);
-    if (p->window == nullptr) {
+int32_t OpenSlot(PresenterState *p, SourceSlot *slot, uint64_t clip_id, uint64_t source_id,
+                 int64_t target_us) {
+    TeardownSlot(slot);
+    if (p->window == nullptr || p->compositor == nullptr) {
         return -1;
     }
 
     int32_t needed = 0;
-    int32_t rc = captrim_engine_source_uri(p->engine, source_id, p->uri, kUriMax, &needed);
+    int32_t rc = captrim_engine_source_uri(p->engine, source_id, slot->uri, kUriMax, &needed);
     if (rc != 0) {
-        CAPTRIM_LOGE("source %llu has no uri (needed %d bytes)",
-                     (unsigned long long)source_id, needed);
+        CAPTRIM_LOGE("source %llu has no uri (needed %d bytes)", (unsigned long long)source_id,
+                     needed);
         return rc;
     }
 
-    const char *path = p->uri;
+    const char *path = slot->uri;
     if (strncmp(path, "file://", 7) == 0) {
         path += 7;
     }
-    p->fd = open(path, O_RDONLY);
-    if (p->fd < 0) {
+    slot->fd = open(path, O_RDONLY);
+    if (slot->fd < 0) {
         CAPTRIM_LOGE("cannot open %{public}s (errno %{public}d)", path, errno);
         return -5;
     }
-    off_t size = lseek(p->fd, 0, SEEK_END);
-    CAPTRIM_LOGI("opening %{public}s size=%{public}lld", path, (long long)size);
-    if (size <= 0 || lseek(p->fd, 0, SEEK_SET) != 0) {
+    off_t size = lseek(slot->fd, 0, SEEK_END);
+    if (size <= 0 || lseek(slot->fd, 0, SEEK_SET) != 0) {
         CAPTRIM_LOGE("cannot size %{public}s", path);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -5;
     }
+    CAPTRIM_LOGI("opening %{public}s size=%{public}lld for clip %llu", path, (long long)size,
+                 (unsigned long long)clip_id);
 
-    p->source = OH_AVSource_CreateWithFD(p->fd, 0, size);
-    if (p->source == nullptr) {
+    slot->source = OH_AVSource_CreateWithFD(slot->fd, 0, size);
+    if (slot->source == nullptr) {
         CAPTRIM_LOGE("OH_AVSource_CreateWithFD failed for %{public}s", path);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -5;
     }
-    p->demuxer = OH_AVDemuxer_CreateWithSource(p->source);
-    if (p->demuxer == nullptr) {
+    slot->demuxer = OH_AVDemuxer_CreateWithSource(slot->source);
+    if (slot->demuxer == nullptr) {
         CAPTRIM_LOGE("OH_AVDemuxer_CreateWithSource failed");
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -5;
     }
 
     // Find the first video track. A media file with no video is not an error
     // for the editor (audio-only clips exist), it just has nothing to draw.
-    OH_AVFormat *source_format = OH_AVSource_GetSourceFormat(p->source);
+    OH_AVFormat *source_format = OH_AVSource_GetSourceFormat(slot->source);
     int32_t track_count = 0;
     if (source_format == nullptr ||
         !OH_AVFormat_GetIntValue(source_format, kKeyTrackCount, &track_count)) {
         CAPTRIM_LOGE("cannot read track count");
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -5;
     }
 
     // Select by MIME ("video/...") rather than by OH_MD_KEY_TRACK_TYPE: the
     // track-type string is not stable across containers, while every decoder
     // path is keyed off the MIME anyway.
-    CAPTRIM_LOGI("track_count=%{public}d", track_count);
     OH_AVFormat *track_format = nullptr;
     for (int32_t i = 0; i < track_count; i++) {
-        OH_AVFormat *candidate = OH_AVSource_GetTrackFormat(p->source, static_cast<uint32_t>(i));
+        OH_AVFormat *candidate = OH_AVSource_GetTrackFormat(slot->source, static_cast<uint32_t>(i));
         if (candidate == nullptr) {
             continue;
         }
@@ -528,7 +607,7 @@ int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
         CAPTRIM_LOGI("track %{public}d mime=%{public}s via_dump=%{public}d", i, mime,
                      via_dump ? 1 : 0);
         if (strncmp(mime, "video/", 6) == 0) {
-            p->track = static_cast<uint32_t>(i);
+            slot->track = static_cast<uint32_t>(i);
             track_format = candidate;
             break;
         }
@@ -536,16 +615,17 @@ int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
     }
     if (track_format == nullptr) {
         CAPTRIM_LOGE("no video track in %{public}s", path);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -2;
     }
 
     // Select before Start: Start kicks off the input callback immediately, and a
     // read on a demuxer with no selected track fails with
     // AV_ERR_OPERATE_NOT_PERMIT (2).
-    if (OH_AVDemuxer_SelectTrackByID(p->demuxer, p->track) != AV_ERR_OK) {
+    if (OH_AVDemuxer_SelectTrackByID(slot->demuxer, slot->track) != AV_ERR_OK) {
         CAPTRIM_LOGE("SelectTrackByID failed");
-        TeardownSource(p);
+        OH_AVFormat_Destroy(track_format);
+        TeardownSlot(slot);
         return -6;
     }
 
@@ -558,17 +638,20 @@ int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
     if (mime[0] == '\0' || width <= 0 || height <= 0) {
         CAPTRIM_LOGE("video track lacks mime/size");
         OH_AVFormat_Destroy(track_format);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
-    p->width = width;
-    p->height = height;
+    slot->width = width;
+    slot->height = height;
 
-    p->codec = OH_VideoDecoder_CreateByMime(mime);
-    if (p->codec == nullptr) {
-        CAPTRIM_LOGE("no decoder for %{public}s (hardware decoder missing?)", mime);
+    slot->codec = OH_VideoDecoder_CreateByMime(mime);
+    if (slot->codec == nullptr) {
+        // Two layers means two decoder instances, and an SoC that has already
+        // handed out all of them answers exactly here. Worth a distinct message:
+        // the failure is "the device is out of decoders", not "the file is bad".
+        CAPTRIM_LOGE("no decoder for %{public}s (instance limit reached?)", mime);
         OH_AVFormat_Destroy(track_format);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
 
@@ -577,39 +660,37 @@ int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
     OH_AVFormat *configure = OH_AVFormat_Create();
     if (configure == nullptr) {
         OH_AVFormat_Destroy(track_format);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -9;
     }
     OH_AVFormat_SetIntValue(configure, kKeyWidth, width);
     OH_AVFormat_SetIntValue(configure, kKeyHeight, height);
     OH_AVFormat_SetIntValue(configure, kKeyPixelFormat, AV_PIXEL_FORMAT_SURFACE_FORMAT);
-    OH_AVErrCode code = OH_VideoDecoder_Configure(p->codec, configure);
+    OH_AVErrCode code = OH_VideoDecoder_Configure(slot->codec, configure);
     OH_AVFormat_Destroy(configure);
     if (code != AV_ERR_OK) {
         CAPTRIM_LOGE("Configure failed (%{public}d)", code);
         OH_AVFormat_Destroy(track_format);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
 
-    // Surface output mode, but the surface is the compositor's NativeImage
-    // rather than the XComponent: the pixels still never pass through user
-    // space, and they end up in a texture that can be scaled, moved and stacked.
-    if (p->comp_source == nullptr) {
-        p->comp_source = CompositorNewSource(p->compositor);
-        if (p->comp_source == nullptr) {
-            CAPTRIM_LOGE("cannot create an image source");
-            OH_AVFormat_Destroy(track_format);
-            TeardownSource(p);
-            return -6;
-        }
+    // Surface output mode, but the surface is this slot's own NativeImage rather
+    // than the XComponent: the pixels still never pass through user space, and
+    // they end up in a texture that can be scaled, moved and stacked.
+    slot->comp_source = CompositorNewSource(p->compositor);
+    if (slot->comp_source == nullptr) {
+        CAPTRIM_LOGE("cannot create an image source");
+        OH_AVFormat_Destroy(track_format);
+        TeardownSlot(slot);
+        return -6;
     }
     OH_AVErrCode surface_code =
-        OH_VideoDecoder_SetSurface(p->codec, CompositorSourceWindow(p->comp_source));
+        OH_VideoDecoder_SetSurface(slot->codec, CompositorSourceWindow(slot->comp_source));
     if (surface_code != AV_ERR_OK) {
         CAPTRIM_LOGE("SetSurface failed (%{public}d)", surface_code);
         OH_AVFormat_Destroy(track_format);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
 
@@ -618,89 +699,102 @@ int32_t OpenSource(PresenterState *p, uint64_t source_id, int64_t target_us) {
     callback.onStreamChanged = OnStreamChanged;
     callback.onNeedInputBuffer = OnNeedInputBuffer;
     callback.onNewOutputBuffer = OnNewOutputBuffer;
-    OH_AVErrCode callback_code = OH_VideoDecoder_RegisterCallback(p->codec, callback, p);
+    OH_AVErrCode callback_code = OH_VideoDecoder_RegisterCallback(slot->codec, callback, slot);
     if (callback_code != AV_ERR_OK) {
         CAPTRIM_LOGE("RegisterCallback failed (%{public}d)", callback_code);
         OH_AVFormat_Destroy(track_format);
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
     OH_AVFormat_Destroy(track_format);
 
-    if (OH_VideoDecoder_Prepare(p->codec) != AV_ERR_OK) {
+    if (OH_VideoDecoder_Prepare(slot->codec) != AV_ERR_OK) {
         CAPTRIM_LOGE("Prepare failed");
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
 
-    if (OH_VideoDecoder_Start(p->codec) != AV_ERR_OK) {
+    if (OH_VideoDecoder_Start(slot->codec) != AV_ERR_OK) {
         CAPTRIM_LOGE("Start failed");
-        TeardownSource(p);
+        TeardownSlot(slot);
         return -6;
     }
 
-    p->target_us = target_us;
-    p->fed_pts_us = target_us - 1;
-    p->last_rendered_us = -1;
+    // Claim the slot last: everything above may call TeardownSlot() on failure,
+    // and that frees the slot with clip_id = 0.
+    slot->owner = p;
+    slot->clip_id = clip_id;
+    slot->source_id = source_id;
+    slot->target_us = target_us;
+    slot->fed_pts_us = target_us - 1;
+    slot->last_rendered_us = -1;
+    slot->last_plan_us = -1;
     if (target_us > 0 &&
-        OH_AVDemuxer_SeekToTime(p->demuxer, target_us / 1000, SEEK_MODE_PREVIOUS_SYNC) !=
+        OH_AVDemuxer_SeekToTime(slot->demuxer, target_us / 1000, SEEK_MODE_PREVIOUS_SYNC) !=
             AV_ERR_OK) {
         CAPTRIM_LOGE("initial seek to %{public}lld failed", (long long)target_us);
     }
 
-    p->bound_source = source_id;
-    CAPTRIM_LOGI("opened %{public}s track %{public}u %{public}dx%{public}d %{public}s at %{public}lldms",
-                 path, p->track, width, height, mime, (long long)(target_us / 1000));
+    CAPTRIM_LOGI("clip %llu: %{public}s track %{public}u %{public}dx%{public}d %{public}s "
+                 "at %{public}lldms",
+                 (unsigned long long)clip_id, path, slot->track, width, height, mime,
+                 (long long)(target_us / 1000));
     return 0;
 }
 
-void SeekTo(PresenterState *p, int64_t target_us) {
+void SeekSlot(SourceSlot *slot, int64_t target_us) {
+    if (slot->codec == nullptr) {
+        return;
+    }
+    PresenterState *p = slot->owner;
     // Reset state first, then release every lock before touching the codec:
-    // Stop() waits for the callback threads, and those callbacks take `lock` to
-    // signal, so holding anything here deadlocks the render loop.
+    // Stop() waits for the callback threads, and those callbacks take the
+    // presenter lock to signal, so holding anything here deadlocks the render
+    // loop. This is why the state lock and the codec call are separated even
+    // though the codec belongs to the slot.
     pthread_mutex_lock(&p->lock);
-    p->fed_pts_us = target_us - 1;
-    p->eos = 0;
-    p->reached = 0;
-    p->failed = 0;
-    p->seeking = 1;
+    slot->fed_pts_us = target_us - 1;
+    slot->eos = 0;
+    slot->reached = 0;
+    slot->failed = 0;
+    slot->seeking = 1;
     pthread_mutex_unlock(&p->lock);
 
-    pthread_mutex_lock(&p->demux_lock);
-    if (p->demuxer != nullptr) {
+    pthread_mutex_lock(&slot->demux_lock);
+    if (slot->demuxer != nullptr) {
         // The demuxer seeks in milliseconds and lands on the previous sync
         // sample; the decoder then walks forward to the exact frame.
-        OH_AVDemuxer_SeekToTime(p->demuxer, target_us / 1000, SEEK_MODE_PREVIOUS_SYNC);
+        OH_AVDemuxer_SeekToTime(slot->demuxer, target_us / 1000, SEEK_MODE_PREVIOUS_SYNC);
     }
-    pthread_mutex_unlock(&p->demux_lock);
+    pthread_mutex_unlock(&slot->demux_lock);
 
     // Stop/Start rather than Flush: after a Flush this decoder never asked for
-    // input again, so the surface stayed on the old frame while RenderAt() ran
-    // out its wait budget (observed: a seek to 4 s left the picture at 8 s and
-    // the drawn counter frozen). Stop/Start is the documented lifecycle and
-    // Start reliably re-issues the input callbacks.
-    if (p->codec != nullptr) {
-        OH_VideoDecoder_Stop(p->codec);
-        if (OH_VideoDecoder_Start(p->codec) != AV_ERR_OK) {
-            CAPTRIM_LOGE("decoder restart after seek failed");
-        }
+    // input again, so the surface stayed on the old frame while the wait ran
+    // out its budget (observed: a seek to 4 s left the picture at 8 s and the
+    // drawn counter frozen). Stop/Start is the documented lifecycle and Start
+    // reliably re-issues the input callbacks.
+    OH_VideoDecoder_Stop(slot->codec);
+    if (OH_VideoDecoder_Start(slot->codec) != AV_ERR_OK) {
+        CAPTRIM_LOGE("decoder restart after seek failed (clip %llu)",
+                     (unsigned long long)slot->clip_id);
     }
-    p->seeking = 0;
+    slot->seeking = 0;
     Signal(p);
 }
 
-/// Ask the decoder for `target_us` and wait until that frame is on the surface.
-int32_t RenderAt(PresenterState *p, int64_t target_us) {
+/// Ask one slot for `target_us` and wait until that frame is on its surface.
+int32_t RenderSlotAt(SourceSlot *slot, int64_t target_us) {
+    PresenterState *p = slot->owner;
     pthread_mutex_lock(&p->lock);
-    bool need_seek = p->eos != 0 || target_us < p->last_rendered_us - kSeekBackUs ||
-                     target_us > p->fed_pts_us + kSeekAheadUs;
-    p->reached = 0;
-    p->failed = 0;
-    p->target_us = target_us;
+    bool need_seek = slot->eos != 0 || target_us < slot->last_rendered_us - kSeekBackUs ||
+                     target_us > slot->fed_pts_us + kSeekAheadUs;
+    slot->reached = 0;
+    slot->failed = 0;
+    slot->target_us = target_us;
     pthread_mutex_unlock(&p->lock);
 
     if (need_seek) {
-        SeekTo(p, target_us);
+        SeekSlot(slot, target_us);
     }
 
     struct timespec deadline;
@@ -714,31 +808,36 @@ int32_t RenderAt(PresenterState *p, int64_t target_us) {
 
     int32_t result = -6;
     pthread_mutex_lock(&p->lock);
-    while (p->reached == 0 && p->failed == 0 && p->eos == 0 && p->abort == 0 &&
+    while (slot->reached == 0 && slot->failed == 0 && slot->eos == 0 && slot->abort == 0 &&
            p->stop_requested == 0) {
         if (pthread_cond_timedwait(&p->cond, &p->lock, &deadline) == ETIMEDOUT) {
             break;
         }
     }
-    if (p->reached != 0) {
+    if (slot->reached != 0) {
         result = 0;
-    } else if (p->stop_requested == 0 && p->abort == 0) {
+    } else if (p->stop_requested == 0 && slot->abort == 0) {
         // A missed deadline is normal while seeking or when the decoder is
         // slow; only a run of them means something is wrong, so log sparsely.
         // Skip-free logging: this counter is cumulative, and a run of misses is
         // exactly what a starved decoder looks like from the outside.
         if (++p->wait_timeouts % 30 == 1) {
-            CAPTRIM_LOGE("no frame (miss #%{public}u): target=%{public}lld "
+            CAPTRIM_LOGE("no frame (miss #%{public}u) clip %llu: target=%{public}lld "
                          "fed=%{public}lld last=%{public}lld eos=%{public}d failed=%{public}d",
-                         p->wait_timeouts, (long long)target_us, (long long)p->fed_pts_us,
-                         (long long)p->last_rendered_us, p->eos, p->failed);
+                         p->wait_timeouts, (unsigned long long)slot->clip_id,
+                         (long long)target_us, (long long)slot->fed_pts_us,
+                         (long long)slot->last_rendered_us, slot->eos, slot->failed);
         }
     }
     pthread_mutex_unlock(&p->lock);
     return result;
 }
 
-/// Ask for `target_us`, waiting only when the transport is paused.
+/// Ask one slot for `target_us`, waiting only when the transport is paused.
+///
+/// Returns 0 when the frame at `target_us` is now in the slot's image, 1 when
+/// the request was only recorded (the caller must not assume new pixels), and a
+/// negative error otherwise.
 ///
 /// Playback is real-time: the clock is authoritative and the decoder is allowed
 /// to lag. Waiting for the exact frame is what broke it -- the clock ran ahead of
@@ -750,11 +849,13 @@ int32_t RenderAt(PresenterState *p, int64_t target_us) {
 ///
 /// Paused is the opposite case: nothing is moving, so waiting is the only way to
 /// land on the scrub position, and there is no clock to fall behind.
-int32_t RequestFrame(PresenterState *p, int64_t target_us) {
+int32_t RequestSlotFrame(SourceSlot *slot, int64_t target_us) {
+    PresenterState *p = slot->owner;
     if (p->playing == 0) {
-        return RenderAt(p, target_us);
+        return RenderSlotAt(slot, target_us);
     }
-    // Playing: only restart the pipeline at end of stream.
+    // Playing: only restart the pipeline at end of stream, or when the layer has
+    // just come back into the plan.
     //
     // An earlier version also seeked when the playhead got more than a second
     // ahead of the decode frontier. That is a trap: the decoder falls behind
@@ -764,15 +865,78 @@ int32_t RequestFrame(PresenterState *p, int64_t target_us) {
     // Measured: Present averaged 87 ms with 22 calls in a 2 s window, and the
     // decoded-frame counter moved by zero. Lagging during playback is caught up
     // by dropping frames, which is what realtime means.
-    if (p->eos != 0) {
-        SeekTo(p, target_us);
-        return 0;
+    //
+    // `resume` is what separates the two cases. A picture-in-picture clip that
+    // was off screen for two seconds has a decoder parked two seconds back and
+    // no way to know it, so it earns exactly one seek; a slow decoder has the
+    // same position gap but must never be seeked, because seeking is what made
+    // it slow. Only the render loop knows which one happened, and it says so
+    // with a flag.
+    if (slot->resume != 0) {
+        slot->resume = 0;
+        SeekSlot(slot, target_us);
+        return 1;
+    }
+    if (slot->eos != 0) {
+        SeekSlot(slot, target_us);
+        return 1;
     }
     pthread_mutex_lock(&p->lock);
-    p->target_us = target_us;
-    p->reached = 0;
+    slot->target_us = target_us;
+    slot->reached = 0;
     pthread_mutex_unlock(&p->lock);
-    return 0;
+    return 1;
+}
+
+/// The slot decoding `clip_id`, or null when this layer has no decoder yet.
+SourceSlot *SlotForClip(PresenterState *p, uint64_t clip_id) {
+    if (clip_id == 0) {
+        return nullptr;
+    }
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        if (p->slots[i].clip_id == clip_id && p->slots[i].codec != nullptr) {
+            return &p->slots[i];
+        }
+    }
+    return nullptr;
+}
+
+/// A slot to decode one more layer in, evicting the stalest one if needed.
+///
+/// The eviction rule is "the layer that has gone longest without being in a
+/// plan", not plain least-recently-used: on a timeline of many short clips every
+/// cut needs a new slot, and evicting one that is still on screen would tear the
+/// picture apart mid-frame. A slot in the current plan is only evicted when
+/// there is no other choice, i.e. when the plan itself has more layers than
+/// there are slots.
+SourceSlot *AllocSlot(PresenterState *p) {
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        if (p->slots[i].codec == nullptr) {
+            return &p->slots[i];
+        }
+    }
+
+    int32_t victim = -1;
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        bool planned = p->slots[i].in_plan != 0;
+        if (planned) {
+            continue;
+        }
+        if (victim < 0 || p->slots[i].last_plan_us < p->slots[victim].last_plan_us) {
+            victim = i;
+        }
+    }
+    if (victim < 0) {
+        for (int32_t i = 0; i < kMaxSources; i++) {
+            if (victim < 0 || p->slots[i].last_plan_us < p->slots[victim].last_plan_us) {
+                victim = i;
+            }
+        }
+    }
+    CAPTRIM_LOGE("no free decoder: evicting clip %llu for a layer of this frame",
+                 (unsigned long long)p->slots[victim].clip_id);
+    TeardownSlot(&p->slots[victim]);
+    return &p->slots[victim];
 }
 
 /// Latch the newest decoded frame and draw the plan onto the window.
@@ -792,28 +956,48 @@ int32_t RequestFrame(PresenterState *p, int64_t target_us) {
 /// expired, the newest frame the decoder did produce still belongs on screen.
 /// Withholding it is what makes a slow decoder look like a freeze.
 int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t force) {
-    if (p->compositor == nullptr || p->comp_source == nullptr) {
+    if (p->compositor == nullptr) {
         return 0;
     }
-
-    // Always try to latch. Gating this on the frame-available callback lost most
-    // of the video: the callback fires once per queue flush, while the decoder
-    // runs ~300 ms ahead and recycles buffers in between, so the loop saw one
-    // notification and missed the frames behind it (observed: 25 frames
-    // composited for an 8 s timeline that had 323 decoded). UpdateSurfaceImage
-    // returns NATIVE_ERROR_NO_BUFFER immediately when the queue is empty, so an
-    // unconditional attempt costs a function call and nothing else.
-    int32_t acquired = 0;
     p->present_calls++;
-    if (CompositorSourceAcquire(p->comp_source) == 0) {
-        acquired = 1;
-        p->acquire_ok++;
-    } else {
-        p->acquire_empty++;
-    }
-    if (acquired == 0 && p->compose_dirty == 0 && force == 0) {
-        // Nothing new, nothing to repair: the window already shows this frame.
-        return 0;
+
+    // Latch every live slot, unconditionally, and do it before anything can
+    // return early.
+    //
+    // Never gate this on the frame-available callback: it fires once per queue
+    // flush, while a decoder runs ~300 ms ahead and recycles buffers in
+    // between, so the loop saw one notification and missed the frames behind it
+    // (observed: 25 frames composited for an 8 s timeline that had 323
+    // decoded). UpdateSurfaceImage returns NATIVE_ERROR_NO_BUFFER immediately
+    // when the queue is empty, so an unconditional attempt costs a function
+    // call and nothing else.
+    //
+    // Nor may it be skipped when there is no plan to draw yet: a freshly opened
+    // clip takes a pipeline's worth of time to produce its first frame, and the
+    // step that opens it returns Present *before* that frame exists. Draining
+    // only when a plan is available left the preview stuck on black forever --
+    // the idle path then had nothing to draw, so it returned before latching,
+    // so no frame ever arrived.
+    //
+    // Every active slot is drained, not only the ones in this plan. A slot whose
+    // layer is currently off screen still has a decoder that would otherwise
+    // fill its image queue and block inside RenderOutputBuffer -- and that
+    // block happens in a callback, so a later OH_VideoDecoder_Stop() would wait
+    // on it forever.
+    int32_t fresh[kMaxSources];
+    memset(fresh, 0, sizeof(fresh));
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        SourceSlot &slot = p->slots[i];
+        if (slot.codec == nullptr || slot.comp_source == nullptr) {
+            continue;
+        }
+        if (CompositorSourceAcquire(slot.comp_source) == 0) {
+            slot.has_frame = 1;
+            slot.acquire_ok++;
+            fresh[i] = 1;
+        } else {
+            slot.acquire_empty++;
+        }
     }
 
     // A resize wipes the window but not the plan, so a redraw without a fresh
@@ -824,33 +1008,62 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
             return 0;
         }
         plan = &p->last_desc;
+    } else {
+        // Remember the geometry even if nothing can be drawn this time round:
+        // the frames that make it drawable arrive later, and the idle path needs
+        // the plan to be here when they do.
+        p->last_desc = *desc;
+        p->has_last_desc = 1;
     }
 
-    // One quad per video layer this presenter can actually feed. Only the bound
-    // source has a decoder, so a plan with two video layers (picture-in-picture)
-    // draws the one it owns and reports the rest through the layer counters --
-    // a second source needs a second codec and a second demuxer, which is a
-    // scheduling problem in the core rather than a drawing problem here.
+    // One quad per video layer that has pixels to show. A layer with no slot
+    // yet, or with a slot that has never latched a frame, is skipped rather
+    // than drawn: an uninitialised texture is not black, it is whatever was in
+    // that memory.
     CompLayer layers[CAPTRIM_MAX_LAYERS];
     int32_t count = 0;
+    int32_t any_new = 0;
     for (int32_t i = 0; i < plan->layer_count && count < CAPTRIM_MAX_LAYERS; i++) {
         const captrim_layer_desc_t *layer = &plan->layers[i];
-        if (layer->kind != CAPTRIM_LAYER_VIDEO || layer->source_id != p->bound_source) {
+        if (layer->kind != CAPTRIM_LAYER_VIDEO) {
             continue;
         }
+        int32_t which = -1;
+        for (int32_t s = 0; s < kMaxSources; s++) {
+            if (p->slots[s].clip_id != 0 && p->slots[s].clip_id == layer->clip_id) {
+                which = s;
+                break;
+            }
+        }
+        if (which < 0 || p->slots[which].has_frame == 0) {
+            continue;
+        }
+        SourceSlot &slot = p->slots[which];
         CompLayer &out = layers[count++];
         memset(&out, 0, sizeof(out));
-        out.texture = CompositorSourceTexture(p->comp_source);
-        out.tex_matrix = CompositorSourceMatrix(p->comp_source);
-        out.src_w = p->width;
-        out.src_h = p->height;
+        out.texture = CompositorSourceTexture(slot.comp_source);
+        out.tex_matrix = CompositorSourceMatrix(slot.comp_source);
+        out.src_w = slot.width;
+        out.src_h = slot.height;
         out.scale = layer->scale;
         out.dx = layer->dx;
         out.dy = layer->dy;
         out.rotation_deg = layer->rotation_deg;
         out.opacity = layer->opacity;
+        if (fresh[which] != 0) {
+            any_new = 1;
+        }
+    }
+
+    if (any_new == 0 && p->compose_dirty == 0 && force == 0) {
+        // Nothing new, nothing to repair: the window already shows this frame.
+        return 0;
     }
     if (count == 0) {
+        // Everything planned is still waiting for its first frame. Leave the
+        // window alone instead of clearing it: a freshly opened clip legitimately
+        // needs a pipeline's worth of time, and flashing black at every cut
+        // looks like a bug in the edit rather than a loading state.
         return 0;
     }
 
@@ -861,7 +1074,34 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
     p->last_desc = *plan;
     p->has_last_desc = 1;
     p->frames_composited++;
-    return acquired;
+    return any_new;
+}
+
+/// Put every decoder back on the frame the current plan wants.
+///
+/// Pausing cannot rely on the feed rate: the surface holds a frame from up to
+/// one feed lead ahead, and the paused state never asks for another one, so
+/// without this the freeze frame sits ~300 ms past where the user stopped.
+///
+/// Seeking each slot to its *layer's* source instant, rather than to the
+/// timeline position, also gets clip trims right: where a clip sits on the
+/// timeline is not where it sits in the file.
+void SeekAllToPlan(PresenterState *p) {
+    if (p->has_last_desc == 0) {
+        return;
+    }
+    for (int32_t i = 0; i < p->last_desc.layer_count; i++) {
+        const captrim_layer_desc_t *layer = &p->last_desc.layers[i];
+        if (layer->kind != CAPTRIM_LAYER_VIDEO) {
+            continue;
+        }
+        for (int32_t s = 0; s < kMaxSources; s++) {
+            if (p->slots[s].clip_id != 0 && p->slots[s].clip_id == layer->clip_id) {
+                SeekSlot(&p->slots[s], layer->source_us);
+                break;
+            }
+        }
+    }
 }
 
 /// Wait up to `us` on the presenter condition, so a transport command or a
@@ -941,10 +1181,7 @@ int32_t ApplyCommands(PresenterState *p, int64_t now) {
             // frame from up to one feed lead ahead, and the paused state never
             // asks for another one, so without this the freeze frame would sit
             // ~300 ms past where the user stopped.
-            int64_t position = 0;
-            if (captrim_preview_position(p->loop_preview, now, &position) == 0) {
-                SeekTo(p, position);
-            }
+            SeekAllToPlan(p);
         }
     }
     return seek;
@@ -996,18 +1233,53 @@ void *LoopMain(void *arg) {
 
         if (MonoUs() >= next_beat_us) {
             next_beat_us = MonoUs() + 2000000;
-            unsigned long long not_shown =
-                p->frames_decoded > p->acquire_ok ? p->frames_decoded - p->acquire_ok : 0;
+            uint64_t decoded = 0;
+            uint64_t latched = 0;
+            uint64_t empty = 0;
+            uint64_t skipped = 0;
+            uint32_t in_calls = 0;
+            uint32_t out_calls = 0;
+            int32_t live = 0;
+            for (int32_t i = 0; i < kMaxSources; i++) {
+                const SourceSlot &slot = p->slots[i];
+                if (slot.codec == nullptr) {
+                    continue;
+                }
+                live++;
+                decoded += slot.frames_decoded;
+                latched += slot.acquire_ok;
+                empty += slot.acquire_empty;
+                skipped += slot.frames_skipped;
+                in_calls += slot.input_calls;
+                out_calls += slot.output_calls;
+            }
+            unsigned long long not_shown = decoded > latched ? decoded - latched : 0;
             CAPTRIM_LOGI("loop: pos=%{public}lldms src=%{public}lldms kind=%{public}d "
-                         "drawn=%{public}llu unseen=%{public}llu skipped=%{public}llu "
-                         "in=%{public}u out=%{public}u calls=%{public}u ok=%{public}u "
-                         "empty=%{public}u busy=%{public}lldus/%{public}lld win=%{public}lldms",
+                         "slots=%{public}d drawn=%{public}llu unseen=%{public}llu "
+                         "skipped=%{public}llu in=%{public}u out=%{public}u calls=%{public}u "
+                         "ok=%{public}llu empty=%{public}llu fail=%{public}d "
+                         "busy=%{public}lldus/%{public}lld win=%{public}lldms",
                          (long long)(report.position_us / 1000), (long long)(report.source_us / 1000),
-                         report.kind, (unsigned long long)p->frames_composited, not_shown,
-                         (unsigned long long)p->frames_skipped, p->input_calls, p->output_calls,
-                         p->present_calls, p->acquire_ok, p->acquire_empty,
+                         report.kind, live, (unsigned long long)p->frames_composited, not_shown,
+                         (unsigned long long)skipped, in_calls, out_calls, p->present_calls,
+                         (unsigned long long)latched, (unsigned long long)empty, p->slot_failures,
                          (long long)busy_us, (long long)busy_count,
                          (long long)((now - p->clock_base_us) / 1000));
+            // One line per live decoder. Aggregates say "two layers are running"
+            // but not which one is starved, and with a picture-in-picture that
+            // is the only question worth asking.
+            for (int32_t i = 0; i < kMaxSources; i++) {
+                const SourceSlot &slot = p->slots[i];
+                if (slot.codec == nullptr) {
+                    continue;
+                }
+                CAPTRIM_LOGI("  slot clip=%llu src=%llu at=%{public}lldms dec=%{public}llu "
+                             "acq=%{public}u eos=%{public}d",
+                             (unsigned long long)slot.clip_id,
+                             (unsigned long long)slot.source_id,
+                             (long long)(slot.target_us / 1000),
+                             (unsigned long long)slot.frames_decoded, slot.acquire_ok, slot.eos);
+            }
             busy_us = 0;
             busy_count = 0;
         }
@@ -1030,22 +1302,21 @@ void *LoopMain(void *arg) {
         WaitOn(p, 2000);
     }
 
-    CAPTRIM_LOGI("render loop stopped (drawn %{public}llu, decoded %{public}llu, "
-                 "latched %{public}u, err %{public}d)",
-                 (unsigned long long)p->frames_composited,
-                 (unsigned long long)p->frames_decoded, p->acquire_ok, p->loop_error);
+    CAPTRIM_LOGI("render loop stopped (drawn %{public}llu, err %{public}d)",
+                 (unsigned long long)p->frames_composited, p->loop_error);
 
-    // The image source has to go before the context that owns its texture, and
-    // the context before the thread that made it current.
-    if (p->comp_source != nullptr) {
-        CompositorDestroySource(p->comp_source);
-        p->comp_source = nullptr;
+    // Order: each slot's codec and image first, then the context that owns the
+    // textures, then the thread that made it current.
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        if (p->slots[i].codec != nullptr || p->slots[i].comp_source != nullptr ||
+            p->slots[i].source != nullptr) {
+            TeardownSlot(&p->slots[i]);
+        }
     }
     if (p->compositor != nullptr) {
         CompositorDestroy(p->compositor);
         p->compositor = nullptr;
     }
-    p->bound_source = 0;
     p->loop_running = 0;
     return nullptr;
 }
@@ -1062,16 +1333,22 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_
         return nullptr;
     }
     p->engine = engine;
-    p->fd = -1;
-    p->last_rendered_us = -1;
     p->cmd_playing = -1;
+    // calloc leaves the slots zeroed, but "free" and "at the beginning of the
+    // file" must not be the same value, so every default that differs is set.
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        p->slots[i].owner = p;
+        p->slots[i].fd = -1;
+        p->slots[i].last_rendered_us = -1;
+        p->slots[i].last_plan_us = -1;
+        pthread_mutex_init(&p->slots[i].demux_lock, nullptr);
+    }
     // Layer geometry is relative to the canvas, so a zero size here would make
     // every layer degenerate. The page knows the XComponent's size; ask for it
     // rather than guessing from the window, which is still unconfigured.
     p->surface_width = width > 0 ? width : 1;
     p->surface_height = height > 0 ? height : 1;
     pthread_mutex_init(&p->lock, nullptr);
-    pthread_mutex_init(&p->demux_lock, nullptr);
     pthread_cond_init(&p->cond, nullptr);
 
     if (OH_NativeWindow_CreateNativeWindowFromSurfaceId(surface_id, &p->window) != 0 ||
@@ -1079,8 +1356,10 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_
         CAPTRIM_LOGE("cannot get native window for surface %llu",
                      (unsigned long long)surface_id);
         pthread_cond_destroy(&p->cond);
-        pthread_mutex_destroy(&p->demux_lock);
         pthread_mutex_destroy(&p->lock);
+        for (int32_t i = 0; i < kMaxSources; i++) {
+            pthread_mutex_destroy(&p->slots[i].demux_lock);
+        }
         free(p);
         return nullptr;
     }
@@ -1095,29 +1374,42 @@ void PresenterDestroy(Presenter *opaque) {
     }
     PresenterState *presenter = reinterpret_cast<PresenterState *>(opaque);
     // The loop owns the decoder callbacks and the preview session; it has to be
-    // gone before any of that is torn down.
+    // gone before any of that is torn down. It also tears the slots down itself
+    // on the way out, on the thread whose EGL context made their textures --
+    // which is why what is left here is normally nothing but the window.
     PresenterLoopStop(opaque);
-    TeardownSource(presenter);
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        if (presenter->slots[i].codec != nullptr || presenter->slots[i].source != nullptr ||
+            presenter->slots[i].fd >= 0) {
+            TeardownSlot(&presenter->slots[i]);
+        }
+        pthread_mutex_destroy(&presenter->slots[i].demux_lock);
+    }
     if (presenter->window != nullptr) {
         OH_NativeWindow_DestroyNativeWindow(presenter->window);
         presenter->window = nullptr;
     }
     pthread_cond_destroy(&presenter->cond);
-    pthread_mutex_destroy(&presenter->demux_lock);
     pthread_mutex_destroy(&presenter->lock);
     free(presenter);
 }
 
 namespace {
 
-/// Frames the decoder produced that never reached the screen.
+/// Frames the decoders produced that never reached the screen.
 ///
-/// Deliberately computed rather than accumulated: the two counters are updated
-/// on different threads (the output callback and the render loop), so a running
-/// tally drifts. The subtraction is exact as long as the loop is the only
-/// consumer, which it is.
+/// Deliberately computed rather than accumulated: the counters are updated on
+/// the codec callback threads while the loop latches, so a running tally drifts.
+/// The subtraction is exact as long as the loop is the only consumer, which it
+/// is.
 uint64_t FramesNotShown(const PresenterState *p) {
-    return p->frames_decoded > p->acquire_ok ? p->frames_decoded - p->acquire_ok : 0;
+    uint64_t decoded = 0;
+    uint64_t latched = 0;
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        decoded += p->slots[i].frames_decoded;
+        latched += p->slots[i].acquire_ok;
+    }
+    return decoded > latched ? decoded - latched : 0;
 }
 
 /// Publish a snapshot and attach the counters the loop owns.
@@ -1291,34 +1583,84 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
     out_report->layer_count = desc.layer_count;
     out_report->layer_overflow = desc.layer_overflow;
 
-    // Bottom-most video layer wins. Multi-layer compositing needs the GPU pass
-    // that does not exist yet; drawing an arbitrary layer would hide that gap.
-    const captrim_layer_desc_t *chosen = nullptr;
-    for (int32_t i = 0; i < desc.layer_count; i++) {
+    // Every video layer gets -- or keeps -- its own decoder. The plan is already
+    // bottom-to-top (the core sorts by z), so collecting it in order is also the
+    // compositor's draw order.
+    //
+    // `was_in_plan` is the previous present's membership: a layer that was off
+    // screen and is back needs one seek, and that transition is the only thing
+    // that can distinguish it from a slow decoder.
+    int32_t was_in_plan[kMaxSources];
+    for (int32_t i = 0; i < kMaxSources; i++) {
+        was_in_plan[i] = p->slots[i].in_plan;
+        p->slots[i].in_plan = 0;
+    }
+
+    const captrim_layer_desc_t *bottom = nullptr;
+    SourceSlot *used[CAPTRIM_MAX_LAYERS];
+    int64_t used_us[CAPTRIM_MAX_LAYERS];
+    int32_t used_count = 0;
+    int32_t open_errors = 0;
+
+    for (int32_t i = 0; i < desc.layer_count && used_count < CAPTRIM_MAX_LAYERS; i++) {
         const captrim_layer_desc_t *layer = &desc.layers[i];
         if (layer->kind != CAPTRIM_LAYER_VIDEO) {
+            // Subtitles and overlays need a text or image engine, not a decoder.
             continue;
         }
-        if (chosen == nullptr || layer->z < chosen->z) {
-            chosen = layer;
+        if (bottom == nullptr) {
+            bottom = layer;
         }
-    }
-    if (chosen == nullptr) {
-        Publish(p, out_report);
-        return 0;
-    }
-    out_report->source_us = chosen->source_us;
 
-    if (chosen->source_id != p->bound_source) {
-        // Open straight at the playhead: a clip that starts 4 s into the file
-        // should not decode the 4 s before it.
-        rc = OpenSource(p, chosen->source_id, chosen->source_us);
-        if (rc != 0) {
-            Publish(p, out_report);
-            return rc;
+        SourceSlot *slot = SlotForClip(p, layer->clip_id);
+        if (slot != nullptr && slot->source_id != layer->source_id) {
+            // An edit replaced the clip's media. The decoder is pointing at a
+            // file this layer no longer refers to.
+            TeardownSlot(slot);
+            slot = nullptr;
         }
+        int32_t just_opened = 0;
+        if (slot == nullptr) {
+            slot = AllocSlot(p);
+            // Open straight at the playhead: a clip that starts 4 s into the
+            // file should not decode the 4 s before it.
+            int32_t open_rc = OpenSlot(p, slot, layer->clip_id, layer->source_id, layer->source_us);
+            if (open_rc != 0) {
+                // Usually "the SoC has no decoder instance left", which is worth
+                // reporting and not worth killing the loop over: the layers that
+                // did open still draw. A frame where nothing opened is fatal,
+                // and is handled below.
+                p->slot_failures++;
+                open_errors++;
+                CAPTRIM_LOGE("layer %llu (source %llu) has no decoder: rc=%{public}d",
+                             (unsigned long long)layer->clip_id,
+                             (unsigned long long)layer->source_id, open_rc);
+                continue;
+            }
+            just_opened = 1;
+        }
+
+        int32_t index = static_cast<int32_t>(slot - p->slots);
+        if (just_opened == 0 && was_in_plan[index] == 0) {
+            slot->resume = 1;
+        }
+        slot->in_plan = 1;
+        slot->last_plan_us = desc.t_us;
+        used[used_count] = slot;
+        used_us[used_count] = layer->source_us;
+        used_count++;
     }
-    if (p->codec == nullptr) {
+
+    if (bottom != nullptr) {
+        out_report->source_us = bottom->source_us;
+    }
+    if (used_count == 0) {
+        if (open_errors > 0) {
+            // Something was planned and none of it could be decoded. Structural:
+            // record it and let the loop stop instead of retrying at 60 Hz.
+            Publish(p, out_report);
+            return -6;
+        }
         Publish(p, out_report);
         return 0;
     }
@@ -1326,12 +1668,12 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
     // Latch and draw before waiting for the exact frame.
     //
     // The decoder writes into a NativeImage, whose buffer queue holds only a
-    // couple of frames. Waiting on RenderAt() first means the queue stays full
-    // while the loop waits, the decoder stalls behind it, and the frame it is
-    // waiting for is the one that cannot be produced -- a mutual stall that
-    // showed up as 12 fps and 37 frames on screen for an 8 s clip. Draining the
-    // queue first keeps the decoder moving; the wait below then usually finds
-    // its frame already there.
+    // couple of frames. Waiting first means the queue stays full while the loop
+    // waits, the decoder stalls behind it, and the frame it is waiting for is
+    // the one that cannot be produced -- a mutual stall that showed up as 12 fps
+    // and 37 frames on screen for an 8 s clip. Draining the queues first keeps
+    // every decoder moving; the waits below then usually find their frame
+    // already there.
     int32_t composed = ComposePlan(p, &desc, 1);
     if (composed < 0) {
         // The EGL surface is gone (the XComponent detached). Nothing can be
@@ -1339,11 +1681,29 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
         Publish(p, out_report);
         return -7;
     }
-
-    RequestFrame(p, chosen->source_us);
     if (composed > 0) {
         out_report->drawn = 1;
-    }    Publish(p, out_report);
+    }
+
+    // Ask each decoder for its layer's instant. Paused, this waits and lands
+    // exactly; playing, it only moves each target and the loop drains next time.
+    int32_t arrived = 0;
+    for (int32_t i = 0; i < used_count; i++) {
+        if (RequestSlotFrame(used[i], used_us[i]) == 0) {
+            arrived = 1;
+        }
+    }
+    if (arrived != 0) {
+        // A frame landed during a wait, and for a paused preview that frame is
+        // the one the playhead asked for. Draw it now: leaving it for the next
+        // tick would show the previous picture one frame longer than the edit
+        // that produced it.
+        if (ComposePlan(p, &desc, 0) > 0) {
+            out_report->drawn = 1;
+        }
+    }
+
+    Publish(p, out_report);
     // A missed deadline is not fatal -- the loop just tries the next frame.
     // Only structural failures (no track, no decoder, unreadable file) propagate
     // as a non-zero return, and those are reported above.

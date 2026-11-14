@@ -138,11 +138,26 @@ impl Timeline {
     }
 }
 
-fn layer_kind(track_kind: TrackKind) -> LayerKind {
+/// Where this layer's pixels come from, which is what decides whether a platform
+/// runs a video decoder, an image loader or the text renderer.
+///
+/// An overlay track is a stacking position, not a media type: it can hold a video
+/// inset (picture-in-picture), a still, or a sticker. So the track kind alone
+/// cannot answer the question -- a picture-in-picture clip backed by an .mp4 must
+/// come out as `Video`, or a compositor that switches on `kind` draws nothing for
+/// it. `source_is_video` is that second half of the answer, and it is `true` when
+/// the media has not been probed yet: decoding is the only way to find out.
+fn layer_kind(track_kind: TrackKind, source_is_video: bool) -> LayerKind {
     match track_kind {
         TrackKind::MainVideo => LayerKind::Video,
-        TrackKind::Overlay => LayerKind::Overlay,
         TrackKind::Subtitle => LayerKind::Subtitle,
+        TrackKind::Overlay => {
+            if source_is_video {
+                LayerKind::Video
+            } else {
+                LayerKind::Overlay
+            }
+        }
         // Audio tracks never contribute pixels; callers filter them out first.
         TrackKind::Audio => LayerKind::Video,
     }
@@ -200,17 +215,15 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
                 .map(|m| m.uri.clone())
                 .unwrap_or_default();
 
-            if track.kind != TrackKind::Audio
-                && source_may_have(timeline, clip.source, true)
-                && clip.transform.scale > 0.0
-            {
+            let source_is_video = source_may_have(timeline, clip.source, true);
+            if track.kind != TrackKind::Audio && source_is_video && clip.transform.scale > 0.0 {
                 layers.push(Layer {
                     clip_id: clip.id,
                     source_id: clip.source,
                     uri: uri.clone(),
                     source_us,
                     z,
-                    kind: layer_kind(track.kind),
+                    kind: layer_kind(track.kind, source_is_video),
                     transform: clip.transform.clone(),
                     opacity: 1.0,
                     effects: clip.effects.clone(),
@@ -393,7 +406,22 @@ mod tests {
         assert_eq!(plan.layers[0].z, 0);
         assert_eq!(plan.layers[0].kind, LayerKind::Video);
         assert_eq!(plan.layers[1].z, 1);
-        assert_eq!(plan.layers[1].kind, LayerKind::Overlay);
+        // Video pixels on an overlay track are still video: the compositor has to
+        // run a decoder for them. A platform that read this as "a sticker" showed
+        // the main picture only, with no error anywhere -- a picture-in-picture
+        // that silently did not exist.
+        assert_eq!(plan.layers[1].kind, LayerKind::Video);
+    }
+
+    #[test]
+    fn an_overlay_that_is_not_video_stays_an_overlay() {
+        // The odd corner of the rule: the track is a stacking position, the media
+        // decides the kind. Once a probe says there is no video stream, there is
+        // nothing to decode and the layer is what the name suggests.
+        assert_eq!(layer_kind(TrackKind::Overlay, false), LayerKind::Overlay);
+        assert_eq!(layer_kind(TrackKind::Overlay, true), LayerKind::Video);
+        assert_eq!(layer_kind(TrackKind::MainVideo, false), LayerKind::Video);
+        assert_eq!(layer_kind(TrackKind::Subtitle, true), LayerKind::Subtitle);
     }
 
     #[test]

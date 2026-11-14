@@ -4,7 +4,7 @@ Android 与 HarmonyOS 共用的视频剪辑核心 SDK。**Rust 描述时间线�
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI / 鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖「剪映基础剪辑」：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-当前状态：**P0 骨架、P1 调度内核与鸿蒙硬解 + GL 合成上屏已跑通**（见[验证状态](#验证状态)）。预览的帧计划、时钟与状态机已实现并有测试覆盖；鸿蒙侧已用 AVCodec 硬解把帧送进 GPU 纹理，再由 GLES 按 transform 合成到 XComponent（真机实测，含缩放/平移/旋转）。
+当前状态：**P0 骨架、P1 调度内核与鸿蒙硬解 + GL 多图层合成已跑通**（见[验证状态](#验证状态)）。预览的帧计划、时钟与状态机已实现并有测试覆盖；鸿蒙侧已用 AVCodec 硬解把每一层送进各自的 GPU 纹理，再由 GLES 按 transform 逐层合成到 XComponent（真机实测，含画中画：两路解码同时跑，双路实时）。
 
 ---
 
@@ -83,7 +83,7 @@ bash scripts/check.sh           # 本地把 CI 的每一关按同样顺序跑一
 
 ```bash
 cargo fmt --all --check            # CI 的第一关；漏跑它会让后面四关在 CI 上被跳过
-cargo test --workspace             # 91 个测试
+cargo test --workspace             # 92 个测试
 cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warnings
 bash scripts/check-native-abi.sh   # 头文件 == Rust 导出 == NAPI == d.ts
 ```
@@ -249,12 +249,16 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 
 关键点：**解码器不直接写 XComponent**。它写到 `OH_NativeImage`（鸿蒙的 SurfaceTexture），帧变成 GPU 纹理，再由合成器按计划画成 quad。直出更快，但只能画一个全屏画面 —— 一旦有缩放、位移、第二个图层，就必须合成。
 
-四条约束决定了这个形状：
+**每个视频图层一个解码器**。`presenter.cpp` 里没有「当前那个解码器」，只有一组 `SourceSlot`（demuxer + codec + NativeImage + texture，外加自己的 target/eos/reached）。一次 present 会按计划里出现的图层逐个要槽位：没有就开一个，开不出来就记一笔并跳过这一层（SoC 解码器实例用尽是真实可能），槽位不够就淘汰「最久没出现在计划里」的那个。画中画因此不再需要 core 做任何调度——计划早就在每一层上写了 `source_id` 和 `source_us`，平台侧照着开解码器即可。
+
+六条约束决定了这个形状：
 
 1. **`present` 会阻塞**。它要等解码器把帧交给 surface（最多 ~120 ms）。早期版本在 ArkUI 的 `setInterval` 里直接调，系统判定主线程无响应并杀掉进程（`THREAD_BLOCK_6S`, `signal:9`）。现在循环跑在自己的线程，页面只发命令 + 读快照。
 2. **预览会话只有一个所有者**。`seek` / `setPlaying` 若从 UI 线程直接打进去，会和正在解码的循环抢时钟锚点。命令通过队列交给渲染线程执行（`PresenterControl` 只是入队 + 唤醒条件变量）。
-3. **不能跨 codec 调用持锁**。`OH_VideoDecoder_Flush/Stop` 会等回调线程返回，而回调要拿同一把锁去 signal —— 死锁后循环彻底静默。现在 `lock` 只保护状态与条件变量，`demux_lock` 单独保护 demuxer。
+3. **不能跨 codec 调用持锁**。`OH_VideoDecoder_Flush/Stop` 会等回调线程返回，而回调要拿同一把锁去 signal —— 死锁后循环彻底静默。现在 `lock` 只保护状态与条件变量，每个槽位有自己的 `demux_lock` 保护自己的 demuxer（两路解码时共用一把锁会把两条互不相干的流水线串起来）。
 4. **surface 队列很浅，先取帧再等帧**。`NativeImage` 只缓冲两三帧，若先在 `RenderAt` 里等「目标帧」，队列会一直满着，解码器被反压停住，而它要产的正是那个目标帧 —— 互相等待。实测表现为 8 秒素材只上屏 51 帧；改成「先 `ComposePlan` 排空队列，再请求下一帧」后恢复到 460+ 帧。
+5. **不在计划里的图层也要继续排空**。某层的画面暂时离场时，如果就此不再 latch，它的解码器会把这轮喂进去的帧填满自己的 image 队列，然后卡在 `RenderOutputBuffer` 里 —— 而这个调用发生在回调线程上，之后的 `OH_VideoDecoder_Stop()` 会一直等它。所以每轮都把**所有活着的槽位**排空一遍，只是不画。
+6. **离场再回来的图层要 seek 一次，且只能靠标志位判断**。播放中绝不 seek 追赶（那会自锁，见第 4 条）；但一个离屏两秒的图层，解码器就停在两秒前，靠「目标位置差得远」是区分不出「刚回到计划」和「解码器慢」的 —— 前者需要 seek，后者 seek 就会更慢。渲染循环知道真相，所以由它置 `resume` 标志，让这个槽位恰好 seek 一次。
 
 ## 七、已完成 / 未完成
 
@@ -268,13 +272,12 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 - **P1 调度内核**：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
 - 鸿蒙真机自检 App：9 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘
-- **鸿蒙硬解 + GL 合成上屏**：解码器输出到 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按计划把每个视频层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列，源切换/跳转/暂停落点/transform 已真机验证
-- 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包
+- **鸿蒙硬解 + GL 多图层合成上屏**：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放均已真机验证
+- 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包、本地 CI 全套
 
 **未完成（按优先级）**
 
-- P1 收尾：多源同时解码（画中画需要第二个 codec + demuxer，属于 core 的调度问题；合成器本身已按多图层写成循环，当前每个 presenter 只有一个 image 源）
-- P2：滤镜/转场/画中画/字幕渲染、音频混合、**重编码导出**（`ExportPlan`/`Segment` 抽象）
+- P2：音频输出 + hold-and-present（同时解决 A/V 偏移）、滤镜/转场/字幕渲染、图片与贴纸图层、**重编码导出**（`ExportPlan`/`Segment` 抽象）
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
 
@@ -286,7 +289,7 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 91 通过 | core 单元 57 + P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16 |
+| `cargo test --workspace` | ✅ 92 通过 | core 单元 58 + P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
 | `check-native-abi.sh` | ✅ 通过 | 27 个 C 函数、31 个 NAPI 函数，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入 |
@@ -298,6 +301,7 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 | **鸿蒙 HAP 打包** | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内仅 `libcaptrim.so` + `libcaptrim_napi.so`，无 `libc++_shared.so` |
 | **鸿蒙真机自检** | ✅ 9/9 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a，详见下节 |
 | **鸿蒙硬解 + GL 合成** | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（468 次合成，解码 458 帧仅 7 帧未上屏）；暂停落点误差 ≤1 帧；缩放/平移/旋转经 `set_transform` 全链路生效（截图对比） |
+| **画中画（双路解码）** | ✅ 真机出画面 | 主轨 + overlay 轨同时解码：`slots=2`、两路各自 latch 并合成，截图可见主画面与右下角内嵌画面；8 s 时间线双路播放 `pos` 与壁钟同为 6012 ms（1.00× 实时）；只改主视频的 transform 时内嵌画面保持原位（截图对比），证明两个图层互不干扰 |
 | **Android AAR 编译** | ⚠️ 未验证 | 本机有 SDK/NDK/Gradle 但无 Android 真机；Kotlin 与 JNI 签名（含 P1 新增 11 个）已逐一手工核对 |
 | **FFmpeg 实际编译** | ⚠️ 未验证 | 本机无 FFmpeg 源码树；FFmpeg 官方要求 make + 宿主 C 编译器 |
 
@@ -354,3 +358,7 @@ CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workf
 24. **`OH_NativeImage` 的队列很浅，等帧会把自己等死**。先在 `RenderAt` 里等「目标帧」再去合成，队列始终满着→解码器被反压→它产不出那个目标帧。实测：8 秒素材只上屏 51 帧。改成「每次循环先 `UpdateSurfaceImage` 排空队列，再请求下一帧」后恢复到 207 帧。同理，用 `OnFrameAvailable` 回调做门限也不行——回调按队列刷新触发，中间的帧全被漏掉（25 帧）。
 25. **`UpdateSurfaceImage` 没有 buffer 时是立即返回，不是阻塞**。返回 `NATIVE_ERROR_NO_BUFFER`（`40601000`）就能当作「这轮没新帧」，所以可以每帧无条件调，不必维护 frame-available 状态机。
 26. **`OH_AVFormat_GetStringValue` 在本机取不到 track mime**（返回非空指针但内容是乱码），要靠 `OH_AVFormat_DumpInfo` 的文本兜底解析，见 `FormatString()`。
+27. **overlay 轨道上的图层不一定是贴纸**。`layer_kind` 原来只看轨道类型，视频画中画因此被标成 `Overlay`，而平台按 `kind` 选渲染器时就不去解码——结果是「画中画静默消失」，日志里没有任何错误，`fail=0`、`slots=1`，只能靠数图层发现。现在按源是否有视频流决定（未探测 = 按视频处理，因为解码是唯一能看见它的方式）。
+28. **「有图层可画」不能当成 latch 的前置条件**。把 `UpdateSurfaceImage` 的排空放进「有计划才执行」的分支后，首帧永远到不了：打开解码器的那一步返回 Present 时帧还没产出，`count == 0` 于是没记住 `last_desc`，之后的空闲路径又因为 `has_last_desc == 0` 提前返回，于是再也不排空、画面停在黑色。排空必须在所有 early return 之前。
+29. **改了 Rust 核心就要重跑 `build-rust.sh ohos`**。HAP 打包只复制 `platforms/ohos/captrim/libs/` 里已经交叉编译好的 `libcaptrim.so`；只跑 `build-ohos-hap.sh` 装上去的还是旧核心。本轮为此多跑了一轮：C++ 已改对，日志里依然只有 1 个解码器。
+30. **槽位不会因为图层离场而关闭**。图层的画面走了，它的解码器留在槽位里空转（`target_us` 不再推进，输入回调自己就停在背压循环里）。这是刻意的：反复开关解码器比留着更贵，而需要腾地方时按 LRU 回收。`kMaxSources = 4` 是这个策略的上限，不是硬件的上限——真正的上限是 SoC 愿意发多少个实例，只能靠 `CreateByMime` 返回 null 发现。
