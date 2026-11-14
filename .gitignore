@@ -36,6 +36,10 @@ captures/
 local.properties
 .cxx/
 obfuscation-rules.txt.bak
+# Written by the IDE on sync, not by hand
+.clangd
+.clang-tidy
+**/BuildProfile.ets
 
 # Editors / OS
 .vscode/

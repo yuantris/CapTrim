@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "CapTrim device self-test"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Runs the CapTrim core on this device"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "CapTrim"
+    }
+  ]
+}

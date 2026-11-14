@@ -65,7 +65,8 @@ crates/captrim-ffi/       稳定 C ABI + 后端抽象（captrim.h 是唯一契�
 native/                   FFmpeg C shim（probe / remux）
 platforms/android/        Gradle AAR + CMake + JNI + Kotlin
 platforms/ohos/           HAR 工程 + CMake + Node-API + ArkTS + .d.ts
-scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验
+platforms/ohos/entry/     真机自检 App（9 项检查，结果写 hilog）
+scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建
 ```
 
 ## 四、快速开始
@@ -104,6 +105,20 @@ bash scripts/build-ffmpeg-android.sh
 bash scripts/build-rust.sh android
 cd platforms/android && ./gradlew :captrim:assembleRelease
 ```
+
+**5. 鸿蒙真机自检**
+
+`platforms/ohos/entry` 是个可直接装到手机上的 App：打开即在设备上跑 9 项检查，把每一行结果写进 hilog。
+
+```bash
+export DEVECO_HOME="/path/to/DevEco Studio"   # 未设置时按 hdc 位置推断
+bash scripts/build-ohos-hap.sh               # 产出 entry/build/.../entry-default-signed.hap
+bash scripts/build-ohos-hap.sh install       # 构建 + hdc install + 拉起页面
+
+hdc shell "hilog -x" | grep CapTrimDemo      # 看 check PASS/FAIL
+```
+
+首次构建需签名：在 DevEco Studio 打开 `platforms/ohos`，File → Project Structure → Signing Configs 勾选自动签名（需登录华为账号），签名材料写入同一份 `build-profile.json5`。未配置签名时 hvigor 只产出 unsigned HAP，`hdc install` 会报 `9568320 no signature file`。
 
 ## 五、API
 
@@ -209,11 +224,12 @@ when (step.kind) {
 - FFmpeg probe / remux 的 C shim + 特征门控后端（未启用时返回 `NO_BACKEND` 而非崩溃）
 - **P1 调度内核**：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
-- 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查
+- 鸿蒙真机自检 App：9 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘
+- 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包
 
 **未完成（按优先级）**
 
-- P1 收尾：硬解码器与 GPU 合成器**实现**（契约已定义，需真机）
+- P1 收尾：硬解码器与 GPU 合成器**实现**（契约已定义、调度已在真机验证，缺 AVCodec 解码与上屏）
 - P2：滤镜/转场/画中画/字幕渲染、音频混合、**重编码导出**（`ExportPlan`/`Segment` 抽象）
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
@@ -235,9 +251,24 @@ when (step.kind) {
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK，`-Wall -Wextra -Werror` 零警告；依赖仅 `libcaptrim.so` / `libace_napi.z.so` / `libc.so` |
 | ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 2 条「.so 未校验」告警（预期） |
 | 鸿蒙构建脚本端到端 | ✅ 通过 | Windows + Git Bash 实测产出并暂存 |
-| **Android AAR 编译** | ⚠️ 未验证 | 本机无 Android SDK/NDK/Gradle；Kotlin 与 JNI 签名（含 P1 新增 11 个）已逐一手工核对 |
+| **鸿蒙 HAP 打包** | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内仅 `libcaptrim.so` + `libcaptrim_napi.so`，无 `libc++_shared.so` |
+| **鸿蒙真机自检** | ✅ 9/9 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a，详见下节 |
+| **Android AAR 编译** | ⚠️ 未验证 | 本机有 SDK/NDK/Gradle 但无 Android 真机；Kotlin 与 JNI 签名（含 P1 新增 11 个）已逐一手工核对 |
 | **FFmpeg 实际编译** | ⚠️ 未验证 | 本机无 FFmpeg 源码树；FFmpeg 官方要求 make + 宿主 C 编译器 |
-| 真机运行 | ⚠️ 未验证 | 需真机；官方注明模拟器仅支持部分软解格式 |
+
+真机自检跑的是 **stub 后端**（无 FFmpeg），验证的是「原生库能加载、25 个 C 函数可用、整数时间轴在 arm64 上算得对、预览状态机不失控」，不含真实解码。9 项结果：
+
+```
+PASS 原生库加载与 N-API 绑定 | libcaptrim 0.1.0
+PASS 时间线构建（2 轨 3 片段） | 9.000s / 270 帧
+PASS 分割 / 撤销 / 重做 | 4 → 3 → 4
+PASS 29.97fps 帧栅格不塌陷 | 270 帧全部严格递增，最大误差 ≤1us
+PASS 逐帧源时间唯一（不重复帧） | 前 60 帧源时间严格递增
+PASS 预览时钟与丢帧统计 | 呈现 45 次 / 等待 45 次 / 位置 1500ms / 丢帧 0
+PASS 编辑后自动重绘 | 同帧不重复，改动后立即重绘
+PASS 音频主导时钟校正 | 漂移 50000us 已被校正
+PASS 错误码可读 | 0 → "ok"，未知片段正确报错
+```
 
 CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workflows/ci.yml`。
 
@@ -253,7 +284,7 @@ CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workf
 已踩过的，以及一定会踩的：
 
 1. **鸿蒙预构建库有硬约束**：`.so` 必须由 HarmonyOS NDK 工具链编译、**必须带 SONAME**（`llvm-readelf -d | grep SONAME` 验证，否则打包后加载不到）、架构限 `armeabi-v7a / arm64-v8a / x86_64`。
-2. **STL 一致性**：鸿蒙要求同一 App 内所有 Native 库的 `OHOS_STL` 一致。因此 NAPI 桥接刻意不依赖 `libc++_shared.so`（不用 `std::string`，`-fno-exceptions -fno-rtti -nostdlib++`），Android 侧用 `c++_static`。这是本仓库为规避该坑做的主动设计，不是随手写的编译选项。
+2. **STL 一致性**：鸿蒙要求同一 App 内所有 Native 库的 `OHOS_STL` 一致。HAR 侧通过 `-DOHOS_STL=none` + 桥接层不用 `std::string`（改用 `stdint.h`/`stdlib.h` 与 `malloc` RAII）做到零 C++ 运行时依赖，`-nostdlib++` 兜底；`llvm-readelf -d` 只剩 `libcaptrim.so / libace_napi.z.so / libc.so`。默认的 `c++_shared` 会额外往 HAP 里塞一个 1.2MB 的 `libc++_shared.so`，并把「宿主 App 必须也用 c++_shared」这个隐形要求传递出去。Android 侧用 `c++_static`。
 3. **`napi_env` / `JNIEnv` 禁止跨线程缓存**。当前 P0 导出在调用线程同步执行所以安全；一旦导出移到工作线程，进度回调**必须**改成 `napi_create_threadsafe_function`，否则随机闪退。
 4. **时间戳**：B 帧导致 DTS≠PTS；seek 必须退回关键帧再解码到目标帧；导出时自己生成单调递增 PTS，不要透传源文件时间戳。
 5. **不要做 YUV↔RGB↔YUV 往返**。Surface 模式解码直出纹理，鸿蒙 `AVBuffer` 回调本身零拷贝，自己 memcpy 会白吃掉一半性能。
@@ -265,3 +296,6 @@ CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workf
 11. **不要把截断后的 PTS 再喂给按下取整的接口**。这是 P1 实际踩到的坑：`frame_pts_us(1)` 对 30000/1001 返回 33366，而第 1 帧真正的起点是 33366.67 µs，再取整一次就回到第 0 帧，导出会静默重复帧。导出必须按帧索引走 `plan_frame_at`。
 12. **播放时钟不能用墙钟**。`System.currentTimeMillis()` 会被 NTP 校正，回拨会让播放卡死、前跳会让整段缓冲作废；必须用单调时钟（`System.nanoTime()`、`OH_GetTimeSinceBoot`）。
 13. **音画不同步先看 drift 再猜**。`syncAudio` 返回它修正了多少微秒，这个数持续变大说明音频输出设备的实际延迟与标称不符，而不是渲染慢——两者的修复方向完全相反。
+14. **DevEco 的 hvigor 不在工程里**。新版 IDE 把 hvigor 打包在 `tools/hvigor/`，工程根放一个 `hvigorw.js` 只会让它把依赖解析到 `<工程>/hvigor`（那里只有配置），报 `ENOENT ... workspace/node_modules/@ohos/hvigor/bin/hvigor.js`。正确做法是直接 `node <DevEco>/tools/hvigor/bin/hvigorw.js`，见 `scripts/build-ohos-hap.sh`。缓存坏了（同一报错但路径存在）删掉 `~/.hvigor/project_caches/<hash>/workspace` 即可。
+15. **`AppScope` 的资源目录是 `resources/base/`**，不是模板里的 `AppScope/res/`。写错时报的是 `The resource reference '$string:app_name' is not defined`（看着像少了字符串，其实是整棵资源树没被识别）。
+16. **未签名 HAP 装不上真机**：`hdc install` 报 `9568320 no signature file`，必须先在 IDE 里配好 Signing Configs（自动签名需登录华为账号）。

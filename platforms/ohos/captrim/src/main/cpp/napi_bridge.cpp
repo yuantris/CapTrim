@@ -15,8 +15,8 @@
 // library only depends on libc.
 #include <napi/native_api.h>
 
-#include <cstdint>
-#include <cstdlib>
+#include <stdint.h>
+#include <stdlib.h>
 
 #include "captrim.h"
 
@@ -27,13 +27,13 @@ namespace {
 class JsString {
 public:
     JsString() = default;
-    ~JsString() { std::free(data_); }
+    ~JsString() { free(data_); }
     JsString(const JsString &) = delete;
     JsString &operator=(const JsString &) = delete;
     JsString(JsString &&other) noexcept : data_(other.data_) { other.data_ = nullptr; }
     JsString &operator=(JsString &&other) noexcept {
         if (this != &other) {
-            std::free(data_);
+            free(data_);
             data_ = other.data_;
             other.data_ = nullptr;
         }
@@ -47,11 +47,11 @@ public:
         if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
             return out;
         }
-        out.data_ = static_cast<char *>(std::malloc(length + 1));
+        out.data_ = static_cast<char *>(malloc(length + 1));
         if (!out.data_) return out;
         size_t written = 0;
         if (napi_get_value_string_utf8(env, value, out.data_, length + 1, &written) != napi_ok) {
-            std::free(out.data_);
+            free(out.data_);
             out.data_ = nullptr;
             return out;
         }
