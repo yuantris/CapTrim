@@ -48,7 +48,24 @@ find_deveco() {
     return 1
 }
 
-DEVECO="$(find_deveco)" || die "DevEco Studio not found. Set DEVECO_HOME to the install root."
+# DevEco exports DEVECO_HOME in Windows form (D:\AppData\DevEco Studio). That
+# works for node, but not for $PATH lookups or any -f test in this shell, so
+# normalise it to the POSIX form this script uses everywhere.
+to_posix() {
+    local path="$1"
+    if [[ "$path" =~ ^([A-Za-z]):[\\/](.*)$ ]]; then
+        local drive rest
+        drive="$(printf '%s' "${BASH_REMATCH[1]}" | tr 'A-Z' 'a-z')"
+        rest="${BASH_REMATCH[2]//\\//}"
+        printf '/%s/%s\n' "$drive" "$rest"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+DEVECO="$(to_posix "$(find_deveco)")" ||
+    die "DevEco Studio not found. Set DEVECO_HOME to the install root."
+DEVECO="${DEVECO%/}"
 
 export DEVECO_SDK_HOME="$DEVECO/sdk"
 export PATH="$DEVECO/tools/node:$DEVECO/tools/ohpm/bin:$PATH"
@@ -72,10 +89,26 @@ esac
 
 log "node $(node --version) | hvigor from $DEVECO"
 
+# A real video is needed to prove that decode actually reaches the surface, and
+# an app cannot read /data/local/tmp (shell does not own the app sandbox), so the
+# sample rides inside the HAP as a rawfile and the app copies it out on first
+# launch. The file is injected here, never committed.
+RAWFILE_DIR="$OHOS_DIR/entry/src/main/resources/rawfile"
+if [ -n "${CAPTRIM_SAMPLE_MP4:-}" ]; then
+    [ -f "$CAPTRIM_SAMPLE_MP4" ] || die "CAPTRIM_SAMPLE_MP4 does not exist: $CAPTRIM_SAMPLE_MP4"
+    mkdir -p "$RAWFILE_DIR"
+    cp -f "$CAPTRIM_SAMPLE_MP4" "$RAWFILE_DIR/sample.mp4"
+    log "bundled sample: $CAPTRIM_SAMPLE_MP4 -> rawfile/sample.mp4"
+elif [ -f "$RAWFILE_DIR/sample.mp4" ]; then
+    log "bundled sample: reusing rawfile/sample.mp4"
+else
+    log "no sample video (set CAPTRIM_SAMPLE_MP4); the page will run logic checks only"
+fi
+
 # ohpm links file: dependencies (entry -> captrim HAR) into oh_modules.
 if [ ! -d "$OHOS_DIR/oh_modules/captrim" ]; then
     log "resolving module dependencies"
-    ohpm install --all >/dev/null
+    ( cd "$OHOS_DIR" && ohpm install --all >/dev/null )
 fi
 
 log "assembling entry HAP"
@@ -92,6 +125,8 @@ if [ "$ACTION" = "install" ]; then
     HDC="$DEVECO/sdk/default/openharmony/toolchains/hdc"
     [ -x "$HDC" ] || HDC="hdc"
     log "installing on $( "$HDC" list targets | head -n 1)"
-    "$HDC" install -r "$HAP"
-    "$HDC" shell aa start -a EntryAbility -b "$BUNDLE"
+    # hdc wants a path it can resolve on the host, and MSYS rewrites absolute
+    # ones; a relative name from the output directory sidesteps both.
+    ( cd "$OUT_DIR" && MSYS_NO_PATHCONV=1 "$HDC" install -r "$(basename "$HAP")" )
+    MSYS_NO_PATHCONV=1 "$HDC" shell aa start -a EntryAbility -b "$BUNDLE"
 fi

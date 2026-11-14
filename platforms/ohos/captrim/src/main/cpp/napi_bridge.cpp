@@ -19,6 +19,7 @@
 #include <stdlib.h>
 
 #include "captrim.h"
+#include "presenter.h"
 
 namespace {
 
@@ -430,6 +431,118 @@ napi_value PreviewStats(napi_env env, napi_callback_info info) {
     return IdResult(env, code, dropped);
 }
 
+
+napi_value PresentReportResult(napi_env env, int32_t code, const captrim::PresentReport &report) {
+    napi_value object = CodeResult(env, code);
+    napi_value value;
+    napi_create_int32(env, report.kind, &value);
+    napi_set_named_property(env, object, "kind", value);
+    napi_create_int64(env, report.due_wall_us, &value);
+    napi_set_named_property(env, object, "due_us", value);
+    napi_create_int64(env, report.source_us, &value);
+    napi_set_named_property(env, object, "source_us", value);
+    napi_create_int32(env, report.layer_count, &value);
+    napi_set_named_property(env, object, "layers", value);
+    napi_create_int32(env, report.layer_overflow, &value);
+    napi_set_named_property(env, object, "overflow", value);
+    napi_create_int32(env, report.drawn, &value);
+    napi_set_named_property(env, object, "drawn", value);
+    napi_create_int32(env, report.running, &value);
+    napi_set_named_property(env, object, "running", value);
+    napi_create_int32(env, report.error, &value);
+    napi_set_named_property(env, object, "error", value);
+    napi_create_int64(env, static_cast<int64_t>(report.frames), &value);
+    napi_set_named_property(env, object, "frames", value);
+    napi_create_int64(env, static_cast<int64_t>(report.dropped), &value);
+    napi_set_named_property(env, object, "dropped", value);
+    napi_create_int64(env, report.position_us, &value);
+    napi_set_named_property(env, object, "position_us", value);
+    return object;
+}
+
+/// Surface id arrives as a decimal string from XComponent.onSurfaceCreated.
+napi_value PresentCreate(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return HandleResult(env, CAPTRIM_ERR_INVALID, nullptr);
+
+    JsString surface = JsString::From(env, args[1]);
+    unsigned long long surface_id = strtoull(surface.c_str(), nullptr, 10);
+    captrim::Presenter *presenter =
+        captrim::PresenterCreate(AsEngine(GetInt64(env, args[0])), surface_id);
+    // The surface is not attached yet during the first layout pass; the caller
+    // retries once onSurfaceChanged. Not an error worth an exception.
+    return HandleResult(env, presenter ? CAPTRIM_OK : CAPTRIM_ERR_INVALID, presenter);
+}
+
+napi_value PresentStart(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+
+    auto *presenter = reinterpret_cast<captrim::Presenter *>(
+        static_cast<intptr_t>(GetInt64(env, args[0])));
+    if (presenter == nullptr) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    return CodeResult(env, captrim::PresenterLoopStart(presenter, AsPreview(GetInt64(env, args[1])),
+                                                       GetInt64(env, args[2])));
+}
+
+napi_value PresentStop(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    auto *presenter = reinterpret_cast<captrim::Presenter *>(
+        static_cast<intptr_t>(GetInt64(env, args[0])));
+    if (presenter == nullptr) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    return CodeResult(env, captrim::PresenterLoopStop(presenter));
+}
+
+/// presentControl(presenter, playing, seekUs): playing < 0 keeps the state,
+/// seekUs < 0 means "no seek". Both are queued for the render thread.
+napi_value PresentControl(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    auto *presenter = reinterpret_cast<captrim::Presenter *>(
+        static_cast<intptr_t>(GetInt64(env, args[0])));
+    if (presenter == nullptr) return CodeResult(env, CAPTRIM_ERR_INVALID);
+
+    int32_t playing = -1;
+    napi_get_value_int32(env, args[1], &playing);
+    int64_t seek_us = GetInt64(env, args[2]);
+    return CodeResult(env, captrim::PresenterControl(presenter, playing, seek_us >= 0 ? 1 : 0,
+                                                     seek_us));
+}
+
+napi_value PresentStatus(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return PresentReportResult(env, CAPTRIM_ERR_INVALID, captrim::PresentReport{});
+    auto *presenter = reinterpret_cast<captrim::Presenter *>(
+        static_cast<intptr_t>(GetInt64(env, args[0])));
+    if (presenter == nullptr) return PresentReportResult(env, CAPTRIM_ERR_INVALID, captrim::PresentReport{});
+
+    captrim::PresentReport report;
+    int32_t code = captrim::PresenterStatus(presenter, &report);
+    return PresentReportResult(env, code, report);
+}
+
+napi_value PresentRelease(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    auto *presenter = reinterpret_cast<captrim::Presenter *>(
+        static_cast<intptr_t>(GetInt64(env, args[0])));
+    captrim::PresenterDestroy(presenter);
+    return CodeResult(env, CAPTRIM_OK);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor descriptors[] = {
         {"createEngine", nullptr, CreateEngine, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -459,6 +572,15 @@ napi_value Init(napi_env env, napi_value exports) {
         {"previewSyncAudio", nullptr, PreviewSyncAudio, nullptr, nullptr, nullptr, napi_default,
          nullptr},
         {"previewStats", nullptr, PreviewStats, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"presentCreate", nullptr, PresentCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"presentStart", nullptr, PresentStart, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"presentStop", nullptr, PresentStop, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"presentControl", nullptr, PresentControl, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
+        {"presentStatus", nullptr, PresentStatus, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
+        {"presentRelease", nullptr, PresentRelease, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
     };
     napi_define_properties(env, exports,
                            sizeof(descriptors) / sizeof(descriptors[0]), descriptors);

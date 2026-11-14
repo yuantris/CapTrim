@@ -66,3 +66,50 @@ export const previewSyncAudio: (
   nowWallUs: number
 ) => I64Result;
 export const previewStats: (preview: number) => IdResult;
+
+/** Snapshot of the render loop, as reported by the native presenter. */
+export interface PresentResult extends CodeResult {
+  /** 0 idle, 1 present, 2 wait_frame, 3 end (mirrors StepKind). */
+  kind: number;
+  /** Set when kind is 2: wall clock the loop sleeps until next. */
+  due_us: number;
+  /** Source instant that reached the surface, -1 when nothing was drawn. */
+  source_us: number;
+  /** Layers in the plan, and layers dropped because the fixed array is full. */
+  layers: number;
+  overflow: number;
+  /** 1 when a decoded frame was rendered during the latest step. */
+  drawn: number;
+  /** 1 while the render loop thread is alive. */
+  running: number;
+  /** Sticky loop exit code: 0 while healthy. */
+  error: number;
+  /** Frames pushed to the surface, and frames the scheduler dropped. */
+  frames: number;
+  dropped: number;
+  /** Playhead in timeline time. */
+  position_us: number;
+}
+
+/** Bind a presenter to an XComponent surface id (decimal string). */
+export const presentCreate: (engine: number, surfaceId: string) => HandleResult;
+/**
+ * Start the render loop on its own thread. The loop owns `preview` from then
+ * on: drive it with presentControl, never by calling preview* directly.
+ * `nowUs` is the caller's clock; the loop advances it from CLOCK_MONOTONIC.
+ */
+export const presentStart: (presenter: number, preview: number, nowUs: number) => CodeResult;
+/** Stop and join the render loop. */
+export const presentStop: (presenter: number) => CodeResult;
+/**
+ * Queue a transport change for the loop. `playing` < 0 keeps the current state,
+ * `seekUs` < 0 means "no seek". Non-blocking, safe from the UI thread.
+ */
+export const presentControl: (
+  presenter: number,
+  playing: number,
+  seekUs: number
+) => CodeResult;
+/** Latest snapshot. Non-blocking, safe from the UI thread. */
+export const presentStatus: (presenter: number) => PresentResult;
+export const presentRelease: (presenter: number) => CodeResult;

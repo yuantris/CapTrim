@@ -22,13 +22,21 @@ import {
   previewStep,
   previewPosition,
   previewSyncAudio,
-  previewStats
+  previewStats,
+  presentCreate,
+  presentStart,
+  presentStop,
+  presentControl,
+  presentStatus,
+  presentRelease
 } from 'libcaptrim_napi.so';
 import type {
+  CodeResult,
   DurationResult,
   HandleResult,
   I64Result,
   IdResult,
+  PresentResult,
   StringResult
 } from 'libcaptrim_napi.so';
 
@@ -310,6 +318,11 @@ export class CapTrimPreview {
     return result.value_us;
   }
 
+  /** SDK internal: the native preview handle, for CapTrimPresenter. */
+  nativeHandle(): number {
+    return this.handle;
+  }
+
   /** Frames skipped because the render loop fell behind. */
   droppedFrames(): number {
     const result: IdResult = previewStats(this.handle);
@@ -327,6 +340,150 @@ export class CapTrimPreview {
   private static checkStatus(code: number): void {
     if (code !== 0) {
       throw new CapTrimError(code, lastErrorMessage().value);
+    }
+  }
+}
+
+/** Numeric step kinds of the C ABI mapped back to the string union. */
+const STEP_KINDS: StepKind[] = ['idle', 'present', 'wait_frame', 'end'];
+
+/**
+ * Presenter failures carry a status but no message: the message thread-local in
+ * the Rust engine belongs to the editor, not to the platform decoder, and reading
+ * it here would report a stale, unrelated error. Map the status instead.
+ */
+function presenterMessage(code: number): string {
+  if (code === -1) {
+    return 'presenter 参数无效';
+  }
+  if (code === -2) {
+    return '媒体里没有视频轨';
+  }
+  if (code === -5) {
+    return '打不开媒体文件';
+  }
+  if (code === -6) {
+    return '解码器失败（无硬解或码流不支持）';
+  }
+  return '预览失败';
+}
+
+/** Snapshot of the render loop, in the units the UI wants to show. */
+export interface PresentReport {
+  kind: StepKind;
+  /** wait_frame only: wall clock the loop sleeps until next. */
+  due_us: number;
+  /** Source instant that reached the surface, -1 when nothing was drawn. */
+  source_us: number;
+  layers: number;
+  /** Layers the plan had beyond the fixed array; never silently dropped. */
+  overflow: number;
+  /** True when a decoded frame was rendered during the latest step. */
+  drawn: boolean;
+  /** True while the render thread is alive. */
+  running: boolean;
+  /** Sticky loop exit code: 0 while healthy. */
+  error: number;
+  /** Frames pushed to the surface, and frames the scheduler dropped. */
+  frames: number;
+  dropped: number;
+  /** Playhead in timeline time. */
+  position_us: number;
+}
+
+function toPresentReport(result: PresentResult): PresentReport {
+  const report: PresentReport = {
+    kind: STEP_KINDS[result.kind],
+    due_us: result.due_us,
+    source_us: result.source_us,
+    layers: result.layers,
+    overflow: result.overflow,
+    drawn: result.drawn !== 0,
+    running: result.running !== 0,
+    error: result.error,
+    frames: result.frames,
+    dropped: result.dropped,
+    position_us: result.position_us
+  };
+  return report;
+}
+
+/**
+ * Draws the preview onto an XComponent surface with the platform decoder.
+ *
+ * This is the platform half of the P1 split: Rust decides which source instant
+ * belongs on screen, this class gets it decoded and presented. Create it from
+ * XComponent's onSurfaceCreated, which is the only place a valid surface id
+ * exists, and close it in onSurfaceDestroyed.
+ *
+ * The decode loop runs on a native thread, not on the ArkTS event loop:
+ * presenting a frame blocks until the hardware decoder hands it to the surface,
+ * and doing that on the UI thread gets the app killed for being unresponsive
+ * (observed: THREAD_BLOCK_6S). The page only sends transport commands and polls
+ * status().
+ *
+ * Ownership: after start(), the native loop owns the preview session. Never
+ * call seek()/setPlaying()/step() on that CapTrimPreview yourself -- going
+ * around the loop races the decoder and tears the clock anchor. Use control().
+ */
+export class CapTrimPresenter {
+  private handle: number = 0;
+
+  private constructor(handle: number) {
+    this.handle = handle;
+  }
+
+  /** Returns null when the surface is not ready yet; retry on the next callback. */
+  static create(editor: CapTrim, surfaceId: string): CapTrimPresenter | null {
+    const result: HandleResult = presentCreate(editor.nativeHandle(), surfaceId);
+    if (result.code !== 0 || result.handle === 0) {
+      return null;
+    }
+    return new CapTrimPresenter(result.handle);
+  }
+
+  /**
+   * Hand `preview` to the render loop and start decoding on a native thread.
+   * `nowUs` is the current wall clock; the loop advances it on its own.
+   */
+  start(preview: CapTrimPreview, nowUs: number): void {
+    const result: CodeResult = presentStart(this.handle, preview.nativeHandle(), nowUs);
+    if (result.code !== 0) {
+      throw new CapTrimError(result.code, presenterMessage(result.code));
+    }
+  }
+
+  /**
+   * Queue a transport change. `playing` < 0 leaves the state alone, `seekUs` < 0
+   * means "no seek". Returns immediately; the loop applies it on its next tick.
+   */
+  control(playing: number, seekUs: number): void {
+    const result: CodeResult = presentControl(this.handle, playing, seekUs);
+    if (result.code !== 0) {
+      throw new CapTrimError(result.code, presenterMessage(result.code));
+    }
+  }
+
+  /** Latest snapshot of the loop. Never blocks on a decode. */
+  status(): PresentReport {
+    const result: PresentResult = presentStatus(this.handle);
+    if (result.code !== 0) {
+      throw new CapTrimError(result.code, presenterMessage(result.code));
+    }
+    return toPresentReport(result);
+  }
+
+  /** Stop and join the render loop. Safe to call more than once. */
+  stop(): void {
+    if (this.handle !== 0) {
+      presentStop(this.handle);
+    }
+  }
+
+  close(): void {
+    if (this.handle !== 0) {
+      presentRelease(this.handle);
+      this.handle = 0;
     }
   }
 }

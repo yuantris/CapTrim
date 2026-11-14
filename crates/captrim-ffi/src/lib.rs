@@ -16,11 +16,13 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod backend;
+pub mod frame_desc;
 pub mod preview;
 
 pub use backend::{default_backend, MediaBackend, StubBackend};
 // The preview entry points are `#[no_mangle] extern "C"`, and Rust callers of
 // this crate expect to find them alongside the engine ones.
+pub use frame_desc::*;
 pub use preview::*;
 
 use captrim_core::{
@@ -367,6 +369,62 @@ pub extern "C" fn captrim_engine_export_remux(
             None => true,
         };
         e.backend.remux(src, dst, &mut report)?;
+        Ok(0)
+    })
+}
+
+/// Copy a media source's URI into a caller buffer.
+///
+/// A renderer has a `source_id` from the frame plan and needs the file to open
+/// a decoder; this is the lookup, kept inside the engine so the draft stays the
+/// only place that knows where media lives. Passing too small a buffer fails
+/// with `CAPTRIM_ERR_OUT_OF_RANGE` but still reports the required length, so a
+/// caller can retry instead of guessing.
+#[no_mangle]
+pub extern "C" fn captrim_engine_source_uri(
+    engine: *mut captrim_engine_t,
+    source_id: u64,
+    buf: *mut c_char,
+    buf_len: i32,
+    out_len: *mut i32,
+) -> i32 {
+    ffi_guard(|| {
+        if buf.is_null() || out_len.is_null() {
+            return Err(Error::invalid("buf and out_len must not be null"));
+        }
+        if buf_len <= 0 {
+            return Err(Error::invalid("buf_len must be positive"));
+        }
+        let e = engine_from(engine)?;
+        let uri = {
+            let editor = lock(&e.editor)?;
+            editor
+                .timeline()
+                .media
+                .iter()
+                .find(|m| m.id == source_id)
+                .map(|m| m.uri.clone())
+                .ok_or_else(|| Error::not_found(format!("media {source_id}")))?
+        };
+
+        let bytes = uri.as_bytes();
+        let needed = i32::try_from(bytes.len())
+            .map_err(|_| Error::OutOfRange("uri is too long for an i32 length".into()))?;
+        // SAFETY: out_len is non-null and points at caller-owned storage.
+        unsafe { *out_len = needed };
+        if needed + 1 > buf_len {
+            return Err(Error::OutOfRange(format!(
+                "buffer holds {} bytes, uri needs {}",
+                buf_len,
+                needed + 1
+            )));
+        }
+        // SAFETY: the caller promised buf_len writable bytes and we just proved
+        // needed + 1 <= buf_len; source and destination cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+            *buf.add(bytes.len()) = 0;
+        }
         Ok(0)
     })
 }

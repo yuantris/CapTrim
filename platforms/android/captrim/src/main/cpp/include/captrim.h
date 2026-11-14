@@ -154,6 +154,87 @@ int32_t captrim_preview_sync_audio(captrim_preview_t *preview,
 int32_t captrim_preview_stats(captrim_preview_t *preview,
                               uint64_t *out_dropped_frames);
 
+/* ---------------------------------------------------------------------------
+ * Binary frame plan, for the renderer.
+ *
+ * captrim_preview_step() returns JSON, which is right for script front-ends but
+ * wrong for a compositor running at 60 Hz: it allocates and parses per frame,
+ * on a path that has a hard deadline. A real renderer calls
+ * captrim_preview_step_frame() instead and reads the struct directly -- no
+ * allocation, no parsing, no ownership rules to remember.
+ *
+ * The two functions return the same decision for the same inputs; they share
+ * one implementation. Nothing here is valid after the preview is freed.
+ * ------------------------------------------------------------------------- */
+
+#define CAPTRIM_MAX_LAYERS 8
+
+/* Same values as the JSON "kind" field of a layer. */
+typedef enum {
+    CAPTRIM_LAYER_VIDEO = 0,
+    CAPTRIM_LAYER_SUBTITLE = 1,
+    CAPTRIM_LAYER_OVERLAY = 2
+} captrim_layer_kind_t;
+
+typedef struct {
+    uint64_t clip_id;
+    uint64_t source_id;
+    /* Exact source instant to decode, already mapped through clip speed. */
+    int64_t source_us;
+    /* Draw order, 0 is the bottom. */
+    int32_t z;
+    int32_t kind; /* captrim_layer_kind_t */
+    float scale;
+    float dx;
+    float dy;
+    float rotation_deg;
+    float opacity;
+} captrim_layer_desc_t;
+
+typedef struct {
+    int64_t t_us;
+    uint64_t frame_index;
+    uint32_t width;
+    uint32_t height;
+    int32_t layer_count;
+    /* Layers beyond CAPTRIM_MAX_LAYERS are dropped and reported here, never
+     * silently: a renderer that draws 8 of 9 layers looks like a UI bug. */
+    int32_t layer_overflow;
+    int32_t audio_count;
+    captrim_layer_desc_t layers[CAPTRIM_MAX_LAYERS];
+} captrim_frame_desc_t;
+
+/* Same values as the JSON "kind" field of a step. */
+typedef enum {
+    CAPTRIM_STEP_IDLE = 0,
+    CAPTRIM_STEP_PRESENT = 1,
+    CAPTRIM_STEP_WAIT_FRAME = 2,
+    CAPTRIM_STEP_END = 3
+} captrim_step_kind_t;
+
+/* One step, written into caller-owned memory.
+ *
+ * out_frame is filled only when *out_kind is CAPTRIM_STEP_PRESENT;
+ * out_due_wall_us only when it is CAPTRIM_STEP_WAIT_FRAME.
+ * Either out pointer may be NULL if the caller does not need it.
+ *
+ * Returns 0 on success, or a CAPTRIM_ERR_* status; on error the outputs are
+ * left untouched. */
+int32_t captrim_preview_step_frame(captrim_preview_t *preview,
+                                   int64_t now_wall_us,
+                                   captrim_frame_desc_t *out_frame,
+                                   int32_t *out_kind,
+                                   int64_t *out_due_wall_us);
+
+/* URI of a media source, so the renderer can open the file the plan refers to.
+ *
+ * Writes a NUL-terminated UTF-8 string into buf and sets *out_len to the length
+ * without the terminator. If the buffer is too small the call fails with
+ * CAPTRIM_ERR_OUT_OF_RANGE and still writes the required length to *out_len, so
+ * the caller can retry with a bigger buffer. */
+int32_t captrim_engine_source_uri(captrim_engine_t *engine, uint64_t source_id,
+                                  char *buf, int32_t buf_len, int32_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

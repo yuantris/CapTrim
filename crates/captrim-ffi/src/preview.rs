@@ -20,8 +20,8 @@ pub struct captrim_preview_t {
     _private: [u8; 0],
 }
 
-struct PreviewState {
-    session: PreviewSession,
+pub(crate) struct PreviewState {
+    pub(crate) session: PreviewSession,
     /// Editor revision the session was built from.
     revision: u64,
 }
@@ -37,7 +37,7 @@ impl Preview {
     /// This is what makes an edit show up without the platform having to know
     /// that editing and rendering are coupled: the compositor gets a new plan
     /// for the same frame index as soon as the draft's revision moves.
-    fn sync_from_engine(&self, state: &mut PreviewState) -> CoreResult<()> {
+    pub(crate) fn sync_from_engine(&self, state: &mut PreviewState) -> CoreResult<()> {
         let revision = lock(&self.engine.editor)?.revision();
         if revision == state.revision {
             return Ok(());
@@ -56,7 +56,7 @@ fn registry() -> &'static Mutex<HashMap<u64, Arc<Preview>>> {
     PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn preview_from(h: *mut captrim_preview_t) -> CoreResult<Arc<Preview>> {
+pub(crate) fn preview_from(h: *mut captrim_preview_t) -> CoreResult<Arc<Preview>> {
     if h.is_null() {
         return Err(Error::invalid("null preview handle"));
     }
@@ -69,7 +69,7 @@ fn preview_from(h: *mut captrim_preview_t) -> CoreResult<Arc<Preview>> {
         .ok_or_else(|| Error::not_found("preview handle is invalid or already freed"))
 }
 
-fn state(preview: &Preview) -> CoreResult<std::sync::MutexGuard<'_, PreviewState>> {
+pub(crate) fn state(preview: &Preview) -> CoreResult<std::sync::MutexGuard<'_, PreviewState>> {
     preview
         .state
         .lock()

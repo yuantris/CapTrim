@@ -36,6 +36,10 @@ captures/
 local.properties
 .cxx/
 obfuscation-rules.txt.bak
+# Sample media is injected at build time by scripts/build-ohos-hap.sh, never
+# committed: it is a 20 MB video, and a test asset that size does not belong in git.
+/platforms/ohos/entry/src/main/resources/rawfile/
+
 # Written by the IDE on sync, not by hand
 .clangd
 .clang-tidy
@@ -46,6 +50,9 @@ obfuscation-rules.txt.bak
 .DS_Store
 Thumbs.db
 *.swp
+
+# Scratch space for device runs (layout dumps, screenshots pulled with hdc)
+/.tmp/
 
 # Patch artifacts
 *.orig

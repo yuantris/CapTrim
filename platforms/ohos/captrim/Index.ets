@@ -2,6 +2,8 @@ export {
   CapTrim,
   CapTrimError,
   CapTrimPreview,
+  CapTrimPresenter,
+  PresentReport,
   ProgressCallback,
   AudioMix,
   FrameLayer,
