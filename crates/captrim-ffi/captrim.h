@@ -73,6 +73,87 @@ int32_t captrim_engine_export_remux(captrim_engine_t *engine,
                                     const char *src_uri, const char *dst_uri,
                                     captrim_progress_cb progress, void *user_data);
 
+/* ---- Frame planning (P1) -------------------------------------------------
+ * Preview and export read the same plan, which is what keeps "what I saw" and
+ * "what got written" identical.
+ *
+ * captrim_engine_plan_frame_at() addresses one frame by index: use it to walk
+ * an export. captrim_engine_plan_frame() floors a timestamp onto the frame
+ * grid: use it while scrubbing or during playback. Do NOT feed a PTS from
+ * plan_frame's output back into plan_frame; flooring twice collapses NTSC
+ * frames onto their predecessor.
+ *
+ * out_json is a FramePlan object, owned by CapTrim. Release it with
+ * captrim_string_free().
+ */
+int32_t captrim_engine_plan_frame_at(captrim_engine_t *engine,
+                                     uint64_t frame_index, char **out_json);
+int32_t captrim_engine_plan_frame(captrim_engine_t *engine, int64_t t_us,
+                                  char **out_json);
+
+/* Timeline length. Either out pointer may be NULL. */
+int32_t captrim_engine_duration(captrim_engine_t *engine,
+                                int64_t *out_duration_us,
+                                uint64_t *out_frame_count);
+
+/* ---- Preview session (P1) ------------------------------------------------
+ * One preview owns one playback clock and one "frame currently on screen".
+ *
+ * Every now_wall_us argument must come from the SAME monotonic clock
+ * (CLOCK_MONOTONIC, or OH_GetTimeSinceBoot on HarmonyOS) in microseconds.
+ * Never pass a wall-clock date: a clock that jumps backwards will stall
+ * playback, and one that jumps forwards will drop the whole buffer.
+ *
+ * The platform loop is:
+ *     step() -> present  -> decode plan.layers, composite, show
+ *            -> wait_frame -> sleep until due_wall_us, then step() again
+ *            -> idle      -> paused, block on a UI event
+ *            -> end       -> stop
+ *
+ * The session notices engine edits on the next step() and re-plans the same
+ * frame index, so an edit repaints without the platform asking for it.
+ */
+typedef struct captrim_preview captrim_preview_t;
+
+int32_t captrim_preview_new(captrim_engine_t *engine,
+                            captrim_preview_t **out_preview);
+void captrim_preview_free(captrim_preview_t *preview);
+
+/* Seek. The target is clamped to the last frame so a paused scrub to the end
+ * shows the final picture instead of a black frame. */
+int32_t captrim_preview_seek(captrim_preview_t *preview, int64_t t_us,
+                             int64_t now_wall_us);
+
+/* playing: 0 pauses, non-zero plays. Starting playback while parked on the last
+ * frame rewinds to the beginning first. */
+int32_t captrim_preview_set_playing(captrim_preview_t *preview, int32_t playing,
+                                    int64_t now_wall_us);
+
+/* Returns the next step as JSON, owned by CapTrim:
+ *   {"kind":"present","frame":{...}}
+ *   {"kind":"wait_frame","due_wall_us":N}
+ *   {"kind":"idle"}
+ *   {"kind":"end","at_us":N}
+ */
+int32_t captrim_preview_step(captrim_preview_t *preview, int64_t now_wall_us,
+                             char **out_json);
+
+int32_t captrim_preview_position(captrim_preview_t *preview, int64_t now_wall_us,
+                                 int64_t *out_us);
+
+/* Re-anchor the clock to the audio renderer's position, which is the master
+ * clock. Small drift is removed by slewing the video rate for ~500 ms; drift
+ * beyond the slew limit snaps. out_drift_us reports the correction and is the
+ * number to log when a device looks out of sync. */
+int32_t captrim_preview_sync_audio(captrim_preview_t *preview,
+                                   int64_t audio_position_us,
+                                   int64_t now_wall_us, int64_t *out_drift_us);
+
+/* Dropped-frame count, for profiling a device. A number that keeps growing
+ * means the decoder or the compositor cannot keep up. */
+int32_t captrim_preview_stats(captrim_preview_t *preview,
+                              uint64_t *out_dropped_frames);
+
 #ifdef __cplusplus
 }
 #endif

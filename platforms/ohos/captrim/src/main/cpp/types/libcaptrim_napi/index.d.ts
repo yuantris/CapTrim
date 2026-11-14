@@ -14,6 +14,16 @@ export interface StringResult extends CodeResult {
   value: string;
 }
 
+/** A microsecond value: a timeline position, or a drift correction. */
+export interface I64Result extends CodeResult {
+  value_us: number;
+}
+
+export interface DurationResult extends CodeResult {
+  duration_us: number;
+  frame_count: number;
+}
+
 export const createEngine: (draftJson: string) => HandleResult;
 export const releaseEngine: (handle: number) => CodeResult;
 export const apply: (handle: number, commandJson: string) => IdResult;
@@ -32,3 +42,27 @@ export const exportRemux: (
 export const version: () => StringResult;
 export const codeMessage: (code: number) => StringResult;
 export const lastErrorMessage: () => StringResult;
+
+/** Plan one frame by index: the export path. Returns a FramePlan JSON. */
+export const planFrameAt: (handle: number, frameIndex: number) => StringResult;
+/** Plan the frame covering t_us: the scrub path. Returns a FramePlan JSON. */
+export const planFrame: (handle: number, tUs: number) => StringResult;
+export const duration: (handle: number) => DurationResult;
+
+export const previewNew: (handle: number) => HandleResult;
+export const previewFree: (preview: number) => CodeResult;
+export const previewSeek: (preview: number, tUs: number, nowWallUs: number) => CodeResult;
+export const previewSetPlaying: (
+  preview: number,
+  playing: boolean,
+  nowWallUs: number
+) => CodeResult;
+/** Returns a Step JSON: present / wait_frame / idle / end. */
+export const previewStep: (preview: number, nowWallUs: number) => StringResult;
+export const previewPosition: (preview: number, nowWallUs: number) => I64Result;
+export const previewSyncAudio: (
+  preview: number,
+  audioPositionUs: number,
+  nowWallUs: number
+) => I64Result;
+export const previewStats: (preview: number) => IdResult;

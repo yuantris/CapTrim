@@ -75,6 +75,10 @@ captrim_engine_t *AsEngine(int64_t handle) {
     return reinterpret_cast<captrim_engine_t *>(static_cast<intptr_t>(handle));
 }
 
+captrim_preview_t *AsPreview(int64_t handle) {
+    return reinterpret_cast<captrim_preview_t *>(static_cast<intptr_t>(handle));
+}
+
 napi_value CodeResult(napi_env env, int32_t code) {
     napi_value object, value;
     napi_create_object(env, &object);
@@ -83,7 +87,9 @@ napi_value CodeResult(napi_env env, int32_t code) {
     return object;
 }
 
-napi_value HandleResult(napi_env env, int32_t code, captrim_engine_t *handle) {
+/// Handles are opaque registry keys, so both the engine and the preview flow
+/// through here as a plain pointer without any type punning at the call site.
+napi_value HandleResult(napi_env env, int32_t code, void *handle) {
     napi_value object = CodeResult(env, code);
     napi_value value;
     napi_create_int64(env, static_cast<int64_t>(reinterpret_cast<intptr_t>(handle)), &value);
@@ -96,6 +102,28 @@ napi_value IdResult(napi_env env, int32_t code, uint64_t id) {
     napi_value value;
     napi_create_int64(env, static_cast<int64_t>(id), &value);
     napi_set_named_property(env, object, "id", value);
+    return object;
+}
+
+/// Microsecond value (a timeline position, or a drift correction).
+napi_value I64Result(napi_env env, int32_t code, int64_t value_us) {
+    napi_value object = CodeResult(env, code);
+    napi_value value;
+    // JS numbers are f64; timeline microseconds stay far below 2^53, so this is
+    // exact for any realistic project length (a 24 h timeline is ~8.6e10).
+    napi_create_int64(env, value_us, &value);
+    napi_set_named_property(env, object, "value_us", value);
+    return object;
+}
+
+napi_value DurationResult(napi_env env, int32_t code, int64_t duration_us, uint64_t frame_count) {
+    napi_value object = CodeResult(env, code);
+    napi_value duration;
+    napi_value frames;
+    napi_create_int64(env, duration_us, &duration);
+    napi_create_int64(env, static_cast<int64_t>(frame_count), &frames);
+    napi_set_named_property(env, object, "duration_us", duration);
+    napi_set_named_property(env, object, "frame_count", frames);
     return object;
 }
 
@@ -276,6 +304,132 @@ napi_value LastError(napi_env env, napi_callback_info) {
     return StaticStringResult(env, captrim_last_error_message());
 }
 
+// ---- Frame planning --------------------------------------------------------
+
+napi_value PlanFrameAt(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    char *json = nullptr;
+    int32_t code = captrim_engine_plan_frame_at(
+        AsEngine(GetInt64(env, args[0])),
+        static_cast<uint64_t>(GetInt64(env, args[1])), &json);
+    return StringResult(env, code, json);
+}
+
+napi_value PlanFrame(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    char *json = nullptr;
+    int32_t code = captrim_engine_plan_frame(
+        AsEngine(GetInt64(env, args[0])), GetInt64(env, args[1]), &json);
+    return StringResult(env, code, json);
+}
+
+napi_value Duration(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return DurationResult(env, CAPTRIM_ERR_INVALID, 0, 0);
+    int64_t duration_us = 0;
+    uint64_t frames = 0;
+    int32_t code = captrim_engine_duration(
+        AsEngine(GetInt64(env, args[0])), &duration_us, &frames);
+    return DurationResult(env, code, duration_us, frames);
+}
+
+// ---- Preview session -------------------------------------------------------
+
+napi_value PreviewNew(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        return HandleResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    }
+    captrim_preview_t *preview = nullptr;
+    int32_t code = captrim_preview_new(AsEngine(GetInt64(env, args[0])), &preview);
+    return HandleResult(env, code, preview);
+}
+
+napi_value PreviewFree(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    captrim_preview_free(AsPreview(GetInt64(env, args[0])));
+    return CodeResult(env, CAPTRIM_OK);
+}
+
+napi_value PreviewSeek(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    return CodeResult(env, captrim_preview_seek(AsPreview(GetInt64(env, args[0])),
+                                                GetInt64(env, args[1]),
+                                                GetInt64(env, args[2])));
+}
+
+napi_value PreviewSetPlaying(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    bool playing = false;
+    napi_get_value_bool(env, args[1], &playing);
+    return CodeResult(env, captrim_preview_set_playing(AsPreview(GetInt64(env, args[0])),
+                                                       playing ? 1 : 0,
+                                                       GetInt64(env, args[2])));
+}
+
+napi_value PreviewStep(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    char *json = nullptr;
+    int32_t code = captrim_preview_step(AsPreview(GetInt64(env, args[0])),
+                                        GetInt64(env, args[1]), &json);
+    return StringResult(env, code, json);
+}
+
+napi_value PreviewPosition(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return I64Result(env, CAPTRIM_ERR_INVALID, 0);
+    int64_t position_us = 0;
+    int32_t code = captrim_preview_position(AsPreview(GetInt64(env, args[0])),
+                                            GetInt64(env, args[1]), &position_us);
+    return I64Result(env, code, position_us);
+}
+
+napi_value PreviewSyncAudio(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return I64Result(env, CAPTRIM_ERR_INVALID, 0);
+    int64_t drift_us = 0;
+    int32_t code = captrim_preview_sync_audio(AsPreview(GetInt64(env, args[0])),
+                                              GetInt64(env, args[1]),
+                                              GetInt64(env, args[2]), &drift_us);
+    return I64Result(env, code, drift_us);
+}
+
+napi_value PreviewStats(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return IdResult(env, CAPTRIM_ERR_INVALID, 0);
+    uint64_t dropped = 0;
+    int32_t code = captrim_preview_stats(AsPreview(GetInt64(env, args[0])), &dropped);
+    return IdResult(env, code, dropped);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor descriptors[] = {
         {"createEngine", nullptr, CreateEngine, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -291,6 +445,20 @@ napi_value Init(napi_env env, napi_value exports) {
         {"version", nullptr, VersionImpl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"codeMessage", nullptr, CodeMessage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"planFrameAt", nullptr, PlanFrameAt, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"planFrame", nullptr, PlanFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"duration", nullptr, Duration, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"previewNew", nullptr, PreviewNew, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"previewFree", nullptr, PreviewFree, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"previewSeek", nullptr, PreviewSeek, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"previewSetPlaying", nullptr, PreviewSetPlaying, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
+        {"previewStep", nullptr, PreviewStep, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"previewPosition", nullptr, PreviewPosition, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
+        {"previewSyncAudio", nullptr, PreviewSyncAudio, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
+        {"previewStats", nullptr, PreviewStats, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports,
                            sizeof(descriptors) / sizeof(descriptors[0]), descriptors);

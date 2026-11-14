@@ -78,6 +78,19 @@ impl Rational {
         }
     }
 
+    /// Clamp into `[min, max]`, used where an out-of-range ratio would be a
+    /// user-visible artefact (e.g. the playback slewing rate, where a large
+    /// correction reads as a speed change).
+    pub fn clamp_ratio(self, min: Self, max: Self) -> Self {
+        if self < min {
+            min
+        } else if self > max {
+            max
+        } else {
+            self
+        }
+    }
+
     fn raw(num: i128, den: i128) -> Self {
         if den == 0 {
             return Self::ZERO;

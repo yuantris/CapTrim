@@ -237,6 +237,10 @@ pub struct Editor {
     undo: Vec<Timeline>,
     redo: Vec<Timeline>,
     limit: usize,
+    /// Bumped on every change, including the silent metadata updates that do
+    /// not create an undo step. A preview session compares this to know whether
+    /// the frame on screen is stale.
+    revision: u64,
 }
 
 impl Default for Editor {
@@ -252,6 +256,7 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             limit: 100,
+            revision: 0,
         }
     }
 
@@ -261,6 +266,7 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             limit: 100,
+            revision: 0,
         })
     }
 
@@ -271,6 +277,7 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             limit: 100,
+            revision: 0,
         })
     }
 
@@ -283,7 +290,14 @@ impl Editor {
     pub fn set_timeline_silent(&mut self, timeline: Timeline) -> Result<()> {
         timeline.validate()?;
         self.timeline = timeline;
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
+    }
+
+    /// Monotonic change counter. A preview session compares it to decide
+    /// whether the frame currently on screen is stale.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn draft_json(&self) -> Result<String> {
@@ -308,6 +322,7 @@ impl Editor {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.revision = self.revision.wrapping_add(1);
         Ok(created)
     }
 
@@ -323,6 +338,7 @@ impl Editor {
         };
         let current = std::mem::replace(&mut self.timeline, previous);
         self.redo.push(current);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
@@ -332,6 +348,7 @@ impl Editor {
         };
         let current = std::mem::replace(&mut self.timeline, next);
         self.undo.push(current);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 }

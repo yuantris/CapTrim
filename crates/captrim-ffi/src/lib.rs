@@ -16,8 +16,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod backend;
+pub mod preview;
 
 pub use backend::{default_backend, MediaBackend, StubBackend};
+// The preview entry points are `#[no_mangle] extern "C"`, and Rust callers of
+// this crate expect to find them alongside the engine ones.
+pub use preview::*;
 
 use captrim_core::{
     code_message, Command, Editor, Error, MediaInfo, MediaSource, Result as CoreResult,
@@ -39,7 +43,7 @@ pub struct captrim_engine_t {
 pub type CaptrimProgressCb = Option<unsafe extern "C" fn(c_float, *mut c_void) -> i32>;
 
 pub struct Engine {
-    editor: Mutex<Editor>,
+    pub(crate) editor: Mutex<Editor>,
     backend: Arc<dyn MediaBackend>,
 }
 
@@ -63,7 +67,7 @@ fn registry() -> &'static Mutex<HashMap<u64, Arc<Engine>>> {
     ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock<'a>(guard: &'a Mutex<Editor>) -> CoreResult<MutexGuard<'a, Editor>> {
+pub(crate) fn lock<'a>(guard: &'a Mutex<Editor>) -> CoreResult<MutexGuard<'a, Editor>> {
     guard
         .lock()
         .map_err(|_| Error::Internal("editor mutex poisoned".into()))
@@ -80,7 +84,7 @@ fn set_last_error(msg: &str) {
     });
 }
 
-unsafe fn cstr<'a>(p: *const c_char) -> CoreResult<&'a str> {
+pub(crate) unsafe fn cstr<'a>(p: *const c_char) -> CoreResult<&'a str> {
     if p.is_null() {
         return Err(Error::invalid("null string argument"));
     }
@@ -89,14 +93,14 @@ unsafe fn cstr<'a>(p: *const c_char) -> CoreResult<&'a str> {
         .map_err(|_| Error::invalid("argument is not valid UTF-8"))
 }
 
-fn owned_cstring(s: String) -> CoreResult<*mut c_char> {
+pub(crate) fn owned_cstring(s: String) -> CoreResult<*mut c_char> {
     let clean = s.replace('\0', "");
     Ok(CString::new(clean)
         .map_err(|e| Error::Internal(e.to_string()))?
         .into_raw())
 }
 
-fn engine_from(h: *mut captrim_engine_t) -> CoreResult<Arc<Engine>> {
+pub(crate) fn engine_from(h: *mut captrim_engine_t) -> CoreResult<Arc<Engine>> {
     if h.is_null() {
         return Err(Error::invalid("null engine handle"));
     }
@@ -109,7 +113,7 @@ fn engine_from(h: *mut captrim_engine_t) -> CoreResult<Arc<Engine>> {
         .ok_or_else(|| Error::not_found("engine handle is invalid or already freed"))
 }
 
-fn ffi_guard<F>(f: F) -> i32
+pub(crate) fn ffi_guard<F>(f: F) -> i32
 where
     F: FnOnce() -> CoreResult<i32>,
 {

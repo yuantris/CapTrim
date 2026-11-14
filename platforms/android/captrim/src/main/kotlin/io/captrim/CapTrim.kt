@@ -44,6 +44,24 @@ object CapTrimNative {
     external fun nativeVersion(): String
     external fun nativeCodeMessage(code: Int): String
     external fun nativeLastError(): String
+
+    external fun nativePlanFrameAt(handle: Long, frameIndex: Long): String
+    external fun nativePlanFrame(handle: Long, tUs: Long): String
+    external fun nativeDuration(handle: Long, out: LongArray): Int
+
+    external fun nativePreviewNew(engine: Long): Long
+    external fun nativePreviewFree(preview: Long)
+    external fun nativePreviewSeek(preview: Long, tUs: Long, nowUs: Long): Int
+    external fun nativePreviewSetPlaying(preview: Long, playing: Boolean, nowUs: Long): Int
+    external fun nativePreviewStep(preview: Long, nowUs: Long): String
+    external fun nativePreviewPosition(preview: Long, nowUs: Long, out: LongArray): Int
+    external fun nativePreviewSyncAudio(
+        preview: Long,
+        audioUs: Long,
+        nowUs: Long,
+        out: LongArray,
+    ): Int
+    external fun nativePreviewStats(preview: Long, out: LongArray): Int
 }
 
 /**
@@ -116,10 +134,124 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
         CapTrimNative.nativeExportRemux(requireOpen(), srcUri, dstUri, progress)
     }
 
+    /** Timeline length in microseconds. */
+    fun duration(): Long = readDuration()[0]
+
+    /** Total frames the exporter must write. */
+    fun frameCount(): Long = readDuration()[1]
+
+    private fun readDuration(): LongArray {
+        val out = LongArray(2)
+        CapTrimNative.nativeDuration(requireOpen(), out)
+        return out
+    }
+
+    /**
+     * Plan the frame covering [tUs], for scrubbing.
+     *
+     * Returns a FramePlan JSON document: `t_us`, `frame_index`, `width`,
+     * `height`, `layers[]` (bottom-to-top, each with `clip_id`, `source_id`,
+     * `uri`, `source_us`, `z`, `kind`, `transform`, `opacity`, `effects`) and
+     * `audio[]` (`clip_id`, `source_id`, `uri`, `source_us`, `volume`).
+     *
+     * JSON is returned raw on purpose: the AAR stays dependency-free, and a
+     * production renderer should call the same C ABI directly from C++ rather
+     * than marshal JSON per frame. Parse it with whatever serializer the host
+     * app already uses (kotlinx.serialization, Moshi, Gson).
+     */
+    fun planFrame(tUs: Long): String =
+        CapTrimNative.nativePlanFrame(requireOpen(), tUs)
+
+    /**
+     * Plan one frame by index. This is the export path — do not walk a timeline
+     * with [planFrame] using truncated PTS values, because flooring twice makes
+     * NTSC sequences repeat frames.
+     */
+    fun planFrameAt(frameIndex: Long): String =
+        CapTrimNative.nativePlanFrameAt(requireOpen(), frameIndex)
+
+    /** Open a playback session. Close any previous one first. */
+    fun preview(): CapTrimPreview =
+        CapTrimPreview(CapTrimNative.nativePreviewNew(requireOpen()))
+
     override fun close() {
         if (handle != 0L) {
             CapTrimNative.nativeFree(handle)
             handle = 0L
         }
+    }
+}
+
+/**
+ * Playback session: owns the clock and the "frame currently on screen" state.
+ *
+ * ```kotlin
+ * val step = JSONObject(preview.step(monotonicUs()))
+ * when (step.getString("kind")) {
+ *     "present" -> render(step.getJSONObject("frame"))
+ *     "wait_frame" -> sleepUntil(step.getLong("due_wall_us"))
+ *     "idle" -> awaitUiEvent()
+ *     "end" -> stop()
+ * }
+ * ```
+ *
+ * [nowUs] must come from the same monotonic source on every call. Never pass
+ * `System.currentTimeMillis()`: a clock that goes backwards stalls playback and
+ * one that jumps forwards drops the whole buffer. Use `System.nanoTime() / 1000`.
+ *
+ * The session notices edits to the draft on the next [step], so the current
+ * frame repaints after a command without any extra call.
+ */
+class CapTrimPreview internal constructor(private var handle: Long) : AutoCloseable {
+
+    fun seek(tUs: Long, nowUs: Long) {
+        CapTrimNative.nativePreviewSeek(requireOpen(), tUs, nowUs)
+    }
+
+    /** Starting playback while parked on the last frame rewinds first. */
+    fun setPlaying(playing: Boolean, nowUs: Long) {
+        CapTrimNative.nativePreviewSetPlaying(requireOpen(), playing, nowUs)
+    }
+
+    /**
+     * Next step as JSON: `{"kind":"present","frame":{...}}`,
+     * `{"kind":"wait_frame","due_wall_us":N}`, `{"kind":"idle"}` or
+     * `{"kind":"end","at_us":N}`.
+     */
+    fun step(nowUs: Long): String = CapTrimNative.nativePreviewStep(requireOpen(), nowUs)
+
+    fun position(nowUs: Long): Long {
+        val out = LongArray(1)
+        CapTrimNative.nativePreviewPosition(requireOpen(), nowUs, out)
+        return out[0]
+    }
+
+    /**
+     * Re-anchor to the audio renderer's position, which is the master clock.
+     * Returns the drift that was corrected: log it when a device looks out of
+     * sync.
+     */
+    fun syncAudio(audioPositionUs: Long, nowUs: Long): Long {
+        val out = LongArray(1)
+        CapTrimNative.nativePreviewSyncAudio(requireOpen(), audioPositionUs, nowUs, out)
+        return out[0]
+    }
+
+    /** Frames skipped because the render loop fell behind. */
+    fun droppedFrames(): Long {
+        val out = LongArray(1)
+        CapTrimNative.nativePreviewStats(requireOpen(), out)
+        return out[0]
+    }
+
+    override fun close() {
+        if (handle != 0L) {
+            CapTrimNative.nativePreviewFree(handle)
+            handle = 0L
+        }
+    }
+
+    private fun requireOpen(): Long = handle.also {
+        check(it != 0L) { "CapTrim preview is closed" }
     }
 }

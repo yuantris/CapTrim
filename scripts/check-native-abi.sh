@@ -8,11 +8,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HEADER="${ROOT_DIR}/crates/captrim-ffi/captrim.h"
-RUST_LIB="${ROOT_DIR}/crates/captrim-ffi/src/lib.rs"
+FFI_SRC="${ROOT_DIR}/crates/captrim-ffi/src"
 
 header_funcs="$(grep -E '^[[:space:]]*(const char \*|void|int32_t)[[:space:]]*.*captrim_[a-z_0-9]+[[:space:]]*\(' "$HEADER" \
     | grep -oE 'captrim_[a-z_0-9]+\(' | sed 's/(//' | sort -u)"
-rust_funcs="$(grep -oE 'pub extern "C" fn captrim_[a-z_0-9]+' "$RUST_LIB" \
+rust_funcs="$(grep -hoE 'pub extern "C" fn captrim_[a-z_0-9]+' "$FFI_SRC"/*.rs \
     | grep -oE 'captrim_[a-z_0-9]+' | sort -u)"
 
 if [ -z "$header_funcs" ] || [ -z "$rust_funcs" ]; then
@@ -66,6 +66,25 @@ if [ -n "$ets_imports" ] && ! diff -u <(printf '%s\n' "$dts_funcs") <(printf '%s
 fi
 printf '[captrim] NAPI surface ok: %s functions (d.ts == bridge == ArkTS)\n' \
     "$(printf '%s\n' "$dts_funcs" | wc -l | tr -d ' ')"
+
+# The Android AAR cannot be compiled without an NDK, so at least guarantee that
+# every JNI method in the RegisterNatives table has a matching definition and
+# vice versa. A missing registration is a runtime UnsatisfiedLinkError that only
+# shows up on a device.
+JNI="${ROOT_DIR}/platforms/android/captrim/src/main/cpp/jni_bridge.cpp"
+jni_registered="$(grep -oE '\{"native[A-Za-z0-9]+",' "$JNI" | sed 's/^{"//; s/",$//' | sort -u)"
+jni_defined="$(grep -oE '^(jstring|jobject|jboolean|jint|jlong|void) native[A-Za-z0-9]+' "$JNI" \
+    | awk '{print $2}' | sort -u)"
+if [ -z "$jni_registered" ] || [ -z "$jni_defined" ]; then
+    echo "[captrim][error] failed to extract the JNI surface" >&2
+    exit 1
+fi
+if ! diff -u <(printf '%s\n' "$jni_registered") <(printf '%s\n' "$jni_defined"); then
+    echo "[captrim][error] RegisterNatives and jni_bridge.cpp definitions disagree" >&2
+    exit 1
+fi
+printf '[captrim] JNI surface ok: %s methods registered\n' \
+    "$(printf '%s\n' "$jni_registered" | wc -l | tr -d ' ')"
 
 for script in "$ROOT_DIR"/scripts/*.sh "$ROOT_DIR"/scripts/toolchain/*.sh; do
     bash -n "$script" || { echo "[captrim][error] syntax error in $script" >&2; exit 1; }

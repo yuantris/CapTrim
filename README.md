@@ -4,7 +4,7 @@ Android 与 HarmonyOS 共用的视频剪辑核心 SDK。**Rust 描述时间线�
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI / 鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖「剪映基础剪辑」：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-当前状态：**P0 骨架已跑通**（见[验证状态](#验证状态)），可在真机前完成双端联调的准备工作。
+当前状态：**P0 骨架与 P1 调度内核已跑通**（见[验证状态](#验证状态)）。预览的帧计划、时钟与状态机已实现并有测试覆盖；解码器与 GPU 合成器只定义了契约，需真机实现。
 
 ---
 
@@ -43,6 +43,7 @@ Android 与 HarmonyOS 共用的视频剪辑核心 SDK。**Rust 描述时间线�
         │  crates/captrim-core  —  纯 Rust，零平台依赖│
         │  Rational 时间 · Timeline/Track/Clip      │
         │  Command 栈（撤销重做）· 草稿 JSON          │
+        │  render 帧计划 · clock 时钟 · preview 状态机│
         └───────┬──────────────────────────────────┘
                 │  MediaBackend trait
         ┌───────▼──────────────────────────────────┐
@@ -125,7 +126,7 @@ cd platforms/android && ./gradlew :captrim:assembleRelease
 | `set_speed` | `clip_id` · `speed{num,den}` |
 | `set_volume` | `clip_id` · `volume` |
 | `set_out_point` | `clip_id` · `out_us` |
-| `set_canvas` | `width` · `height` · `fps{num,den}` |
+| `set_canvas` | `width` · `height` · `frame_rate{num,den}` |
 
 ### 两端用法
 
@@ -135,6 +136,13 @@ CapTrim.create(draftJson).use { editor ->
     val clipId = editor.apply("""{"type":"split_clip","clip_id":3,"at_us":4000000}""")
     editor.undo()
     val draft = editor.draft()
+
+    // 预览：时钟与帧调度在 native 侧，这里只消费 step
+    editor.preview().use { preview ->
+        preview.setPlaying(true, System.nanoTime() / 1000)
+        val step = JSONObject(preview.step(System.nanoTime() / 1000))
+        if (step.getString("kind") == "present") render(step.getJSONObject("frame"))
+    }
 }
 ```
 
@@ -143,58 +151,104 @@ CapTrim.create(draftJson).use { editor ->
 const editor = CapTrim.create(draftJson);
 editor.apply('{"type":"split_clip","clip_id":3,"at_us":4000000}');
 editor.undo();
+
+const preview = editor.preview();
+preview.setPlaying(true, monotonicUs());
+const step: Step = preview.step(monotonicUs());
+if (step.kind === 'present') render(step.frame);
+preview.close();
 editor.close();
 ```
 
+ArkTS 侧 `Step` / `FramePlan` 是类型化的（`JSON.parse` 是原生实现）；Android 侧返回原始 JSON，解析交给宿主 App 已有的序列化库——理由见[第七节](#七已完成--未完成)末尾。
+
 两端失败都抛异常并带 `CAPTRIM_ERR_*` 码。C ABI 的线程约定、字符串所有权写在 `crates/captrim-ffi/captrim.h` 头部，改代码前先读。
 
-## 六、P0 已完成 / 未完成
+## 六、P1：预览管线
+
+P1 的成果不是「能放视频」，而是**把预览和导出钉在同一条时间线上**。做法是把三件事从平台层收进 Rust：
+
+| 模块 | 职责 | 为什么必须在 Rust |
+|---|---|---|
+| `render` | 给定时刻，算出这一帧要画什么：图层次序（`z`）、源时间（已过变速映射并钳到 `[in,out)`）、音频混合项 | 导出逐帧走的是同一函数，两端不可能各解析一遍 |
+| `clock` | 音频主导的播放时钟，漂移小于阈值时微调速率（slew），超过阈值硬对齐 | 漂移补偿策略写两遍，就是两端体验不一致的开始 |
+| `preview` | `step(now)` 状态机：`present` / `wait_frame` / `idle` / `end`，并统计丢帧 | 平台只管解码和上屏，节奏由一处决定 |
+
+平台侧因此只剩一件事：
+
+```kotlin
+// 每帧调用；nowUs 必须是单调时钟（System.nanoTime() / 1000）
+when (step.kind) {
+    "present"    -> { decode(step.frame); composite(step.frame.layers); present() }
+    "wait_frame" -> sleepUntil(step.due_wall_us)
+    "idle"       -> awaitUiEvent()
+    "end"        -> stop()
+}
+```
+
+**三条容易踩的实现约定**
+
+1. **`nowUs` 必须是单调时钟**。传 `System.currentTimeMillis()` 会出两种故障：时钟回拨导致播放卡死，向前跳跃导致整段缓冲被丢弃。鸿蒙用 `OH_GetTimeSinceBoot` 系列的微秒值。
+2. **导出按帧索引走，按时间戳走会重复帧**。`frame_pts_us(1)` 对 30000/1001 返回 33366，但第 1 帧真正的起点是 33366.67 µs；再把这个值喂给按下取整的接口就会塌回第 0 帧。所以 `plan_frame_at(frame_index)` 是导出 API，`plan_frame(t_us)` 只用于拖动和播放。这条有专门的集成测试守着。
+3. **编辑后不需要额外通知预览**。`Editor` 有单调递增的 `revision`，`preview_step` 每次比对它；变化了就重规划**同一帧索引**。否则改完滤镜画面会停在旧图，直到播放头移动。
+
+**平台需要自己实现的部分**（有接口契约、无实现，因为必须真机验证）：
+
+- 解码器：`FrameLayer.source_us` 是精确的源时间，用它去 seek + 解码；空 `uri` 表示该层不可用，跳过而不是整帧失败。
+- 合成器：按 `z` 从小到大画，`transform` / `opacity` / `effects` 直接消费；`kind` 区分视频、字幕、贴纸，决定走解码器还是文字引擎。
+- 音频：`AudioMix` 是全轨混合后的输入，先统一重采样到 48kHz/立体声/f32 再叠加；播完后把音频位置回灌给 `syncAudio`。
+
+## 七、已完成 / 未完成
 
 **已完成**
 
 - `Rational` 精确时间运算（含 NTSC 30000/1001 帧边界、无浮点比较）
 - Timeline / Track / Clip 模型、重叠校验、分割（含变速片段的源时间映射）
 - Command 栈 + 撤销重做 + 草稿 JSON 往返
-- 稳定 C ABI：句柄注册表、错误码、`catch_unwind`、UTF-8 校验
+- 稳定 C ABI（25 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验
 - FFmpeg probe / remux 的 C shim + 特征门控后端（未启用时返回 `NO_BACKEND` 而非崩溃）
+- **P1 调度内核**：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查
 
 **未完成（按优先级）**
 
-- P1：硬解码预览、音画同步、GPU 合成（先把画面跑起来）
+- P1 收尾：硬解码器与 GPU 合成器**实现**（契约已定义，需真机）
 - P2：滤镜/转场/画中画/字幕渲染、音频混合、**重编码导出**（`ExportPlan`/`Segment` 抽象）
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
 
-## 七、验证状态
+**逐帧数据不要走 JSON 往返**：当前 `planFrame` / `step` 返回 JSON，是为了让 P1 骨架在没有渲染器时也能跑通、也能两端对齐。真实的合成器应当从 C++ 直接调 C ABI（同一份 `captrim_preview_step`），避免每帧一次 JSON 解析与跨语言拷贝。ArkTS 侧已做类型化封装，Android 侧返回原始 JSON 是刻意的：AAR 保持零依赖，也不塞一个无法用单元测试验证的手写解析器。
+
+## 八、验证状态
 
 区分「本机实测通过」和「已写好但未在此环境验证」，避免误判成熟度。
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 26 通过 | core 18 + 集成 1 + FFI 7 |
-| `cargo clippy --workspace --all-targets` | ✅ 零告警 | 含 `--features ffmpeg` |
-| `check-native-abi.sh` | ✅ 通过 | 14 个 C 函数、13 个 NAPI 函数三方一致 |
+| `cargo test --workspace` | ✅ 84 通过 | core 单元 55 + P0 集成 1 + P1 预览/导出一致性 5 + FFI 7 + P1 ABI 契约 16 |
+| 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
+| `cargo clippy --workspace --all-targets` | ✅ 零告警 | 含 `--features ffmpeg`，`-D warnings` 可用 |
+| `check-native-abi.sh` | ✅ 通过 | 25 个 C 函数、24 个 NAPI 函数，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
-| `libcaptrim.so` 交叉链接 | ✅ 通过 | ELF64 / AArch64 / DYN，SONAME=`libcaptrim.so`，仅依赖 `libc.so` |
-| NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK，`-Wall -Wextra` 零警告；依赖仅 `libcaptrim.so` / `libace_napi.z.so` / `libc.so` |
-| ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`，剩 2 条「.so 未校验」告警（P0 预期） |
+| `libcaptrim.so` 交叉链接 | ✅ 通过 | ELF64 / AArch64 / DYN，25 个符号（含 8 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so` |
+| NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK，`-Wall -Wextra -Werror` 零警告；依赖仅 `libcaptrim.so` / `libace_napi.z.so` / `libc.so` |
+| ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 2 条「.so 未校验」告警（预期） |
 | 鸿蒙构建脚本端到端 | ✅ 通过 | Windows + Git Bash 实测产出并暂存 |
-| **Android AAR 编译** | ⚠️ 未验证 | 本机无 Android SDK/NDK/Gradle；Kotlin 与 JNI 签名已逐一手工核对 |
+| **Android AAR 编译** | ⚠️ 未验证 | 本机无 Android SDK/NDK/Gradle；Kotlin 与 JNI 签名（含 P1 新增 11 个）已逐一手工核对 |
 | **FFmpeg 实际编译** | ⚠️ 未验证 | 本机无 FFmpeg 源码树；FFmpeg 官方要求 make + 宿主 C 编译器 |
 | 真机运行 | ⚠️ 未验证 | 需真机；官方注明模拟器仅支持部分软解格式 |
 
 CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workflows/ci.yml`。
 
-## 八、许可与专利
+## 九、许可与专利
 
 - FFmpeg 默认 **LGPL-2.1+**。两个编译脚本显式禁用了 `--enable-gpl` / `--enable-nonfree` / `libx264` / `libx265`，产物附构建回执。
 - 保持 LGPL 的条件：动态链接、随附 FFmpeg 对应源码与 configure 行、在 App 的 About/EULA 中声明。
 - 因编码走系统硬件，**不需要 libx264**，从根上避免整体变成 GPL。
 - H.264 / H.265 另有**专利许可**问题（与开源许可无关），商业分发需单独评估。
 
-## 九、已知坑
+## 十、已知坑
 
 已踩过的，以及一定会踩的：
 
@@ -208,3 +262,6 @@ CI 已配置为在上述缺口处开工（Android 构建），见 `.github/workf
 8. **VFR 素材**（手机录屏、部分相机）没有恒定帧率。P0 的 remux 不受影响，但 P1 按帧率映射时间线时必须按 PTS 走，不能假设 `frame_index / fps`。
 9. **素材会被用户删掉**：草稿里存 URI 不够，需持久化权限或拷贝到沙箱，否则重开草稿时一片空白。
 10. **生命周期**：XComponent / Surface 的销毁必须早于解码器停止；长时导出走前台服务 / 后台长时任务。
+11. **不要把截断后的 PTS 再喂给按下取整的接口**。这是 P1 实际踩到的坑：`frame_pts_us(1)` 对 30000/1001 返回 33366，而第 1 帧真正的起点是 33366.67 µs，再取整一次就回到第 0 帧，导出会静默重复帧。导出必须按帧索引走 `plan_frame_at`。
+12. **播放时钟不能用墙钟**。`System.currentTimeMillis()` 会被 NTP 校正，回拨会让播放卡死、前跳会让整段缓冲作废；必须用单调时钟（`System.nanoTime()`、`OH_GetTimeSinceBoot`）。
+13. **音画不同步先看 drift 再猜**。`syncAudio` 返回它修正了多少微秒，这个数持续变大说明音频输出设备的实际延迟与标称不符，而不是渲染慢——两者的修复方向完全相反。

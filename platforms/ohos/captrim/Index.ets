@@ -1,1 +1,13 @@
-export { CapTrim, CapTrimError, ProgressCallback } from './src/main/ets/CapTrim';
+export {
+  CapTrim,
+  CapTrimError,
+  CapTrimPreview,
+  ProgressCallback,
+  AudioMix,
+  FrameLayer,
+  FramePlan,
+  LayerKind,
+  Step,
+  StepKind,
+  Transform,
+} from './src/main/ets/CapTrim';

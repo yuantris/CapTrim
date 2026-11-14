@@ -62,6 +62,25 @@ captrim_engine_t *asEngine(jlong handle) {
     return reinterpret_cast<captrim_engine_t *>(static_cast<intptr_t>(handle));
 }
 
+captrim_preview_t *asPreview(jlong handle) {
+    return reinterpret_cast<captrim_preview_t *>(static_cast<intptr_t>(handle));
+}
+
+/// Free `owned` and throw on error, or hand the string to Java.
+jstring planResult(JNIEnv *env, int32_t code, char *owned) {
+    if (code != CAPTRIM_OK) {
+        if (owned) captrim_string_free(owned);
+        throwError(env, code);
+        return nullptr;
+    }
+    return takeString(env, owned);
+}
+
+void writeLong(JNIEnv *env, jlongArray out, jsize index, jlong value) {
+    if (!out || env->GetArrayLength(out) <= index) return;
+    env->SetLongArrayRegion(out, index, 1, &value);
+}
+
 struct ProgressContext {
     JNIEnv *env;
     jobject callback;
@@ -188,6 +207,91 @@ jstring nativeLastError(JNIEnv *env, jobject) {
     return staticString(env, captrim_last_error_message());
 }
 
+// ---- Frame planning --------------------------------------------------------
+
+jstring nativePlanFrameAt(JNIEnv *env, jobject, jlong handle, jlong frameIndex) {
+    char *json = nullptr;
+    int32_t code = captrim_engine_plan_frame_at(
+        asEngine(handle), static_cast<uint64_t>(frameIndex), &json);
+    return planResult(env, code, json);
+}
+
+jstring nativePlanFrame(JNIEnv *env, jobject, jlong handle, jlong tUs) {
+    char *json = nullptr;
+    int32_t code = captrim_engine_plan_frame(
+        asEngine(handle), static_cast<int64_t>(tUs), &json);
+    return planResult(env, code, json);
+}
+
+jint nativeDuration(JNIEnv *env, jobject, jlong handle, jlongArray out) {
+    int64_t duration_us = 0;
+    uint64_t frames = 0;
+    int32_t code = captrim_engine_duration(asEngine(handle), &duration_us, &frames);
+    if (code == CAPTRIM_OK && out) {
+        writeLong(env, out, 0, static_cast<jlong>(duration_us));
+        writeLong(env, out, 1, static_cast<jlong>(frames));
+    }
+    return check(env, code);
+}
+
+// ---- Preview session -------------------------------------------------------
+
+jlong nativePreviewNew(JNIEnv *env, jobject, jlong engine) {
+    captrim_preview_t *preview = nullptr;
+    int32_t code = captrim_preview_new(asEngine(engine), &preview);
+    if (code != CAPTRIM_OK) {
+        throwError(env, code);
+        return 0;
+    }
+    return static_cast<jlong>(reinterpret_cast<intptr_t>(preview));
+}
+
+void nativePreviewFree(JNIEnv *, jobject, jlong preview) {
+    captrim_preview_free(asPreview(preview));
+}
+
+jint nativePreviewSeek(JNIEnv *env, jobject, jlong preview, jlong tUs, jlong nowUs) {
+    return check(env, captrim_preview_seek(asPreview(preview), static_cast<int64_t>(tUs),
+                                           static_cast<int64_t>(nowUs)));
+}
+
+jint nativePreviewSetPlaying(JNIEnv *env, jobject, jlong preview, jboolean playing,
+                             jlong nowUs) {
+    return check(env, captrim_preview_set_playing(asPreview(preview),
+                                                  playing == JNI_TRUE ? 1 : 0,
+                                                  static_cast<int64_t>(nowUs)));
+}
+
+jstring nativePreviewStep(JNIEnv *env, jobject, jlong preview, jlong nowUs) {
+    char *json = nullptr;
+    int32_t code = captrim_preview_step(asPreview(preview), static_cast<int64_t>(nowUs), &json);
+    return planResult(env, code, json);
+}
+
+jint nativePreviewPosition(JNIEnv *env, jobject, jlong preview, jlong nowUs, jlongArray out) {
+    int64_t position_us = 0;
+    int32_t code = captrim_preview_position(asPreview(preview), static_cast<int64_t>(nowUs),
+                                            &position_us);
+    if (code == CAPTRIM_OK) writeLong(env, out, 0, static_cast<jlong>(position_us));
+    return check(env, code);
+}
+
+jint nativePreviewSyncAudio(JNIEnv *env, jobject, jlong preview, jlong audioUs, jlong nowUs,
+                            jlongArray out) {
+    int64_t drift_us = 0;
+    int32_t code = captrim_preview_sync_audio(asPreview(preview), static_cast<int64_t>(audioUs),
+                                              static_cast<int64_t>(nowUs), &drift_us);
+    if (code == CAPTRIM_OK) writeLong(env, out, 0, static_cast<jlong>(drift_us));
+    return check(env, code);
+}
+
+jint nativePreviewStats(JNIEnv *env, jobject, jlong preview, jlongArray out) {
+    uint64_t dropped = 0;
+    int32_t code = captrim_preview_stats(asPreview(preview), &dropped);
+    if (code == CAPTRIM_OK) writeLong(env, out, 0, static_cast<jlong>(dropped));
+    return check(env, code);
+}
+
 JNINativeMethod kMethods[] = {
     {"nativeCreate", "(Ljava/lang/String;)J", reinterpret_cast<void *>(nativeCreate)},
     {"nativeFree", "(J)V", reinterpret_cast<void *>(nativeFree)},
@@ -204,6 +308,17 @@ JNINativeMethod kMethods[] = {
     {"nativeVersion", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeVersion)},
     {"nativeCodeMessage", "(I)Ljava/lang/String;", reinterpret_cast<void *>(nativeCodeMessage)},
     {"nativeLastError", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeLastError)},
+    {"nativePlanFrameAt", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrameAt)},
+    {"nativePlanFrame", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrame)},
+    {"nativeDuration", "(J[J)I", reinterpret_cast<void *>(nativeDuration)},
+    {"nativePreviewNew", "(J)J", reinterpret_cast<void *>(nativePreviewNew)},
+    {"nativePreviewFree", "(J)V", reinterpret_cast<void *>(nativePreviewFree)},
+    {"nativePreviewSeek", "(JJJ)I", reinterpret_cast<void *>(nativePreviewSeek)},
+    {"nativePreviewSetPlaying", "(JZJ)I", reinterpret_cast<void *>(nativePreviewSetPlaying)},
+    {"nativePreviewStep", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePreviewStep)},
+    {"nativePreviewPosition", "(JJ[J)I", reinterpret_cast<void *>(nativePreviewPosition)},
+    {"nativePreviewSyncAudio", "(JJJ[J)I", reinterpret_cast<void *>(nativePreviewSyncAudio)},
+    {"nativePreviewStats", "(J[J)I", reinterpret_cast<void *>(nativePreviewStats)},
 };
 
 }  // namespace
