@@ -9,7 +9,7 @@
 //! Both paths share one implementation (`PreviewSession::step`) so a renderer
 //! and a JS test can never disagree about which frame is due.
 
-use crate::preview::{preview_from, state, captrim_preview_t};
+use crate::preview::{captrim_preview_t, preview_from, state};
 use crate::{ffi_guard, Error};
 use captrim_core::{LayerKind, Step};
 use std::os::raw::c_int;
@@ -73,10 +73,7 @@ fn layer_kind_code(kind: LayerKind) -> i32 {
 }
 
 /// Copy at most MAX_LAYERS layers, and report the overflow instead of hiding it.
-fn fill(
-    out: &mut CaptrimFrameDesc,
-    plan: &captrim_core::FramePlan,
-) -> Result<(), Error> {
+fn fill(out: &mut CaptrimFrameDesc, plan: &captrim_core::FramePlan) -> Result<(), Error> {
     out.t_us = plan.t_us;
     out.frame_index = plan.frame_index;
     out.width = plan.width;
@@ -171,7 +168,12 @@ mod tests {
             source_us,
             z,
             kind,
-            transform: Transform { scale: 2.0, dx: 0.5, dy: -0.25, rotation_deg: 90.0 },
+            transform: Transform {
+                scale: 2.0,
+                dx: 0.5,
+                dy: -0.25,
+                rotation_deg: 90.0,
+            },
             opacity: 0.75,
             effects: Vec::new(),
         }
@@ -232,14 +234,23 @@ mod tests {
 
         assert_eq!(out.layer_count as usize, MAX_LAYERS);
         assert_eq!(out.layer_overflow, 3);
-        assert_eq!(out.layers[MAX_LAYERS - 1].source_us, (MAX_LAYERS as i64 - 1) * 1000);
+        assert_eq!(
+            out.layers[MAX_LAYERS - 1].source_us,
+            (MAX_LAYERS as i64 - 1) * 1000
+        );
     }
 
     #[test]
     fn refilling_a_reused_struct_leaves_no_stale_layers() {
         let mut out = CaptrimFrameDesc::default();
-        fill(&mut out, &plan(vec![layer(0, LayerKind::Video, 1000), layer(1, LayerKind::Video, 2000)]))
-            .unwrap();
+        fill(
+            &mut out,
+            &plan(vec![
+                layer(0, LayerKind::Video, 1000),
+                layer(1, LayerKind::Video, 2000),
+            ]),
+        )
+        .unwrap();
         assert_eq!(out.layer_count, 2);
 
         fill(&mut out, &plan(Vec::new())).unwrap();
