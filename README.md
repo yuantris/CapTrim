@@ -66,7 +66,7 @@ native/                   FFmpeg C shim（probe / remux）
 platforms/android/        Gradle AAR + CMake + JNI + Kotlin
 platforms/ohos/           HAR 工程 + CMake + Node-API + ArkTS + .d.ts
 platforms/ohos/entry/     真机自检 App（9 项检查，结果写 hilog）
-scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建
+scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建、本地 CI 全套（check.sh）
 ```
 
 ## 四、快速开始
@@ -76,10 +76,19 @@ scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验�
 **1. 只验证核心逻辑（不需要任何移动端环境）**
 
 ```bash
-cargo test --workspace          # 26 个测试
-cargo clippy --workspace --all-targets
+bash scripts/check.sh           # 本地把 CI 的每一关按同样顺序跑一遍
+```
+
+单独跑某一步时：
+
+```bash
+cargo fmt --all --check            # CI 的第一关；漏跑它会让后面四关在 CI 上被跳过
+cargo test --workspace             # 91 个测试
+cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warnings
 bash scripts/check-native-abi.sh   # 头文件 == Rust 导出 == NAPI == d.ts
 ```
+
+`check.sh` 存在的原因很具体：`b2d3158` 在 `cargo fmt --all --check` 上失败，GitHub 于是跳过了后面的测试、clippy 与 ABI 三步——本地跑过的三项结果一次都没被报出来，推送看着是验证过的，其实没有。一个不能只跑一半的命令比多一条纪律更可靠。
 
 **2. 鸿蒙侧（先跑 stub 后端，不需要 FFmpeg）**
 
@@ -279,7 +288,7 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 |---|---|---|
 | `cargo test --workspace` | ✅ 91 通过 | core 单元 57 + P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
-| `cargo clippy --workspace --all-targets` | ✅ 零告警 | 含 `--features ffmpeg`，`-D warnings` 可用 |
+| `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
 | `check-native-abi.sh` | ✅ 通过 | 27 个 C 函数、31 个 NAPI 函数，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
 | `libcaptrim.so` 交叉链接 | ✅ 通过 | ELF64 / AArch64 / DYN，27 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so` |
