@@ -1,0 +1,16 @@
+# Shell scripts break under CRLF (`bash: $'\r': command not found`), and Windows
+# batch files can break under LF when they use carets for line continuation.
+# Pin both explicitly instead of relying on the platform default.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Keep binaries out of diff/merge handling.
+*.so   binary
+*.a    binary
+*.png  binary
+*.jpg  binary
+*.jar  binary
+*.aar  binary

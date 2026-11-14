@@ -1,0 +1,21 @@
+[package]
+name = "captrim-ffi"
+description = "Stable C ABI for CapTrim. Android JNI and HarmonyOS NAPI both call this single boundary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "captrim"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enables the FFmpeg C shim backend (requires libcaptrim_ffmpeg.so at link time).
+ffmpeg = []
+
+[dependencies]
+captrim-core = { path = "../captrim-core" }
+serde_json = { workspace = true }

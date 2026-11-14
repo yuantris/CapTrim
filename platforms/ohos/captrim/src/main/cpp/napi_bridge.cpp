@@ -1,0 +1,314 @@
+// Thin Node-API adapter for HarmonyOS. Every method forwards to the same
+// stable CapTrim C ABI used by Android JNI. No editing logic lives here.
+//
+// IMPORTANT: P0 export runs synchronously on the ArkTS thread, so calling the
+// JS progress callback directly is safe. When export moves to a worker thread
+// (P1), this MUST be replaced with napi_create_threadsafe_function: caching a
+// napi_env or calling N-API from a native thread is undefined behaviour.
+//
+// IMPORTANT: this file deliberately avoids the C++ standard library (no
+// std::string, no exceptions, no RTTI). Using std::string would make
+// libcaptrim_napi.so depend on libc++_shared.so, which in turn would force the
+// host application's OHOS_STL setting to match ours -- a very common source of
+// "works in the sample app, crashes in the real app" reports. Strings are
+// copied from Node-API straight into a malloc'd buffer instead, so this
+// library only depends on libc.
+#include <napi/native_api.h>
+
+#include <cstdint>
+#include <cstdlib>
+
+#include "captrim.h"
+
+namespace {
+
+/// Owns the UTF-8 copy of a JS string. Frees on destruction, movable, not
+/// copyable, so call sites cannot leak and cannot double free.
+class JsString {
+public:
+    JsString() = default;
+    ~JsString() { std::free(data_); }
+    JsString(const JsString &) = delete;
+    JsString &operator=(const JsString &) = delete;
+    JsString(JsString &&other) noexcept : data_(other.data_) { other.data_ = nullptr; }
+    JsString &operator=(JsString &&other) noexcept {
+        if (this != &other) {
+            std::free(data_);
+            data_ = other.data_;
+            other.data_ = nullptr;
+        }
+        return *this;
+    }
+
+    /// Empty string on any conversion failure, so callers never see nullptr.
+    static JsString From(napi_env env, napi_value value) {
+        JsString out;
+        size_t length = 0;
+        if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
+            return out;
+        }
+        out.data_ = static_cast<char *>(std::malloc(length + 1));
+        if (!out.data_) return out;
+        size_t written = 0;
+        if (napi_get_value_string_utf8(env, value, out.data_, length + 1, &written) != napi_ok) {
+            std::free(out.data_);
+            out.data_ = nullptr;
+            return out;
+        }
+        out.data_[written] = '\0';
+        return out;
+    }
+
+    const char *c_str() const { return data_ ? data_ : ""; }
+
+private:
+    char *data_ = nullptr;
+};
+
+int64_t GetInt64(napi_env env, napi_value value) {
+    int64_t result = 0;
+    napi_get_value_int64(env, value, &result);
+    return result;
+}
+
+captrim_engine_t *AsEngine(int64_t handle) {
+    return reinterpret_cast<captrim_engine_t *>(static_cast<intptr_t>(handle));
+}
+
+napi_value CodeResult(napi_env env, int32_t code) {
+    napi_value object, value;
+    napi_create_object(env, &object);
+    napi_create_int32(env, code, &value);
+    napi_set_named_property(env, object, "code", value);
+    return object;
+}
+
+napi_value HandleResult(napi_env env, int32_t code, captrim_engine_t *handle) {
+    napi_value object = CodeResult(env, code);
+    napi_value value;
+    napi_create_int64(env, static_cast<int64_t>(reinterpret_cast<intptr_t>(handle)), &value);
+    napi_set_named_property(env, object, "handle", value);
+    return object;
+}
+
+napi_value IdResult(napi_env env, int32_t code, uint64_t id) {
+    napi_value object = CodeResult(env, code);
+    napi_value value;
+    napi_create_int64(env, static_cast<int64_t>(id), &value);
+    napi_set_named_property(env, object, "id", value);
+    return object;
+}
+
+napi_value StringResult(napi_env env, int32_t code, char *owned) {
+    napi_value object = CodeResult(env, code);
+    napi_value value;
+    if (owned) {
+        napi_create_string_utf8(env, owned, NAPI_AUTO_LENGTH, &value);
+        captrim_string_free(owned);
+    } else {
+        // Keep the .d.ts contract (value: string) valid even on failure.
+        napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &value);
+    }
+    napi_set_named_property(env, object, "value", value);
+    return object;
+}
+
+napi_value StaticStringResult(napi_env env, const char *text) {
+    napi_value object = CodeResult(env, 0);
+    napi_value value;
+    napi_create_string_utf8(env, text ? text : "", NAPI_AUTO_LENGTH, &value);
+    napi_set_named_property(env, object, "value", value);
+    return object;
+}
+
+struct ProgressContext {
+    napi_env env;
+    napi_value callback;
+};
+
+int32_t ProgressTrampoline(float value, void *userData) {
+    auto *ctx = static_cast<ProgressContext *>(userData);
+    napi_value argument, undefined, result;
+    napi_get_undefined(ctx->env, &undefined);
+    napi_create_double(ctx->env, static_cast<double>(value), &argument);
+    if (napi_call_function(ctx->env, undefined, ctx->callback, 1, &argument, &result) != napi_ok) {
+        return 1;
+    }
+    bool keepGoing = true;
+    napi_get_value_bool(ctx->env, result, &keepGoing);
+    return keepGoing ? 0 : 1;
+}
+
+napi_value CreateEngine(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    JsString draft = argc > 0 ? JsString::From(env, args[0]) : JsString();
+    captrim_engine_t *handle = nullptr;
+    int32_t code = captrim_engine_new(draft.c_str(), &handle);
+    return HandleResult(env, code, handle);
+}
+
+napi_value ReleaseEngine(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    captrim_engine_free(AsEngine(GetInt64(env, args[0])));
+    return CodeResult(env, CAPTRIM_OK);
+}
+
+napi_value Apply(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return IdResult(env, CAPTRIM_ERR_INVALID, 0);
+    JsString command = JsString::From(env, args[1]);
+    uint64_t created = 0;
+    int32_t code = captrim_engine_apply(
+        AsEngine(GetInt64(env, args[0])), command.c_str(), &created);
+    return IdResult(env, code, created);
+}
+
+napi_value Undo(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    return CodeResult(env, captrim_engine_undo(AsEngine(GetInt64(env, args[0]))));
+}
+
+napi_value Redo(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    return CodeResult(env, captrim_engine_redo(AsEngine(GetInt64(env, args[0]))));
+}
+
+napi_value Draft(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    char *json = nullptr;
+    int32_t code = captrim_engine_draft(AsEngine(GetInt64(env, args[0])), &json);
+    return StringResult(env, code, json);
+}
+
+napi_value AddMedia(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return IdResult(env, CAPTRIM_ERR_INVALID, 0);
+    JsString uri = JsString::From(env, args[1]);
+    uint64_t id = 0;
+    int32_t code = captrim_engine_add_media(
+        AsEngine(GetInt64(env, args[0])), uri.c_str(), &id);
+    return IdResult(env, code, id);
+}
+
+napi_value Probe(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    JsString uri = JsString::From(env, args[1]);
+    char *json = nullptr;
+    int32_t code = captrim_engine_probe(
+        AsEngine(GetInt64(env, args[0])), uri.c_str(), &json);
+    return StringResult(env, code, json);
+}
+
+napi_value SetMediaInfo(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+    JsString infoJson = JsString::From(env, args[2]);
+    int32_t code = captrim_engine_set_media_info(
+        AsEngine(GetInt64(env, args[0])),
+        static_cast<uint64_t>(GetInt64(env, args[1])), infoJson.c_str());
+    return CodeResult(env, code);
+}
+
+napi_value ExportRemux(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+
+    JsString src = JsString::From(env, args[1]);
+    JsString dst = JsString::From(env, args[2]);
+
+    ProgressContext ctx{env, nullptr};
+    captrim_progress_cb callback = nullptr;
+    if (argc >= 4) {
+        napi_valuetype type = napi_undefined;
+        napi_typeof(env, args[3], &type);
+        if (type == napi_function) {
+            ctx.callback = args[3];
+            callback = ProgressTrampoline;
+        }
+    }
+
+    int32_t code = captrim_engine_export_remux(
+        AsEngine(GetInt64(env, args[0])), src.c_str(), dst.c_str(),
+        callback, callback ? &ctx : nullptr);
+    return CodeResult(env, code);
+}
+
+// captrim_version() returns a static string; it must not be freed.
+napi_value VersionImpl(napi_env env, napi_callback_info) {
+    return StaticStringResult(env, captrim_version());
+}
+
+napi_value CodeMessage(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t code = 0;
+    if (argc > 0) napi_get_value_int32(env, args[0], &code);
+    return StaticStringResult(env, captrim_code_message(code));
+}
+
+napi_value LastError(napi_env env, napi_callback_info) {
+    return StaticStringResult(env, captrim_last_error_message());
+}
+
+napi_value Init(napi_env env, napi_value exports) {
+    napi_property_descriptor descriptors[] = {
+        {"createEngine", nullptr, CreateEngine, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"releaseEngine", nullptr, ReleaseEngine, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"apply", nullptr, Apply, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"undo", nullptr, Undo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"redo", nullptr, Redo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"draft", nullptr, Draft, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"addMedia", nullptr, AddMedia, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"probe", nullptr, Probe, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setMediaInfo", nullptr, SetMediaInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exportRemux", nullptr, ExportRemux, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"version", nullptr, VersionImpl, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"codeMessage", nullptr, CodeMessage, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},
+    };
+    napi_define_properties(env, exports,
+                           sizeof(descriptors) / sizeof(descriptors[0]), descriptors);
+    return exports;
+}
+
+}  // namespace
+
+static napi_module g_captrimModule = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "captrim_napi",
+    .nm_priv = nullptr,
+    .reserved = {nullptr, nullptr, nullptr, nullptr},
+};
+
+extern "C" __attribute__((constructor)) void RegisterCaptrimNapiModule(void) {
+    napi_module_register(&g_captrimModule);
+}

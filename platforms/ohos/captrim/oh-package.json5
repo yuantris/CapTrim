@@ -1,0 +1,9 @@
+{
+  "name": "captrim",
+  "version": "0.1.0",
+  "description": "Rust-based audio/video editing core for HarmonyOS",
+  "main": "Index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {}
+}

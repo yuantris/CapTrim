@@ -1,0 +1,6 @@
+# Keep the ArkTS public surface of the HAR readable to consumers.
+-enable-property-obfuscation
+-enable-toplevel-obfuscation
+-keep-file-name
+index
+CapTrim

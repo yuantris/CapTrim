@@ -1,0 +1,4 @@
+{
+  "name": "libcaptrim_napi.so",
+  "types": "./index.d.ts"
+}

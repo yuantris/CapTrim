@@ -1,0 +1,12 @@
+[package]
+name = "captrim-core"
+description = "Platform-independent editing model for CapTrim: rational time, immutable timeline, command history."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

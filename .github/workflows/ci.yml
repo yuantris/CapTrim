@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Everything here is verified locally too, so a red run always means a real
+  # regression rather than a missing toolchain.
+  rust:
+    name: Rust core, ABI and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustup target add aarch64-unknown-linux-ohos
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: ABI / NAPI contract
+        run: bash scripts/check-native-abi.sh
+
+      # `cargo check` type-checks against the HarmonyOS std without invoking a
+      # linker, so this needs no DevEco NDK and still catches the mistakes that
+      # actually break the cross build (unsupported platform APIs, bad cfg).
+      - name: Cross-check core for HarmonyOS arm64
+        run: cargo check -p captrim-core --target aarch64-unknown-linux-ohos
+
+  # The AAR can only be built where an Android SDK/NDK exists. It is not
+  # verified on the machine this repository was bootstrapped from, so it starts
+  # as non-blocking: flip `continue-on-error` to false once the first green run
+  # confirms the NDK/AGP versions below.
+  android:
+    name: Android AAR (provisional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android
+
+      - name: Install Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;27.0.12077973'
+
+      - name: Build libcaptrim.so (stub backend)
+        env:
+          FEATURES: ''
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.0.12077973"
+          bash scripts/build-rust.sh android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble AAR
+        working-directory: platforms/android
+        run: gradle :captrim:assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: captrim-aar
+          path: platforms/android/captrim/build/outputs/aar/*.aar
+          if-no-files-found: warn

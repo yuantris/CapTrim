@@ -1,0 +1,12 @@
+{
+  "module": {
+    "name": "captrim",
+    "type": "har",
+    "description": "CapTrim editing core",
+    "deviceTypes": [
+      "phone",
+      "tablet",
+      "2in1"
+    ]
+  }
+}
