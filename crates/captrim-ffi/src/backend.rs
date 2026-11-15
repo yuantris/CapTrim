@@ -18,6 +18,19 @@ pub trait MediaBackend: Send + Sync {
         dst_uri: &str,
         progress: &mut dyn FnMut(f32) -> bool,
     ) -> Result<()>;
+    /// Decode -> filter graph -> re-encode -> mux. `filter_desc` is a
+    /// libavfilter graph string (e.g. "scale=640:-2,fps=24"); `video_codec` is
+    /// an encoder name (e.g. "libx264"); empty strings use backend defaults.
+    /// This is the software backbone and the fallback for hardware codecs.
+    /// `progress` returns false to cancel.
+    fn transcode(
+        &self,
+        src_uri: &str,
+        dst_uri: &str,
+        filter_desc: &str,
+        video_codec: &str,
+        progress: &mut dyn FnMut(f32) -> bool,
+    ) -> Result<()>;
 }
 
 pub struct StubBackend;
@@ -37,6 +50,19 @@ impl MediaBackend for StubBackend {
         &self,
         _src_uri: &str,
         _dst_uri: &str,
+        _progress: &mut dyn FnMut(f32) -> bool,
+    ) -> Result<()> {
+        Err(Error::BackendUnavailable(
+            "build captrim-ffi with --features ffmpeg and ship libcaptrim_ffmpeg.so".into(),
+        ))
+    }
+
+    fn transcode(
+        &self,
+        _src_uri: &str,
+        _dst_uri: &str,
+        _filter_desc: &str,
+        _video_codec: &str,
         _progress: &mut dyn FnMut(f32) -> bool,
     ) -> Result<()> {
         Err(Error::BackendUnavailable(
@@ -76,6 +102,15 @@ mod ffmpeg {
         fn ct_ff_remux(
             src_uri: *const c_char,
             dst_uri: *const c_char,
+            progress: Option<unsafe extern "C" fn(c_float, *mut c_void) -> c_int>,
+            user_data: *mut c_void,
+            out_error: *mut *mut c_char,
+        ) -> c_int;
+        fn ct_ff_transcode(
+            src_uri: *const c_char,
+            dst_uri: *const c_char,
+            filter_desc: *const c_char,
+            video_codec: *const c_char,
             progress: Option<unsafe extern "C" fn(c_float, *mut c_void) -> c_int>,
             user_data: *mut c_void,
             out_error: *mut *mut c_char,
@@ -153,6 +188,38 @@ mod ffmpeg {
                 ct_ff_remux(
                     src.as_ptr(),
                     dst.as_ptr(),
+                    Some(progress_trampoline),
+                    user,
+                    &mut err,
+                )
+            };
+            let message = unsafe { take_error(err) };
+            if status != 0 {
+                return Err(map_status(status, message));
+            }
+            Ok(())
+        }
+
+        fn transcode(
+            &self,
+            src_uri: &str,
+            dst_uri: &str,
+            filter_desc: &str,
+            video_codec: &str,
+            mut progress: &mut dyn FnMut(f32) -> bool,
+        ) -> Result<()> {
+            let src = cs(src_uri)?;
+            let dst = cs(dst_uri)?;
+            let filter = cs(filter_desc)?;
+            let codec = cs(video_codec)?;
+            let mut err: *mut c_char = ptr::null_mut();
+            let user = &mut progress as *mut _ as *mut c_void;
+            let status = unsafe {
+                ct_ff_transcode(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    filter.as_ptr(),
+                    codec.as_ptr(),
                     Some(progress_trampoline),
                     user,
                     &mut err,

@@ -373,6 +373,42 @@ pub extern "C" fn captrim_engine_export_remux(
     })
 }
 
+/// Transcode: decode -> filter graph -> re-encode -> mux. `filter_desc` and
+/// `video_codec` may be NULL or "" for backend defaults.
+#[no_mangle]
+pub extern "C" fn captrim_engine_export_transcode(
+    engine: *mut captrim_engine_t,
+    src_uri: *const c_char,
+    dst_uri: *const c_char,
+    filter_desc: *const c_char,
+    video_codec: *const c_char,
+    progress: CaptrimProgressCb,
+    user_data: *mut c_void,
+) -> i32 {
+    ffi_guard(|| {
+        let e = engine_from(engine)?;
+        let src = unsafe { cstr(src_uri)? };
+        let dst = unsafe { cstr(dst_uri)? };
+        let filter = if filter_desc.is_null() {
+            ""
+        } else {
+            unsafe { cstr(filter_desc)? }
+        };
+        let codec = if video_codec.is_null() {
+            ""
+        } else {
+            unsafe { cstr(video_codec)? }
+        };
+        let mut report = |value: f32| match progress {
+            Some(cb) => unsafe { cb(value, user_data) == 0 },
+            None => true,
+        };
+        e.backend
+            .transcode(src, dst, filter, codec, &mut report)?;
+        Ok(0)
+    })
+}
+
 /// Copy a media source's URI into a caller buffer.
 ///
 /// A renderer has a `source_id` from the frame plan and needs the file to open

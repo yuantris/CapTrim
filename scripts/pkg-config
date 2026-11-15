@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Minimal pkg-config shim for the CapTrim FFmpeg cross-build.
+# It only needs to answer queries for the external codecs we bundle (x264, x265)
+# by reading their .pc files from PKG_CONFIG_PATH. This avoids installing a full
+# pkg-config on the (minimal) Windows build host.
+set -u
+
+mode="cflags"
+static=0
+pkg=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        # FFmpeg's configure probes `pkg-config --version` first; if that fails
+        # it sets pkg_config=false and every later check degenerates to
+        # `false --exists <pkg>` and fails. So we MUST answer --version with a
+        # zero exit and a sane version string.
+        --version)       echo "0.29-caprim-shim"; exit 0 ;;
+        --help)          exit 0 ;;
+        --exists)        mode="exists" ;;
+        --cflags)        mode="cflags" ;;
+        --libs)          mode="libs" ;;
+        --modversion)    mode="modversion" ;;
+        --static)        static=1 ;;
+        --print-errors)  : ;;        # ignore
+        --variable=*)    mode="variable"; var="${1#--variable=}" ;;
+        --atleast-version=*|--max-version=*|--exact-version=*) exit 0 ;;
+        --*)             : ;;         # ignore other flags
+        *)               pkg="$1" ;;
+    esac
+    shift
+done
+
+# Take the package name before any version operator/space.
+pkg="${pkg%%[ <>=]*}"
+
+# Locate <pkg>.pc in PKG_CONFIG_PATH (and PKG_CONFIG_LIBDIR as fallback).
+IFS=':' read -ra DIRS <<< "${PKG_CONFIG_PATH:-}"
+pc=""
+for d in "${DIRS[@]:-}"; do
+    [ -z "$d" ] && continue
+    if [ -f "$d/$pkg.pc" ]; then pc="$d/$pkg.pc"; break; fi
+done
+if [ -z "$pc" ] && [ -n "${PKG_CONFIG_LIBDIR:-}" ]; then
+    IFS=':' read -ra LDIRS <<< "$PKG_CONFIG_LIBDIR"
+    for d in "${LDIRS[@]:-}"; do
+        [ -z "$d" ] && continue
+        if [ -f "$d/$pkg.pc" ]; then pc="$d/$pkg.pc"; break; fi
+    done
+fi
+
+if [ -z "$pc" ]; then
+    [ "$mode" = "exists" ] && exit 1
+    echo "Package '$pkg' not found (PKG_CONFIG_PATH=$PKG_CONFIG_PATH)" >&2
+    exit 1
+fi
+
+# Parse the .pc: capture both `key=value` and `key: value` lines.
+declare -A V
+while IFS= read -r line; do
+    line="${line%%#*}"                       # strip comments
+    [ -z "$line" ] && continue
+    if [[ "$line" == *=* ]]; then
+        k="${line%%=*}"; v="${line#*=}"
+    elif [[ "$line" =~ ^([A-Za-z_.]+):[[:space:]]*(.*)$ ]]; then
+        k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+    else
+        continue
+    fi
+    k="$(printf '%s' "$k" | tr -d ' ')"
+    V["$k"]="$v"
+done < "$pc"
+
+# Substitute ${var} / $var references. Keys may reference each other
+# (e.g. libdir=${exec_prefix}/lib, exec_prefix=${prefix}), so iterate until
+# the string stops changing.
+subst() {
+    local s="$1" prev
+    for _ in 1 2 3 4 5 6; do
+        prev="$s"
+        s="$(printf '%s' "$s" | sed \
+            -e "s|\${prefix}|${V[prefix]:-}|g" \
+            -e "s|\${exec_prefix}|${V[exec_prefix]:-}|g" \
+            -e "s|\${libdir}|${V[libdir]:-}|g" \
+            -e "s|\${includedir}|${V[includedir]:-}|g" \
+            -e "s|\${bindir}|${V[bindir]:-}|g")"
+        [ "$s" = "$prev" ] && break
+    done
+    printf '%s' "$s"
+}
+
+cflags="$(subst "${V[Cflags]:-}")"
+libs="$(subst "${V[Libs]:-}")"
+[ "$static" = "1" ] && libs="$libs $(subst "${V[Libs.private]:-}")"
+
+case "$mode" in
+    exists)     exit 0 ;;
+    cflags)     echo "$cflags" ;;
+    libs)       echo "$libs" ;;
+    modversion) echo "${V[Version]:-}" ;;
+    variable)   echo "${V[$var]:-}" ;;
+esac
+exit 0

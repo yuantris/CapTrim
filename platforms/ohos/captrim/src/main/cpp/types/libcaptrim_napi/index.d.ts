@@ -39,6 +39,15 @@ export const exportRemux: (
   dstUri: string,
   progress?: (value: number) => boolean
 ) => CodeResult;
+/** Decode -> filter graph -> re-encode -> mp4 mux. Empty strings use defaults. */
+export const exportTranscode: (
+  handle: number,
+  srcUri: string,
+  dstUri: string,
+  filterDesc: string,
+  videoCodec: string,
+  progress?: (value: number) => boolean
+) => CodeResult;
 export const version: () => StringResult;
 export const codeMessage: (code: number) => StringResult;
 export const lastErrorMessage: () => StringResult;

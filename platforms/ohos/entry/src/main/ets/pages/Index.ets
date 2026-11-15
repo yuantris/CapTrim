@@ -410,9 +410,28 @@ struct Index {
 
   // ---- self test ---------------------------------------------------------
 
+  private pipelineScheduled: boolean = false;
+
+  private appendChecks(extra: CheckResult[]): void {
+    for (const item of extra) {
+      hilog.info(DOMAIN, TAG, 'check %{public}s %{public}s | %{public}s',
+        item.pass ? 'PASS' : 'FAIL', item.name, item.detail);
+    }
+    const all: CheckResult[] = this.checks.concat(extra);
+    let passed = 0;
+    for (const item of all) {
+      if (item.pass) {
+        passed++;
+      }
+    }
+    this.checks = all;
+    this.summary = `${passed}/${all.length} 项通过`;
+    hilog.info(DOMAIN, TAG, 'selfcheck %{public}d/%{public}d passed', passed, all.length);
+  }
+
   private runChecks(): void {
     this.summary = '运行中…';
-    const results: CheckResult[] = SelfCheck.run();
+    const results: CheckResult[] = SelfCheck.run(this.filesDir);
     let passed = 0;
     for (const item of results) {
       if (item.pass) {
@@ -424,6 +443,32 @@ struct Index {
     this.checks = results;
     this.summary = `${passed}/${results.length} 项通过`;
     hilog.info(DOMAIN, TAG, 'selfcheck %{public}d/%{public}d passed', passed, results.length);
+
+    // The three hybrid-pipeline checks are deferred, one per UI task. SelfCheck
+    // is synchronous and the 12 checks above already contain a ~17s software
+    // transcode; chaining long jobs back-to-back makes OHOS report
+    // ThreadBlock6S and kill the app with signal 9 (verified on Mate 60).
+    // Letting the event loop breathe between tasks keeps the watchdog happy.
+    if (!this.pipelineScheduled) {
+      this.pipelineScheduled = true;
+      const filesDir: string = this.filesDir;
+      setTimeout((): void => {
+        this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 0));
+        // Give the UI thread a real idle window before each heavy job.
+        // Chaining them back-to-back still trips ThreadBlock6S even though
+        // each job is short, because the 12 checks above already burned most
+        // of the watchdog's tolerance with the ~17s software transcode.
+        setTimeout((): void => {
+          this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 1));
+          setTimeout((): void => {
+            this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 2));
+            setTimeout((): void => {
+              this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 3));
+            }, 8000);
+          }, 8000);
+        }, 8000);
+      }, 800);
+    }
   }
 
   @Builder

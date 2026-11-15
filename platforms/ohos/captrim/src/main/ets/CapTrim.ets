@@ -9,6 +9,7 @@ import {
   probe as nativeProbe,
   setMediaInfo as nativeSetMediaInfo,
   exportRemux as nativeExportRemux,
+  exportTranscode as nativeExportTranscode,
   version as nativeVersion,
   codeMessage as nativeCodeMessage,
   lastErrorMessage,
@@ -246,6 +247,27 @@ export class CapTrim {
   exportRemux(srcUri: string, dstUri: string,
     progress: ProgressCallback = alwaysContinue): void {
     CapTrim.checkStatus(nativeExportRemux(this.handle, srcUri, dstUri, progress).code);
+  }
+
+  /**
+   * Full transcode: decode -> FFmpeg filter graph -> re-encode -> mp4 mux.
+   * This is the software backbone of the editing pipeline (and the fallback
+   * when a platform hardware codec is unavailable).
+   *
+   * @param filterDesc libavfilter graph for the VIDEO track, e.g.
+   *   "scale=640:-2,fps=24,hflip". Empty string keeps frames as-is (still
+   *   re-encoded). Audio tracks are losslessly stream-copied.
+   * @param videoCodec encoder name, e.g. "libx264" (default), "libx265",
+   *   "mpeg4". Empty string uses the default.
+   *
+   * Runs synchronously on the calling thread -- invoke from a worker/task
+   * dispatcher to avoid blocking the UI thread on long clips.
+   */
+  exportTranscode(srcUri: string, dstUri: string,
+    filterDesc: string = '', videoCodec: string = '',
+    progress: ProgressCallback = alwaysContinue): void {
+    CapTrim.checkStatus(
+      nativeExportTranscode(this.handle, srcUri, dstUri, filterDesc, videoCodec, progress).code);
   }
 
   /** Open a playback session. Close the previous one first. */

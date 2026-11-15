@@ -73,6 +73,15 @@ int32_t captrim_engine_export_remux(captrim_engine_t *engine,
                                     const char *src_uri, const char *dst_uri,
                                     captrim_progress_cb progress, void *user_data);
 
+/* Transcode: decode -> libavfilter graph -> re-encode -> mp4 mux.
+ * filter_desc / video_codec may be NULL or "" for backend defaults
+ * (no filter / libx264). Non-video streams are stream-copied.
+ * Returns CAPTRIM_ERR_NO_BACKEND when built without the `ffmpeg` feature. */
+int32_t captrim_engine_export_transcode(captrim_engine_t *engine,
+                                        const char *src_uri, const char *dst_uri,
+                                        const char *filter_desc, const char *video_codec,
+                                        captrim_progress_cb progress, void *user_data);
+
 /* ---- Frame planning (P1) -------------------------------------------------
  * Preview and export read the same plan, which is what keeps "what I saw" and
  * "what got written" identical.

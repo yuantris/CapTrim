@@ -15,6 +15,19 @@ cd "$ROOT_DIR"
 log() { printf '[captrim] %s\n' "$*"; }
 die() { printf '[captrim][error] %s\n' "$*" >&2; exit 1; }
 
+# On Windows / Git-Bash the NDK clang.exe is a *native* Windows binary and does
+# not understand MSYS-style paths like /c/Users/... (it would look for
+# C:\c\Users\... and never find libcaptrim_ffmpeg.so). Convert a path to a
+# Windows "mixed" form (C:/...) before handing it to the native linker. On
+# Linux/macOS `cygpath` is absent, so the path is returned unchanged.
+native_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w -m -- "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 PLATFORM="${1:-}"
 [ -n "$PLATFORM" ] || die "usage: build-rust.sh host|android|ohos"
 
@@ -23,7 +36,11 @@ stage_libs() {
     local dst_dir="$2"
     mkdir -p "$dst_dir"
     local found=0
-    for lib in "$src_dir"/*.so; do
+    # Use *.so* so versioned FFmpeg libraries (libavcodec.so.61.19.100 and the
+    # libavcodec.so / libavcodec.so.61 symlinks) are staged too. Android ships
+    # unversioned .so files, where *.so* collapses to *.so, so this is safe for
+    # both platforms.
+    for lib in "$src_dir"/*.so*; do
         [ -e "$lib" ] || continue
         cp -a "$lib" "$dst_dir/"
         found=1
@@ -69,7 +86,15 @@ for ABI in $ABIS; do
     if [ "$PLATFORM" = "android" ]; then
         [ -n "${ANDROID_NDK_HOME:-}" ] || die "ANDROID_NDK_HOME is not set"
         ANDROID_API="${ANDROID_API:-26}"
-        LINKER="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/${CLANG_NAME}${ANDROID_API}-clang"
+        LINKER_BASE="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/${CLANG_NAME}${ANDROID_API}-clang"
+        # On Windows the NDK ships the clang wrapper as a .cmd. rustc only spawns
+        # a linker through `cmd /c` for *.cmd/*.bat linkers, so the bare-name
+        # (shell-script) wrapper would be exec'd directly and fail.
+        if [ "$HOST_TAG" = "windows-x86_64" ]; then
+            LINKER="${LINKER_BASE}.cmd"
+        else
+            LINKER="${LINKER_BASE}"
+        fi
         NATIVE_DIR="${ROOT_DIR}/dist/android/${ABI}"
         STAGE_DIR="${ROOT_DIR}/platforms/android/captrim/src/main/jniLibs/${ABI}"
     else
@@ -80,12 +105,11 @@ for ABI in $ABIS; do
         STAGE_DIR="${ROOT_DIR}/platforms/ohos/captrim/libs/${ABI}"
     fi
 
-    # A .bat has no executable bit under Git Bash, so only presence matters.
-    if [ "$WRAPPER_EXT" = ".bat" ]; then
-        [ -f "$LINKER" ] || die "linker wrapper not found: $LINKER"
-    else
-        [ -x "$LINKER" ] || die "linker not found or not executable: $LINKER"
-    fi
+    # A .bat/.cmd has no executable bit under Git Bash, so presence is enough.
+    case "$LINKER" in
+        *.bat|*.cmd) [ -f "$LINKER" ] || die "linker wrapper not found: $LINKER" ;;
+        *) [ -x "$LINKER" ] || die "linker not found or not executable: $LINKER" ;;
+    esac
     if [ -n "$FEATURES" ]; then
         [ -f "${NATIVE_DIR}/libcaptrim_ffmpeg.so" ] || \
             die "run build-ffmpeg-${PLATFORM}.sh first, or set FEATURES= to build the stub backend (missing ${NATIVE_DIR}/libcaptrim_ffmpeg.so)"
@@ -94,7 +118,9 @@ for ABI in $ABIS; do
     LINKER_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
     export "$LINKER_VAR"="$LINKER"
     # HarmonyOS requires a SONAME on every prebuilt .so.
-    export RUSTFLAGS="${RUSTFLAGS:-} -L native=${NATIVE_DIR} -C link-arg=-Wl,-soname,libcaptrim.so"
+    # NATIVE_DIR may be an MSYS path (/c/...); the native linker only accepts a
+    # Windows path, so convert it.
+    export RUSTFLAGS="${RUSTFLAGS:-} -L native=$(native_path "$NATIVE_DIR") -C link-arg=-Wl,-soname,libcaptrim.so"
 
     FEATURE_ARGS=()
     if [ -n "$FEATURES" ]; then

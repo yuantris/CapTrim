@@ -8,6 +8,7 @@
 // suspicious zero.
 
 import { CapTrim, CapTrimPreview, FramePlan, Step } from 'captrim';
+import { fileIo as fs } from '@kit.CoreFileKit';
 
 export interface CheckResult {
   name: string;
@@ -211,7 +212,7 @@ export class Fixture {
 }
 
 export class SelfCheck {
-  static run(): CheckResult[] {
+  static run(filesDir: string): CheckResult[] {
     const results: CheckResult[] = [];
     SelfCheck.check(results, '原生库加载与 N-API 绑定', (): string => {
       const version = CapTrim.version();
@@ -378,7 +379,239 @@ export class SelfCheck {
       return `0 → "${ok}"，未知片段正确报错`;
     });
 
+    // ---- FFmpeg 软件后端（probe / remux） ---------------------------------
+    // These exercise the real FFmpeg C shim (libcaptrim_ffmpeg.so + the FFmpeg
+    // shared libraries) through the same N-API the Rust FfmpegBackend uses, so a
+    // pass here proves the GPL software backend actually works on device.
+    SelfCheck.check(results, 'FFmpeg 探测（软后端 probe）', (): string => {
+      const engine = CapTrim.create();
+      try {
+        const src = `file://${filesDir}/a.mp4`;
+        const json = engine.probe(src);
+        const info = JSON.parse(json) as MediaInfoJson;
+        expect(info.streams.length > 0, 'probe 未返回任何流');
+        const kinds = info.streams.map((s: StreamJson) => s.kind).join(',');
+        return `format=${info.format} dur=${(info.duration_us / 1_000_000).toFixed(2)}s ` +
+          `streams=${info.streams.length}[${kinds}]`;
+      } finally {
+        engine.close();
+      }
+    });
+
+    SelfCheck.check(results, 'FFmpeg 重封装（软后端 remux）', (): string => {
+      const engine = CapTrim.create();
+      const src = `file://${filesDir}/a.mp4`;
+      const dst = `${filesDir}/remuxed.mp4`;
+      try {
+        try {
+          fs.unlinkSync(dst);
+        } catch (e) {
+          // 首次运行产物不存在，忽略
+        }
+        engine.exportRemux(src, dst);
+        const stat = fs.statSync(dst);
+        expect(stat.size > 0, `remux 输出为空 (${stat.size} bytes)`);
+        // 复探产物，证明它是自包含、可被 FFmpeg 重新解封装的 mp4
+        const json = engine.probe(`file://${dst}`);
+        const info = JSON.parse(json) as MediaInfoJson;
+        expect(info.streams.length > 0, 'remux 产物无法被 probe');
+        return `写回 ${(stat.size / 1_000_000).toFixed(2)}MB，复探 ${info.streams.length} 路流`;
+      } finally {
+        engine.close();
+      }
+    });
+
+    // ---- FFmpeg 复杂剪辑链路（decode -> filter -> libx264 -> mux） ---------
+    // Exercises a real "complex edit command": scale down, horizontal flip,
+    // drop to 15fps, then H.264 re-encode. Passing proves the full software
+    // backbone works on device (and is available as the hardware fallback).
+    SelfCheck.check(results, 'FFmpeg 复杂剪辑（滤镜+libx264重编码）', (): string => {
+      const engine = CapTrim.create();
+      const src = `file://${filesDir}/a.mp4`;
+      const dst = `${filesDir}/edited.mp4`;
+      try {
+        try {
+          fs.unlinkSync(dst);
+        } catch (e) {
+          // 首次运行产物不存在，忽略
+        }
+        // 先探测源片分辨率，验证 scale 确实改了尺寸
+        const before = JSON.parse(engine.probe(src)) as MediaInfoJson;
+        const srcVideo = before.streams.find((s: StreamJson) => s.kind === 'video');
+        expect(srcVideo !== undefined, '源片没有视频流');
+        const rawFrames: number[] = [];
+        // Only 2s of source: a full 22s synchronous transcode on the UI
+        // thread exhausts the OHOS ThreadBlock6S watchdog budget, so any
+        // later check gets the app killed with signal 9. trim is a terminating
+        // filter - ct_ff_transcode() now stops decoding when the graph closes.
+        engine.exportTranscode(
+          src, dst,
+          'trim=duration=2,setpts=PTS-STARTPTS,scale=320:180,hflip,fps=15',
+          'libx264',
+          (v: number): boolean => { rawFrames.push(Math.round(v * 100)); return true; }
+        );
+        const stat = fs.statSync(dst);
+        expect(stat.size > 0, `转码输出为空 (${stat.size} bytes)`);
+        expect(rawFrames.length >= 20, `进度回调次数过少 (${rawFrames.length})`);
+        expect(rawFrames[rawFrames.length - 1] > rawFrames[0], '进度没有推进');
+        // 复探产物：确认是 h264、分辨率已变为 320x180、帧率约 15
+        const info = JSON.parse(engine.probe(`file://${dst}`)) as MediaInfoJson;
+        const video = info.streams.find((s: StreamJson) => s.kind === 'video');
+        expect(video !== undefined, '转码产物没有视频流');
+        // ArkTS does not narrow through our custom expect(), so bind an
+        // explicitly non-null local for the field accesses below.
+        const outVideo: StreamJson = video!;
+        expect(outVideo.codec === 'h264', `编码器应为 h264，实际 ${outVideo.codec}`);
+        expect(outVideo.width === 320 && outVideo.height === 180,
+          `分辨率应为 320x180，实际 ${outVideo.width}x${outVideo.height}`);
+        expect(srcVideo!.width !== 320, '测试无效：源片本来就是 320 宽');
+        return `${srcVideo!.width}x${srcVideo!.height}→320x180 ` +
+          `codec=${outVideo.codec} fps≈15 ${(stat.size / 1_000_000).toFixed(2)}MB ` +
+          `进度 ${rawFrames.length} 次`;
+      } finally {
+        engine.close();
+      }
+    });
+
     return results;
+  }
+
+  /**
+   * Heavy hybrid-pipeline checks. Call ONE AT A TIME from a deferred UI task.
+   * The device self check is synchronous; running two full transcodes back to
+   * back with the 17s software edit above trips the OHOS ThreadBlock6S
+   * watchdog (verified on Mate 60: app killed with signal 9).
+   */
+  static runPipelineChecks(filesDir: string, which: number): CheckResult[] {
+    const results: CheckResult[] = [];
+    if (which === 0) {
+    // Three-stage pipeline, software baseline. "hw:sw:" forces every stage to
+    // FFmpeg but still exercises ct_pipeline_run(): decoder -> libavfilter ->
+    // encoder vtables, per-frame ct_frame_t handoff, progress and flush.
+    SelfCheck.check(results, '三段式管线（软件基线 / 回退链路）', (): string => {
+      const engine = CapTrim.create();
+      const src = `file://${filesDir}/a.mp4`;
+      const dst = `${filesDir}/pipeline_sw.mp4`;
+      try {
+        try {
+          fs.unlinkSync(dst);
+        } catch (e) {
+          // 首次运行产物不存在，忽略
+        }
+        const ticks: number[] = [];
+        engine.exportTranscode(
+          src, dst,
+          // Only 2s of media: the on-device self check runs synchronously on
+          // the UI thread, and a full 22s transcode makes the system's
+          // ThreadBlock6S watchdog kill the app (verified on Mate 60).
+          'trim=duration=2,setpts=PTS-STARTPTS,scale=320:180,hflip,fps=15',
+          'hw:sw:libx264',
+          (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; }
+        );
+        const stat = fs.statSync(dst);
+        expect(stat.size > 0, `管线输出为空 (${stat.size} bytes)`);
+        expect(ticks.length > 0, '管线进度回调未触发');
+        const info = JSON.parse(engine.probe(`file://${dst}`)) as MediaInfoJson;
+        const video = info.streams.find((s: StreamJson) => s.kind === 'video');
+        expect(video !== undefined, '管线产物没有视频流');
+        const outVideo: StreamJson = video!;
+        expect(outVideo.codec === 'h264', `编码器应为 h264，实际 ${outVideo.codec}`);
+        expect(outVideo.width === 320 && outVideo.height === 180,
+          `分辨率应为 320x180，实际 ${outVideo.width}x${outVideo.height}`);
+        return `decode→filter→encode ${(stat.size / 1_000_000).toFixed(2)}MB ` +
+          `进度 ${ticks.length} 次`;
+      } finally {
+        engine.close();
+      }
+    });
+
+    // "hw:" prefers OHOS hardware decode + hardware encode for STAGE 1/3 while
+    // STAGE 2 stays FFmpeg libavfilter. Any hardware failure falls back per
+    // stage, and a streaming-time failure retries the whole job in software.
+    // The actual decoder/encoder choice is logged under tag CapTrimPipeline.
+    } else if (which === 1) {
+      SelfCheck.hybridCheck(results, filesDir,
+        '三段式管线（硬解/硬编优先，失败自动回退）',
+        'pipeline_hw.mp4', 'hw:libx264', '硬件优先→回退就绪');
+    } else if (which === 2) {
+      // "hw:cb:" forces the AVCodec callback (async) Buffer mode queues. This
+      // is the API-11+ path from the official transcoding sample; it must work
+      // independently of the API-20 synchronous Query*Buffer fast path.
+      SelfCheck.hybridCheck(results, filesDir,
+        '三段式管线（OHOS 回调式 Buffer 硬解/硬编）',
+        'pipeline_cb.mp4', 'hw:cb:libx264', '回调式 Buffer 硬件优先');
+    } else if (which === 3) {
+      // probe() only reads container metadata. Re-DECODE the hardware-encoded
+      // mp4 with the FFmpeg software H.264 decoder to prove the bitstream is
+      // real (SPS/PPS + frames), not just a well-formed but empty muxer file.
+      ['pipeline_hw.mp4', 'pipeline_cb.mp4'].forEach((name: string): void => {
+        SelfCheck.verifyDecodable(results, filesDir, name);
+      });
+    }
+    return results;
+  }
+
+  private static verifyDecodable(results: CheckResult[], filesDir: string,
+                                 srcName: string): void {
+    SelfCheck.check(results, `硬编产物可被 FFmpeg 软解（${srcName}）`, (): string => {
+      const engine = CapTrim.create();
+      const src = `${filesDir}/${srcName}`;
+      const dst = `${filesDir}/${srcName}.verify.mp4`;
+      try {
+        try {
+          fs.unlinkSync(dst);
+        } catch (e) {
+          // 首次运行产物不存在，忽略
+        }
+        const ticks: number[] = [];
+        engine.exportTranscode(
+          `file://${src}`, dst, 'scale=64:64', 'libx264',
+          (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; }
+        );
+        expect(fs.statSync(dst).size > 0, '软解再编码产物为空');
+        expect(ticks.length >= 2, `可解码帧数异常 (进度 ${ticks.length} 次)`);
+        return `FFmpeg 软解→重编码成功，进度 ${ticks.length} 次`;
+      } finally {
+        engine.close();
+      }
+    });
+  }
+
+  private static hybridCheck(results: CheckResult[], filesDir: string,
+                             name: string, dstName: string,
+                             codec: string, okPrefix: string): void {
+    SelfCheck.check(results, name, (): string => {
+      const engine = CapTrim.create();
+      const src = `file://${filesDir}/a.mp4`;
+      const dst = `${filesDir}/${dstName}`;
+      try {
+        try {
+          fs.unlinkSync(dst);
+        } catch (e) {
+          // 首次运行产物不存在，忽略
+        }
+        const ticks: number[] = [];
+        engine.exportTranscode(
+          src, dst,
+          'trim=duration=2,setpts=PTS-STARTPTS,scale=320:180,hflip,fps=15',
+          codec,
+          (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; }
+        );
+        const stat = fs.statSync(dst);
+        expect(stat.size > 0, `混合管线输出为空 (${stat.size} bytes)`);
+        const info = JSON.parse(engine.probe(`file://${dst}`)) as MediaInfoJson;
+        const video = info.streams.find((s: StreamJson) => s.kind === 'video');
+        expect(video !== undefined, '混合管线产物没有视频流');
+        const outVideo: StreamJson = video!;
+        expect(outVideo.codec === 'h264', `编码器应为 h264，实际 ${outVideo.codec}`);
+        expect(outVideo.width === 320 && outVideo.height === 180,
+          `分辨率应为 320x180，实际 ${outVideo.width}x${outVideo.height}`);
+        return `${okPrefix} ${(stat.size / 1_000_000).toFixed(2)}MB ` +
+          `codec=${outVideo.codec} 进度 ${ticks.length} 次`;
+      } finally {
+        engine.close();
+      }
+    });
   }
 
   private static check(out: CheckResult[], name: string, body: () => string): void {

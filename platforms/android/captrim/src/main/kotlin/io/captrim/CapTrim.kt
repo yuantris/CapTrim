@@ -41,6 +41,15 @@ object CapTrimNative {
         callback: ProgressCallback?,
     ): Int
 
+    external fun nativeExportTranscode(
+        handle: Long,
+        srcUri: String,
+        dstUri: String,
+        filterDesc: String,
+        videoCodec: String,
+        callback: ProgressCallback?,
+    ): Int
+
     external fun nativeVersion(): String
     external fun nativeCodeMessage(code: Int): String
     external fun nativeLastError(): String
@@ -132,6 +141,25 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
      */
     fun exportRemux(srcUri: String, dstUri: String, progress: ProgressCallback? = null) {
         CapTrimNative.nativeExportRemux(requireOpen(), srcUri, dstUri, progress)
+    }
+
+    /**
+     * Full transcode: decode -> FFmpeg filter graph -> re-encode -> mp4 mux.
+     * Software backbone of the editing pipeline and fallback when a hardware
+     * codec is unavailable. `filterDesc` is a libavfilter graph for the video
+     * track (e.g. "scale=640:-2,fps=24,hflip"); empty keeps frames as-is.
+     * `videoCodec` defaults to libx264 when empty. Audio is stream-copied.
+     * Runs on the calling thread; use a background dispatcher.
+     */
+    fun exportTranscode(
+        srcUri: String,
+        dstUri: String,
+        filterDesc: String = "",
+        videoCodec: String = "",
+        progress: ProgressCallback? = null,
+    ) {
+        CapTrimNative.nativeExportTranscode(
+            requireOpen(), srcUri, dstUri, filterDesc, videoCodec, progress)
     }
 
     /** Timeline length in microseconds. */

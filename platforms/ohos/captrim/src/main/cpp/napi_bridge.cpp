@@ -293,6 +293,34 @@ napi_value ExportRemux(napi_env env, napi_callback_info info) {
     return CodeResult(env, code);
 }
 
+napi_value ExportTranscode(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value args[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+
+    JsString src = JsString::From(env, args[1]);
+    JsString dst = JsString::From(env, args[2]);
+    JsString filter = argc > 3 ? JsString::From(env, args[3]) : JsString();
+    JsString codec = argc > 4 ? JsString::From(env, args[4]) : JsString();
+
+    ProgressContext ctx{env, nullptr};
+    captrim_progress_cb callback = nullptr;
+    if (argc >= 6) {
+        napi_valuetype type = napi_undefined;
+        napi_typeof(env, args[5], &type);
+        if (type == napi_function) {
+            ctx.callback = args[5];
+            callback = ProgressTrampoline;
+        }
+    }
+
+    int32_t code = captrim_engine_export_transcode(
+        AsEngine(GetInt64(env, args[0])), src.c_str(), dst.c_str(),
+        filter.c_str(), codec.c_str(), callback, callback ? &ctx : nullptr);
+    return CodeResult(env, code);
+}
+
 // captrim_version() returns a static string; it must not be freed.
 napi_value VersionImpl(napi_env env, napi_callback_info) {
     return StaticStringResult(env, captrim_version());
@@ -577,6 +605,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"probe", nullptr, Probe, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setMediaInfo", nullptr, SetMediaInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportRemux", nullptr, ExportRemux, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exportTranscode", nullptr, ExportTranscode, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
         {"version", nullptr, VersionImpl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"codeMessage", nullptr, CodeMessage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},
