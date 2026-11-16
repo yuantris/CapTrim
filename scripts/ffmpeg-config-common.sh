@@ -90,10 +90,13 @@ build_x264() {
     # counterparts (llvm-ar/llvm-strip/llvm-ranlib/llvm-strings) sit in the
     # same bin/ directory, all with the .exe suffix. For HarmonyOS the CC is a
     # wrapper script under scripts/toolchain/, so resolve the binutils from the
-    # OHOS NDK's own llvm/bin instead.
+    # OHOS NDK's own llvm/bin instead. make.exe spawns AR/STRIP through
+    # CreateProcess, so an MSYS path (/d/...) fails; use the Windows form.
     local llvm_dir
     if [ -n "${OHOS_NDK_HOME:-}" ] && [[ "$cc" == *"ohos"* ]]; then
         llvm_dir="${OHOS_NDK_HOME}/llvm/bin/"
+        command -v cygpath >/dev/null 2>&1 && \
+            llvm_dir="$(cygpath -m -- "${OHOS_NDK_HOME}/llvm/bin")/"
     else
         llvm_dir="$(dirname "$cc")/"
     fi
@@ -121,14 +124,36 @@ SHIM
     # when the path is space-free (covers Android, whose NDK path has no space).
     local x264_cflags="-fPIC"
     case "$sysroot" in *" "*) ;; *) x264_cflags="--sysroot=$sysroot -fPIC" ;; esac
+    # The make found on PATH is the NDK's Windows binary. It spawns recipes
+    # through CreateProcess, which cannot run an MSYS path like /c/.../clang.sh
+    # directly ("system cannot find the file specified"). Point it at a POSIX
+    # shell in Windows form, exactly as the Android FFmpeg build already does.
+    local make_shell=()
+    if [ -n "${CAPTRIM_MAKE_SHELL:-}" ]; then
+        make_shell=(SHELL="$CAPTRIM_MAKE_SHELL")
+    elif command -v cygpath >/dev/null 2>&1 && command -v sh >/dev/null 2>&1; then
+        make_shell=(SHELL="$(cygpath -m -- "$(command -v sh)")")
+    fi
+    # The NDK's Windows make.exe spawns simple recipes with CreateProcess and
+    # never consults SHELL, so a bare /c/.../clang.sh as CC fails with
+    # "system cannot find the file specified". Prefix the wrapper with a
+    # Windows sh.exe: make then launches the shell, which runs the script.
+    local x264_cc="$cc"
+    if command -v cygpath >/dev/null 2>&1 && [[ "$cc" == *.sh ]]; then
+        x264_cc="$(cygpath -m -- "$(command -v sh)") $(cygpath -m -- "$cc")"
+    fi
+    # install recipes are also launched by make.exe; an MSYS --prefix makes
+    # ranlib fail with "No such file or directory" on the installed archive.
+    local x264_prefix="$prefix"
+    command -v cygpath >/dev/null 2>&1 && x264_prefix="$(cygpath -m -- "$prefix")"
     log "building x264 for ${abi}"
     if ( cd "$src" && \
-         CC="$cc" AR="$ar" STRIP="$strip" RANLIB="$ranlib" \
-         ./configure --prefix="$prefix" \
+         CC="$x264_cc" AR="$ar" STRIP="$strip" RANLIB="$ranlib" \
+         ./configure --prefix="$x264_prefix" \
              --host="${arch}-linux" \
              --enable-static --enable-pic --disable-cli --disable-opencl \
              --extra-cflags="$x264_cflags" && \
-         make -j"$JOBS" && make install ); then
+         make -j"$JOBS" "${make_shell[@]}" && make install "${make_shell[@]}" ); then
         log "x264 built -> $prefix"
     else
         log "x264 build FAILED; continuing without libx264"
@@ -216,7 +241,10 @@ build_x265() {
     # shared build would compile yet silently install nothing.
     ( cd "$src" && git fetch origin --tags --depth 1 >/dev/null 2>&1 ) \
         || log "x265 tag fetch failed; shared library install may be skipped"
-    local b="${ROOT_DIR}/build/x265-${abi}"
+    # The build dir is the parent of the prefix. Deriving it from `prefix`
+    # keeps per-platform prefixes (x265-android-*, x265-ohos-*) paired with
+    # their own CMake cache instead of sharing one arm64-v8a directory.
+    local b="$(dirname "$prefix")"
     # Never `rm -rf "$b"`: prefix IS "$b/prefix". Wiping the build dir also
     # destroyed completed installs, so the cache check above could never fire
     # after an interrupted run and every retry recompiled x265 from scratch.
@@ -340,8 +368,26 @@ resolve_external_codecs() {
     # Reset per-ABI so repeated calls don't duplicate --enable flags.
     X264_PREFIX=""; X265_PREFIX=""
     EXT_CFLAGS=""; EXT_LDFLAGS=""; FFMPEG_EXTRA_ENABLE=""
-    local p264="${ROOT_DIR}/build/x264-${abi}/prefix"
-    local p265="${ROOT_DIR}/build/x265-${abi}/prefix"
+    # Android and HarmonyOS both use arm64-v8a, but their static codec archives
+    # are NOT interchangeable: an Android x264.a references bionic's
+    # __assert2, which musl on OHOS cannot resolve (configure then reports
+    # "x264 not found using pkg-config" with an undefined-symbol link log).
+    # Keep one prefix per platform. Migrate the old shared directory to the
+    # Android name once so its completed build is not thrown away.
+    local codec_tag="ohos"
+    case "$cc" in *android*) codec_tag="android" ;; esac
+    local legacy264="${ROOT_DIR}/build/x264-${abi}"
+    local legacy265="${ROOT_DIR}/build/x265-${abi}"
+    if [ "$codec_tag" = "android" ] && [ -d "$legacy264" ] &&
+       [ ! -d "${legacy264}-android" ]; then
+        mv "$legacy264" "${legacy264}-android"
+    fi
+    if [ "$codec_tag" = "android" ] && [ -d "$legacy265" ] &&
+       [ ! -d "${legacy265}-android" ]; then
+        mv "$legacy265" "${legacy265}-android"
+    fi
+    local p264="${ROOT_DIR}/build/x264-${codec_tag}-${abi}/prefix"
+    local p265="${ROOT_DIR}/build/x265-${codec_tag}-${abi}/prefix"
     build_x264 "$abi" "$cc" "$cxx" "$arch" "$sysroot" "$p264"
     if [ -f "$p264/lib/libx264.a" ] || [ -f "$p264/lib/libx264.so" ]; then
         X264_PREFIX="$p264"
@@ -368,17 +414,112 @@ resolve_external_codecs() {
     fi
 }
 
+# Escape hatch: restore the inline link rule in the shared FFmpeg source tree.
+# Both platforms now use @rsp (see patch_ffmpeg_link_rsp below); this only
+# matters when diagnosing link rules or deliberately testing an inline link.
+restore_ffmpeg_link_rule() {
+    local mak="${FFMPEG_SRC}/ffbuild/library.mak"
+    grep -Fq '$$(LD) @$$@.rsp' "$mak" 2>/dev/null || return 0
+    python - "$mak" <<'PYEOF'
+import sys
+p = sys.argv[1]
+data = open(p, 'rb').read()
+rsp_ok = (b'\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+          b'$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
+          b'\t$$(LD) @$$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
+inline = (b'\t$$(LD) $(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+          b'$$(filter %.o,$$^) $(FFEXTRALIBS)\n\t$(SLIB_EXTRA_CMD)\n')
+if rsp_ok in data:
+    open(p, 'wb').write(data.replace(rsp_ok, inline, 1))
+    print('[captrim] library.mak restored to inline link rule')
+PYEOF
+}
+
+# Both platforms now link shared libraries through a response file: the
+# inline libavcodec link line is ~8.2 KB, just over the Windows 8191 limit.
+# This rewrites FFmpeg's shared source tree, so call it before each configure.
+patch_ffmpeg_link_rsp() {
+    local mak="${FFMPEG_SRC}/ffbuild/library.mak"
+    if grep -Fq '$$(LD) @$$@.rsp' "$mak" 2>/dev/null; then
+        log "library.mak already patched for @rsp linking"
+        return 0
+    fi
+    python - "$mak" <<'PYEOF'
+import sys
+p = sys.argv[1]
+data = open(p, 'rb').read()
+inline = (b'\t$$(LD) $(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+          b'$$(filter %.o,$$^) $(FFEXTRALIBS)\n\t$(SLIB_EXTRA_CMD)\n')
+rsp_noflag = (b'\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+              b'$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
+              b'\t$$(LD) $$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
+rsp_ok = (b'\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+          b'$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
+          b'\t$$(LD) @$$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
+if rsp_ok in data:
+    print('[captrim] library.mak already patched for @rsp linking')
+elif inline in data:
+    open(p, 'wb').write(data.replace(inline, rsp_ok, 1))
+    print('[captrim] library.mak patched: shared-library links via @rsp file')
+elif rsp_noflag in data:
+    open(p, 'wb').write(data.replace(rsp_noflag, rsp_ok, 1))
+    print('[captrim] library.mak patched: added @ to rsp link')
+else:
+    raise SystemExit('library.mak shared-library link rule not recognized')
+PYEOF
+}
+
+# Print the build-environment pitfalls at the start of every FFmpeg build.
+# Full checklist lives in .workbuddy/memory/MEMORY.md (not README: no agent
+# can be assumed to read README before touching the build).
+build_env_preflight() {
+    local platform="${1:-unknown}"
+    log "build environment preflight (${platform}); details: .workbuddy/memory/MEMORY.md"
+    command -v make >/dev/null 2>&1 \
+        || log "WARNING: make not on PATH; OHOS NDK has no make, reuse Android NDK prebuilt/bin"
+    command -v cmake >/dev/null 2>&1 \
+        || log "WARNING: cmake not on PATH; x265 will be skipped unless CMAKE_BIN is set"
+    case "${JOBS:-}" in
+        ''|*[!0-9]*) ;;
+        *) [ "$JOBS" -gt 3 ] && log "WARNING: JOBS=$JOBS > 3; MSYS fork heap is small on this host" ;;
+    esac
+    if command -v cygpath >/dev/null 2>&1; then
+        [ -n "${ANDROID_NDK_HOME:-}" ] && \
+            log "ANDROID_NDK_HOME (native tools must be C:/...): $(cygpath -m -- "$ANDROID_NDK_HOME")"
+        [ -n "${OHOS_NDK_HOME:-}" ] && \
+            log "OHOS_NDK_HOME (native tools must be C:/...): $(cygpath -m -- "$OHOS_NDK_HOME")"
+    fi
+    if [ -n "${FFMPEG_SRC:-}" ] && [ -f "${FFMPEG_SRC}/ffbuild/library.mak" ]; then
+        if grep -Fq '$$(LD) @$$@.rsp' "${FFMPEG_SRC}/ffbuild/library.mak" 2>/dev/null; then
+            log "library.mak: @rsp link rule (required on both platforms; inline line is ~8.2 KB)"
+        else
+            log "library.mak: inline link rule (will be patched to @rsp before configure; inline line is ~8.2 KB)"
+        fi
+    fi
+}
+
 # Ensure make + cmake are reachable. NDK ships make; cmake is usually alongside
 # an Android SDK. Override CMAKE_BIN if your cmake lives elsewhere.
 ensure_build_tools() {
     local ndk_prebuilt="${1:-}"
     local extra_cmake="${CMAKE_BIN:-}"
     if ! command -v make >/dev/null 2>&1; then
-        if [ -n "$ndk_prebuilt" ] && { [ -x "$ndk_prebuilt/make.exe" ] || [ -x "$ndk_prebuilt/make" ]; }; then
-            export PATH="$ndk_prebuilt:$PATH"
-        else
+        # HarmonyOS NDK has no make, but its codec builds still need one. Look
+        # beyond the explicitly passed NDK dir: on this host the Android SDK is
+        # installed even when only OHOS_NDK_HOME is exported, and requiring a
+        # second env var just to find make broke an otherwise valid build.
+        local candidates=()
+        [ -n "$ndk_prebuilt" ] && candidates+=("$ndk_prebuilt")
+        candidates+=(/d/Android/Sdk/ndk/*/prebuilt/*/bin)
+        [ -n "${ANDROID_HOME:-}" ] && candidates+=("$ANDROID_HOME"/ndk/*/prebuilt/*/bin)
+        for dir in "${candidates[@]}"; do
+            if [ -x "$dir/make.exe" ] || [ -x "$dir/make" ]; then
+                export PATH="$dir:$PATH"
+                break
+            fi
+        done
+        command -v make >/dev/null 2>&1 || \
             log "WARNING: make not on PATH and no NDK prebuilt dir; build may fail"
-        fi
     fi
     if [ -n "$extra_cmake" ]; then
         export PATH="$(dirname "$extra_cmake"):$PATH"
@@ -552,8 +693,9 @@ build_c_shim() {
         -I"${PREFIX}/include" \
         "${ROOT_DIR}/native/captrim_ffmpeg.c" \
         "${ROOT_DIR}/native/captrim_pipeline.c" \
+        "${ROOT_DIR}/native/captrim_audio.c" \
         -o "${out_dir}/libcaptrim_ffmpeg.so" \
-        -L"${PREFIX}/lib" -lavformat -lavcodec -lavutil -lavfilter -lswscale \
+        -L"${PREFIX}/lib" -lavformat -lavcodec -lavutil -lavfilter -lswscale -lswresample \
         -Wl,-soname,libcaptrim_ffmpeg.so "$@" \
         || die "C shim compilation failed"
 

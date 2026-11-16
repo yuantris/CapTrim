@@ -98,6 +98,8 @@ struct Index {
   private pollId: number = -1;
   private filesDir: string = '';
   private mediaReady: boolean = false;
+  /** Sample the P2 audio clock every 2 s at the 4 Hz UI poll rate. */
+  private pollCounter: number = 0;
   /** Ids of the two main-track demo clips. The transform button only touches
    * these, so the picture-in-picture clip keeps its own placement and the two
    * layers stay visually distinguishable. */
@@ -396,7 +398,15 @@ struct Index {
       }
       this.frameInfo =
         `${report.kind} · 源 ${source} · 图层 ${report.layers} · ` +
-        `已上屏 ${report.frames} · 丢帧 ${report.dropped}`;
+        `已上屏 ${report.frames} · 丢帧 ${report.dropped} · ` +
+        `音频 ${(report.audio_position_us / 1000).toFixed(0)}ms · ` +
+        `音频帧 ${report.audio_frames} · hold ${report.held}`;
+      this.pollCounter++;
+      if (this.pollCounter % 8 === 0) {
+        hilog.info(DOMAIN, TAG, 'p2 clock pos=%{public}s audio=%{public}s frames=%{public}s held=%{public}s',
+          `${report.position_us}`, `${report.audio_position_us}`,
+          `${report.audio_frames}`, `${report.held}`);
+      }
       if (report.kind === 'end' && this.playing) {
         this.playing = false;
         this.frameInfo = '播放结束';

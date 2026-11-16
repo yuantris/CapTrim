@@ -188,6 +188,44 @@ fn clamp_source_us(clip: &Clip, source_us: i64) -> i64 {
     source_us.clamp(clip.in_us, last)
 }
 
+/// Audio contributors at an arbitrary instant, without frame quantisation.
+///
+/// The audio renderer pulls at its own callback rate (often 10 ms), which is
+/// unrelated to the video frame grid (33 ms at 30 fps). Feeding that instant
+/// through `plan_frame` would snap each audio block to a video frame and make
+/// source positions jump by a third of a frame. This function deliberately
+/// takes the raw `t_us`; frame plans reuse it with a snapped instant so both
+/// paths read the same clip boundaries and speed maps.
+pub fn plan_audio_at(timeline: &Timeline, t_us: i64) -> Vec<AudioMix> {
+    let mut audio = Vec::new();
+    for track in &timeline.tracks {
+        for clip in &track.clips {
+            if !clip.contains(t_us)
+                || clip.volume <= 0.0
+                || !source_may_have(timeline, clip.source, false)
+            {
+                continue;
+            }
+            let source_us = clamp_source_us(clip, clip.to_source_us(t_us));
+            let uri = timeline
+                .media
+                .iter()
+                .find(|m| m.id == clip.source)
+                .map(|m| m.uri.clone())
+                .unwrap_or_default();
+            audio.push(AudioMix {
+                clip_id: clip.id,
+                source_id: clip.source,
+                uri,
+                source_us,
+                volume: clip.volume,
+            });
+        }
+    }
+    audio.sort_by_key(|a| a.clip_id);
+    audio
+}
+
 /// Build the plan for one frame, addressed by index.
 ///
 /// This is the exact API the export path should use. `plan_frame` takes a
@@ -199,7 +237,6 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
     let snapped_us = frame_pts_us(&timeline.frame_rate, frame_index);
 
     let mut layers = Vec::new();
-    let mut audio = Vec::new();
 
     for (z, track) in timeline.tracks.iter().enumerate() {
         let z = z as i32;
@@ -229,23 +266,12 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
                     effects: clip.effects.clone(),
                 });
             }
-
-            if clip.volume > 0.0 && source_may_have(timeline, clip.source, false) {
-                audio.push(AudioMix {
-                    clip_id: clip.id,
-                    source_id: clip.source,
-                    uri,
-                    source_us,
-                    volume: clip.volume,
-                });
-            }
         }
     }
 
     // Track order already gives z, but clips inside one track are unordered in
     // the draft; sort so the compositor gets a stable draw list.
     layers.sort_by(|a, b| a.z.cmp(&b.z).then(a.clip_id.cmp(&b.clip_id)));
-    audio.sort_by_key(|a| a.clip_id);
 
     FramePlan {
         t_us: snapped_us,
@@ -253,7 +279,7 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
         width: timeline.width,
         height: timeline.height,
         layers,
-        audio,
+        audio: plan_audio_at(timeline, snapped_us),
     }
 }
 
@@ -294,6 +320,45 @@ mod tests {
             });
         }
         t
+    }
+
+    #[test]
+    fn audio_plan_uses_raw_time_not_the_frame_grid() {
+        let mut clip = Clip::new(2, 0, 1_000_000, 0);
+        clip.id = 7;
+        clip.volume = 0.5;
+        let t = timeline_with(vec![(TrackKind::Audio, clip)]);
+
+        // Both instants fall in video frame 1, but an audio renderer calling
+        // at 10 ms blocks needs source positions 10 ms and 50 ms apart.
+        let a = plan_audio_at(&t, 10_000);
+        let b = plan_audio_at(&t, 50_000);
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].source_us, 10_000);
+        assert_eq!(b[0].source_us, 50_000);
+        assert_eq!(a[0].volume, 0.5);
+        assert_eq!(a[0].uri, "file:///a.m4a");
+
+        // Frame plans reuse the same function at the snapped instant.
+        let frame = plan_frame(&t, 50_000);
+        assert_eq!(frame.audio.len(), 1);
+        assert_eq!(frame.audio[0].source_us, 33_333);
+    }
+
+    #[test]
+    fn audio_plan_applies_speed_and_clamps_to_clip_bounds() {
+        let mut clip = Clip::new(2, 0, 1_000_000, 0);
+        clip.id = 8;
+        clip.speed = Rational::new(2, 1).unwrap();
+        let t = timeline_with(vec![(TrackKind::Audio, clip)]);
+        assert_eq!(plan_audio_at(&t, 50_000)[0].source_us, 100_000);
+        // Half a second into a 2x clip is one full second into the source;
+        // the clip ends there, so the source is clamped to the last sample.
+        let at_end = plan_audio_at(&t, 499_999);
+        assert_eq!(at_end.len(), 1);
+        assert!(at_end[0].source_us <= 1_000_000);
+        assert!(plan_audio_at(&t, 1_000_000).is_empty());
     }
 
     #[test]

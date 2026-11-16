@@ -100,6 +100,13 @@ int32_t captrim_engine_plan_frame_at(captrim_engine_t *engine,
 int32_t captrim_engine_plan_frame(captrim_engine_t *engine, int64_t t_us,
                                   char **out_json);
 
+/* Audio contributors at an arbitrary instant, returned as a JSON array of
+ * AudioMix objects. Unlike plan_frame this does NOT snap to the video frame
+ * grid: the audio renderer pulls at its own callback rate (typically 10 ms),
+ * which is unrelated to the frame rate. Release with captrim_string_free(). */
+int32_t captrim_engine_plan_audio(captrim_engine_t *engine, int64_t t_us,
+                                  char **out_json);
+
 /* Timeline length. Either out pointer may be NULL. */
 int32_t captrim_engine_duration(captrim_engine_t *engine,
                                 int64_t *out_duration_us,

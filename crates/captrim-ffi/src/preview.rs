@@ -6,7 +6,9 @@
 //! the preview reads the same plan the exporter will.
 
 use crate::{captrim_engine_t, engine_from, ffi_guard, lock, owned_cstring, Engine};
-use captrim_core::{plan_frame, plan_frame_at_index, Error, PreviewSession, Result as CoreResult};
+use captrim_core::{
+    plan_audio_at, plan_frame, plan_frame_at_index, Error, PreviewSession, Result as CoreResult,
+};
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -114,6 +116,32 @@ pub extern "C" fn captrim_engine_plan_frame(
         let json = {
             let editor = lock(&e.editor)?;
             plan_frame(editor.timeline(), t_us).to_json()?
+        };
+        unsafe { *out_json = owned_cstring(json)? };
+        Ok(0)
+    })
+}
+
+/// Plan the audio contributors at an arbitrary instant, without frame
+/// quantisation. The audio renderer calls this at its callback rate, not at
+/// the video frame rate, so feeding `t_us` through `plan_frame` would slide
+/// every audio block onto the nearest frame boundary.
+#[no_mangle]
+pub extern "C" fn captrim_engine_plan_audio(
+    engine: *mut captrim_engine_t,
+    t_us: i64,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    ffi_guard(|| {
+        if out_json.is_null() {
+            return Err(Error::invalid("out_json is null"));
+        }
+        unsafe { *out_json = ptr::null_mut() };
+        let e = engine_from(engine)?;
+        let json = {
+            let editor = lock(&e.editor)?;
+            serde_json::to_string(&plan_audio_at(editor.timeline(), t_us))
+                .map_err(|e| Error::Internal(e.to_string()))?
         };
         unsafe { *out_json = owned_cstring(json)? };
         Ok(0)

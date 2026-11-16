@@ -12,6 +12,7 @@ for target in "$INCLUDE_ANDROID" "$INCLUDE_OHOS"; do
     mkdir -p "$target"
     cp "${ROOT_DIR}/crates/captrim-ffi/captrim.h" "$target/captrim.h"
     cp "${ROOT_DIR}/native/captrim_ffmpeg.h" "$target/captrim_ffmpeg.h"
+    cp "${ROOT_DIR}/native/captrim_audio.h" "$target/captrim_audio.h"
 done
 
 printf '[captrim] headers synced to Android and HarmonyOS Native projects\n'

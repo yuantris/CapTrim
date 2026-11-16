@@ -12,8 +12,14 @@ set_target_properties(captrim PROPERTIES
 add_library(captrim_napi SHARED
     napi_bridge.cpp
     presenter.cpp
+    audio_output.cpp
     gl_compositor.cpp)
 target_include_directories(captrim_napi PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+# System libraries resolve from the OHOS NDK sysroot, but libcaptrim_ffmpeg.so
+# is a project prebuilt. Without an explicit -L the final link emits only
+# `-lcaptrim_ffmpeg` and ld.lld cannot find it (observed on Windows/DevEco).
+target_link_directories(captrim_napi PRIVATE "${CAPTRIM_PREBUILT}")
 target_compile_features(captrim_napi PRIVATE cxx_std_17)
 
 # No C++ runtime on purpose. Both sources avoid std::string, new/delete and use
@@ -44,4 +50,8 @@ target_link_libraries(captrim_napi
     libnative_window.so
     libnative_image.so
     libEGL.so
-    libGLESv3.so)
+    libGLESv3.so
+    # Audio preview: the renderer callback calls into the CapTrim PCM mixer,
+    # which lives in the GPL FFmpeg shim rather than in Rust.
+    libcaptrim_ffmpeg.so
+    libohaudio.so)

@@ -113,47 +113,6 @@ export CAPTRIM_MAKE_SHELL="$(cygpath -m -- "$MSYS_SH")"
 export CAPTRIM_LD_CMD="$(cygpath -m -- "$LD_RSP")"
 ld_invoke() { printf '%s %s' "$CAPTRIM_MAKE_SHELL" "$CAPTRIM_LD_CMD"; }
 
-# Windows: recipe lines are truncated at ~8 KB regardless of which shell
-# make spawns (the native NDK make.exe funnels every recipe through
-# cmd.exe), and libavcodec's shared-library link line is ~8.3 KB once
-# libx265.o joins the object list — the tail of the argument list (the
-# -L/-l flags!) silently disappeared, leaving x264/x265 symbols unresolved.
-# FFmpeg's shared-library link rule is the only place with such a huge
-# line: rewrite it to emit an @rsp file via make's $(file ) function
-# (expanded inside make, immune to OS limits) and link through "@rsp".
-# Idempotent: a second run detects the patch and skips it.
-patch_ffmpeg_link_rsp() {
-    local mak="${FFMPEG_SRC}/ffbuild/library.mak"
-    if grep -q '\$LD) @\$\$@\.rsp' "$mak" 2>/dev/null; then
-        log "library.mak already patched for @rsp linking"
-        return 0
-    fi
-    python - "$mak" <<'PYEOF'
-import sys
-p = sys.argv[1]
-s = open(p, encoding='utf-8', newline='').read()
-inline = ('\t$$(LD) $(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
-          '$$(filter %.o,$$^) $(FFEXTRALIBS)\n\t$(SLIB_EXTRA_CMD)\n')
-rsp_noflag = ('\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
-              '$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
-              '\t$$(LD) $$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
-rsp_ok = ('\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
-          '$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
-          '\t$$(LD) @$$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
-if rsp_ok in s:
-    print('[captrim] library.mak already patched for @rsp linking')
-    sys.exit(0)
-if inline in s:
-    s = s.replace(inline, rsp_ok, 1)
-elif rsp_noflag in s:
-    s = s.replace(rsp_noflag, rsp_ok, 1)
-else:
-    raise SystemExit('library.mak shared-library link rule not recognized')
-open(p, 'w', encoding='utf-8', newline='').write(s)
-print('[captrim] library.mak patched: shared-library links via @rsp file')
-PYEOF
-}
-
 need_env ANDROID_NDK_HOME
 
 ANDROID_API="${ANDROID_API:-26}"
@@ -192,6 +151,7 @@ esac
 TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}"
 [ -d "$TOOLCHAIN" ] || die "NDK toolchain not found at $TOOLCHAIN"
 ensure_build_tools "${ANDROID_NDK_HOME}/prebuilt/${HOST_TAG}/bin"
+build_env_preflight android
 
 if [ ! -d "$FFMPEG_SRC" ]; then
     git_clone_robust https://git.ffmpeg.org/ffmpeg.git "$FFMPEG_SRC" "$FFMPEG_REF" \

@@ -8,10 +8,12 @@
  *
  * Usage: captrim_selftest <source.mp4> <writable-dir>
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "captrim_audio.h"
 #include "captrim_ffmpeg.h"
 #include "captrim_pipeline.h"
 
@@ -58,6 +60,133 @@ static char *probe_info(const char *uri, char *buf, size_t cap, int *ok) {
 
 static int has(const char *json, const char *needle) {
     return json && strstr(json, needle) != NULL;
+}
+
+static void put_le16(unsigned char *p, unsigned v) {
+    p[0] = (unsigned char)(v & 0xff);
+    p[1] = (unsigned char)((v >> 8) & 0xff);
+}
+
+static void put_le32(unsigned char *p, unsigned v) {
+    for (int i = 0; i < 4; ++i) p[i] = (unsigned char)((v >> (8 * i)) & 0xff);
+}
+
+/* A 1-second 440 Hz sine as a 48 kHz stereo s16le WAV. Written by hand so the
+ * self-check needs no ffmpeg CLI on the host: FFmpeg in the shim already has
+ * the wav demuxer and pcm_s16le decoder. */
+static int write_test_wav(const char *path) {
+    const int frames = 48000;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    unsigned char header[44];
+    memset(header, 0, sizeof(header));
+    memcpy(header, "RIFF", 4);
+    put_le32(header + 4, 36 + frames * 4);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    put_le32(header + 16, 16);
+    put_le16(header + 20, 1);             /* PCM */
+    put_le16(header + 22, 2);             /* stereo */
+    put_le32(header + 24, 48000);
+    put_le32(header + 28, 48000 * 4);
+    put_le16(header + 32, 4);
+    put_le16(header + 34, 16);
+    memcpy(header + 36, "data", 4);
+    put_le32(header + 40, frames * 4);
+    if (fwrite(header, 1, sizeof(header), f) != sizeof(header)) {
+        fclose(f);
+        return -1;
+    }
+    for (int i = 0; i < frames; ++i) {
+        float v = 0.5f * sinf(2.0f * (float)M_PI * 440.0f * i / 48000.0f);
+        short l = (short)(v * 32767.0f);
+        short r = (short)(v * 0.8f * 32767.0f);
+        unsigned char s[4];
+        put_le16(s, (unsigned short)l);
+        put_le16(s + 2, (unsigned short)r);
+        if (fwrite(s, 1, 4, f) != 4) {
+            fclose(f);
+            return -1;
+        }
+    }
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+static void audio_peak_rms(const float *pcm, int frames, float *peak, float *rms) {
+    *peak = 0.0f;
+    *rms = 0.0f;
+    for (int i = 0; i < frames * CT_AUDIO_CHANNELS; ++i) {
+        float a = fabsf(pcm[i]);
+        if (a > *peak) *peak = a;
+        *rms += pcm[i] * pcm[i];
+    }
+    *rms = sqrtf(*rms / (float)(frames * CT_AUDIO_CHANNELS));
+}
+
+static void check_audio(const char *dir) {
+    char wav[512];
+    char detail[512];
+    snprintf(wav, sizeof(wav), "%s/selftest_tone.wav", dir);
+    if (write_test_wav(wav) != 0) {
+        check(0, "Audio test tone", "cannot write WAV");
+        return;
+    }
+
+    ct_audio_t *mixer = NULL;
+    char *err = NULL;
+    int32_t rc = ct_audio_create(&mixer, &err);
+    check(rc == CT_OK && mixer != NULL, "Audio mixer create",
+          rc == CT_OK ? "48000/2/f32" : (err ? err : "unknown error"));
+    ct_ff_string_free(err);
+    if (!mixer) return;
+
+    float *pcm = (float *)malloc((size_t)2048 * CT_AUDIO_CHANNELS * sizeof(float));
+    if (!pcm) {
+        ct_audio_destroy(mixer);
+        check(0, "Audio decode to PCM", "out of memory");
+        return;
+    }
+
+    ct_audio_item_t item = { wav, 0, 1.0f };
+    err = NULL;
+    rc = ct_audio_render(mixer, pcm, 1024, &item, 1, &err);
+    float peak = 0.0f, rms = 0.0f;
+    if (rc == CT_OK) audio_peak_rms(pcm, 1024, &peak, &rms);
+    snprintf(detail, sizeof(detail), "rc=%d peak=%.4f rms=%.4f %s",
+             (int)rc, peak, rms, err ? err : "");
+    check(rc == CT_OK && peak > 0.1f && rms > 0.01f,
+          "Audio decode/resample to f32 PCM", detail);
+    ct_ff_string_free(err);
+
+    /* Seeking into the middle must still produce audible samples: this is the
+     * path a scrub or a mid-clip preview takes. */
+    item.source_us = 500000;
+    err = NULL;
+    rc = ct_audio_render(mixer, pcm, 512, &item, 1, &err);
+    audio_peak_rms(pcm, 512, &peak, &rms);
+    snprintf(detail, sizeof(detail), "source_us=500000 peak=%.4f", peak);
+    check(rc == CT_OK && peak > 0.1f, "Audio seek to source instant", detail);
+    ct_ff_string_free(err);
+
+    /* Volume must actually scale the samples, not just sit in the plan. */
+    item.source_us = 0;
+    item.volume = 0.25f;
+    err = NULL;
+    rc = ct_audio_render(mixer, pcm, 512, &item, 1, &err);
+    audio_peak_rms(pcm, 512, &peak, &rms);
+    snprintf(detail, sizeof(detail), "volume=0.25 peak=%.4f (expected ~0.125)", peak);
+    check(rc == CT_OK && peak > 0.05f && peak < 0.20f, "Audio volume scaling", detail);
+    ct_ff_string_free(err);
+
+    err = NULL;
+    rc = ct_audio_render(mixer, pcm, 256, NULL, 0, &err);
+    audio_peak_rms(pcm, 256, &peak, &rms);
+    snprintf(detail, sizeof(detail), "rc=%d peak=%.4f", (int)rc, peak);
+    check(rc == CT_OK && peak == 0.0f, "Audio silence with no items", detail);
+    ct_ff_string_free(err);
+
+    free(pcm);
+    ct_audio_destroy(mixer);
 }
 
 int main(int argc, char **argv) {
@@ -208,6 +337,9 @@ int main(int argc, char **argv) {
               crc == 0 && caps ? caps : "unavailable");
         ct_pipeline_string_free(caps);
     }
+
+    /* 8. Audio preview: real PCM out of a WAV, with seek/volume/silence. */
+    check_audio(dir);
 
     printf("== selftest %d/%d passed ==\n", g_pass, g_pass + g_fail);
     return g_fail == 0 ? 0 : 1;

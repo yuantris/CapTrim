@@ -412,6 +412,11 @@ export interface PresentReport {
   dropped: number;
   /** Playhead in timeline time. */
   position_us: number;
+  /** Position the audio device actually rendered, and total samples written. */
+  audio_position_us: number;
+  audio_frames: number;
+  /** Decoded frames withheld because their PTS was ahead of the playhead. */
+  held: number;
 }
 
 function toPresentReport(result: PresentResult): PresentReport {
@@ -426,7 +431,10 @@ function toPresentReport(result: PresentResult): PresentReport {
     error: result.error,
     frames: result.frames,
     dropped: result.dropped,
-    position_us: result.position_us
+    position_us: result.position_us,
+    audio_position_us: result.audio_position_us,
+    audio_frames: result.audio_frames,
+    held: result.held
   };
   return report;
 }

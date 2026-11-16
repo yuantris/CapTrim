@@ -49,6 +49,13 @@ struct PresentReport {
     uint64_t dropped;
     /// Playhead in timeline time.
     int64_t position_us;
+    /// Timeline position the audio device actually rendered, and the number of
+    /// sample frames it wrote. Both stay 0 until audio output is started.
+    int64_t audio_position_us;
+    uint64_t audio_frames_written;
+    /// Frames withheld from the surface because their PTS was ahead of the
+    /// playhead. Proof that hold-and-present is active, not just the clock.
+    uint64_t frames_held;
 };
 
 struct Presenter;

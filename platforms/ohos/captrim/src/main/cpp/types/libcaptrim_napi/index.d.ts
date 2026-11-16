@@ -102,6 +102,11 @@ export interface PresentResult extends CodeResult {
   dropped: number;
   /** Playhead in timeline time. */
   position_us: number;
+  /** Position the audio device actually rendered, and total samples written. */
+  audio_position_us: number;
+  audio_frames: number;
+  /** Decoded frames withheld because their PTS was ahead of the playhead. */
+  held: number;
 }
 
 /**

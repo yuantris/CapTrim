@@ -17,6 +17,8 @@ pub use error::{code_message, Error, Result};
 pub use media::{MediaInfo, StreamInfo, StreamKind};
 pub use model::{Clip, Id, MediaSource, Timeline, Track, TrackKind, Transform, DRAFT_VERSION};
 pub use preview::{PreviewSession, Step};
-pub use render::{plan_frame, plan_frame_at_index, AudioMix, FramePlan, Layer, LayerKind};
+pub use render::{
+    plan_audio_at, plan_frame, plan_frame_at_index, AudioMix, FramePlan, Layer, LayerKind,
+};
 pub use time::Rational;
 pub use timeline::{Command, Editor};

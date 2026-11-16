@@ -18,6 +18,7 @@
 #include <native_image/native_image.h>
 #include <native_window/external_window.h>
 
+#include "audio_output.h"
 #include "gl_compositor.h"
 
 namespace captrim {
@@ -56,6 +57,11 @@ constexpr int64_t kSeekAheadUs = 1000000;
 
 /// Give up waiting for a frame after this long instead of stalling the loop.
 constexpr int64_t kWaitBudgetUs = 120000;
+
+/// Decoder output buffers held back for hold-and-present. Four covers more
+/// than one 30 fps frame at the measured 300 ms feed lead without exhausting
+/// the decoder's output buffer pool.
+constexpr int32_t kMaxHeldFrames = 4;
 
 constexpr int32_t kUriMax = 512;
 constexpr int32_t kMimeMax = 32;
@@ -144,10 +150,25 @@ struct SourceSlot {
     /// the one case that earns a seek during playback.
     int32_t in_plan;
 
+    /// Hold-and-present: during playback the decoder runs ~300 ms ahead, but
+    /// only frames whose PTS has been reached by the audio-driven playhead may
+    /// be handed to the surface. The rest stay in these codec buffers. A full
+    /// queue falls back to showing the earliest held frame instead of stalling
+    /// the decoder forever. Owned by the callback thread for writes and the
+    /// render thread for drains, hence the lock.
+    struct {
+        uint32_t index;
+        int64_t pts_us;
+    } held[kMaxHeldFrames];
+    int32_t held_count;
+    pthread_mutex_t held_lock;
+
     uint64_t frames_decoded;
     /// Frames decoded and deliberately not shown, to land on the playhead while
     /// paused. Not a performance figure.
     uint64_t frames_skipped;
+    /// Frames withheld from the surface because their PTS was in the future.
+    uint64_t frames_held;
     uint32_t input_calls;
     uint32_t output_calls;
     uint32_t acquire_ok;
@@ -161,6 +182,10 @@ struct SourceSlot {
 struct PresenterState {
     OHNativeWindow *window;
     captrim_engine_t *engine;
+    /// Audio renderer, created with the presenter and started/stopped with the
+    /// loop. The callback thread publishes its position here for the render
+    /// loop to consume; it never touches the preview session.
+    AudioOutput *audio;
 
     /// EGL context bound to `window`, owned by the render thread. Null until the
     /// loop starts: EGL contexts are per-thread, so it cannot be created here on
@@ -334,6 +359,37 @@ void OnNeedInputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
     }
 }
 
+/// Hand held frames whose PTS has been reached by the playhead to the surface.
+/// Frames still in the future stay in the codec, which is the "hold" half of
+/// hold-and-present. `target_us <= 0` means discard them all (seek/teardown).
+/// The signal is deliberately sent after releasing held_lock: the render loop
+/// takes `lock` first and then held_lock, so signalling under held_lock would
+/// invert that order and deadlock on the first seek.
+static void ResolveHeldFrames(SourceSlot *slot, int64_t target_us) {
+    if (slot->codec == nullptr) return;
+    pthread_mutex_lock(&slot->held_lock);
+    int keep = 0;
+    for (int i = 0; i < slot->held_count; ++i) {
+        if (target_us > 0 && slot->held[i].pts_us <= target_us + kFrameToleranceUs) {
+            OH_AVErrCode rc = OH_VideoDecoder_RenderOutputBuffer(slot->codec, slot->held[i].index);
+            if (rc == AV_ERR_OK) {
+                slot->last_rendered_us = slot->held[i].pts_us;
+                slot->frames_decoded++;
+                slot->reached = 1;
+                continue;
+            }
+        }
+        if (target_us <= 0) {
+            OH_VideoDecoder_FreeOutputBuffer(slot->codec, slot->held[i].index);
+        } else {
+            slot->held[keep++] = slot->held[i];
+        }
+    }
+    slot->held_count = keep;
+    pthread_mutex_unlock(&slot->held_lock);
+    if (target_us > 0) Signal(slot->owner);
+}
+
 void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
                        void *user_data) {
     SourceSlot *slot = static_cast<SourceSlot *>(user_data);
@@ -391,6 +447,26 @@ void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
         return;
     }
 
+    // Playing: hold frames that are still in the future. The decoder's 300 ms
+    // feed lead otherwise paints a picture ahead of the audio-driven playhead;
+    // holding the codec buffer (instead of rendering it early) keeps the newest
+    // texture at or before the playhead. The render loop drains these once the
+    // playhead catches up. When the queue is full, release the older frames
+    // first so the decoder never runs out of output buffers.
+    if (p->playing != 0 && attr.pts > slot->target_us + kFrameToleranceUs) {
+        pthread_mutex_lock(&slot->held_lock);
+        if (slot->held_count < kMaxHeldFrames) {
+            slot->held[slot->held_count].index = index;
+            slot->held[slot->held_count].pts_us = attr.pts;
+            slot->held_count++;
+            slot->frames_held++;
+            pthread_mutex_unlock(&slot->held_lock);
+            return;
+        }
+        pthread_mutex_unlock(&slot->held_lock);
+        ResolveHeldFrames(slot, attr.pts);
+    }
+
     // RenderOutputBuffer, not FreeOutputBuffer: the latter only returns the
     // buffer to the codec, while the former also hands it to the surface the
     // decoder was configured with. That surface is this slot's NativeImage, so
@@ -424,6 +500,7 @@ void OnNewOutputBuffer(OH_AVCodec *codec, uint32_t index, OH_AVBuffer *buffer,
 /// the queue first is a use-after-free inside the decoder.
 void TeardownSlot(SourceSlot *slot) {
     slot->abort = 1;
+    ResolveHeldFrames(slot, 0); // return held buffers before Stop reclaims them
     if (slot->codec != nullptr) {
         OH_VideoDecoder_Stop(slot->codec);
         OH_VideoDecoder_Destroy(slot->codec);
@@ -760,6 +837,8 @@ void SeekSlot(SourceSlot *slot, int64_t target_us) {
     slot->seeking = 1;
     pthread_mutex_unlock(&p->lock);
 
+    ResolveHeldFrames(slot, 0); // Stop/Start below reclaims every codec buffer
+
     pthread_mutex_lock(&slot->demux_lock);
     if (slot->demuxer != nullptr) {
         // The demuxer seeks in milliseconds and lands on the previous sync
@@ -792,6 +871,11 @@ int32_t RenderSlotAt(SourceSlot *slot, int64_t target_us) {
     slot->failed = 0;
     slot->target_us = target_us;
     pthread_mutex_unlock(&p->lock);
+
+    // The audio clock may have advanced past frames the callback withheld.
+    // Release those now, before waiting: reached=1 lets the loop skip the wait
+    // and go straight to the compositor.
+    ResolveHeldFrames(slot, target_us);
 
     if (need_seek) {
         SeekSlot(slot, target_us);
@@ -1168,6 +1252,10 @@ int32_t ApplyCommands(PresenterState *p, int64_t now) {
         if (rc != 0) {
             CAPTRIM_LOGE("seek to %{public}lld failed (rc=%{public}d)", (long long)seek_us, rc);
         }
+        int64_t landed = 0;
+        if (captrim_preview_position(p->loop_preview, now, &landed) == 0) {
+            AudioOutputSeek(p->audio, landed);
+        }
     }
     if (playing >= 0) {
         int32_t was_playing = p->playing;
@@ -1175,6 +1263,15 @@ int32_t ApplyCommands(PresenterState *p, int64_t now) {
         int32_t rc = captrim_preview_set_playing(p->loop_preview, playing, now);
         if (rc != 0) {
             CAPTRIM_LOGE("set_playing(%{public}d) failed (rc=%{public}d)", playing, rc);
+        }
+        AudioOutputSetPlaying(p->audio, playing);
+        if (playing != 0) {
+            // The renderer kept running while paused, so its position has run
+            // ahead of the timeline. Re-anchor to where the playhead resumes.
+            int64_t resumed = 0;
+            if (captrim_preview_position(p->loop_preview, now, &resumed) == 0) {
+                AudioOutputSeek(p->audio, resumed);
+            }
         }
         if (playing == 0 && was_playing != 0) {
             // Pausing has to land on the playhead. The surface currently holds a
@@ -1333,6 +1430,7 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_
         return nullptr;
     }
     p->engine = engine;
+    p->audio = AudioOutputCreate(engine);
     p->cmd_playing = -1;
     // calloc leaves the slots zeroed, but "free" and "at the beginning of the
     // file" must not be the same value, so every default that differs is set.
@@ -1342,6 +1440,7 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_
         p->slots[i].last_rendered_us = -1;
         p->slots[i].last_plan_us = -1;
         pthread_mutex_init(&p->slots[i].demux_lock, nullptr);
+        pthread_mutex_init(&p->slots[i].held_lock, nullptr);
     }
     // Layer geometry is relative to the canvas, so a zero size here would make
     // every layer degenerate. The page knows the XComponent's size; ask for it
@@ -1359,6 +1458,7 @@ Presenter *PresenterCreate(captrim_engine_t *engine, uint64_t surface_id, int32_
         pthread_mutex_destroy(&p->lock);
         for (int32_t i = 0; i < kMaxSources; i++) {
             pthread_mutex_destroy(&p->slots[i].demux_lock);
+        pthread_mutex_destroy(&p->slots[i].held_lock);
         }
         free(p);
         return nullptr;
@@ -1378,6 +1478,8 @@ void PresenterDestroy(Presenter *opaque) {
     // on the way out, on the thread whose EGL context made their textures --
     // which is why what is left here is normally nothing but the window.
     PresenterLoopStop(opaque);
+    AudioOutputDestroy(presenter->audio);
+    presenter->audio = nullptr;
     for (int32_t i = 0; i < kMaxSources; i++) {
         if (presenter->slots[i].codec != nullptr || presenter->slots[i].source != nullptr ||
             presenter->slots[i].fd >= 0) {
@@ -1412,12 +1514,19 @@ uint64_t FramesNotShown(const PresenterState *p) {
     return decoded > latched ? decoded - latched : 0;
 }
 
+uint64_t FramesHeld(const PresenterState *p) {
+    uint64_t held = 0;
+    for (int32_t i = 0; i < kMaxSources; i++) held += p->slots[i].frames_held;
+    return held;
+}
+
 /// Publish a snapshot and attach the counters the loop owns.
 void Publish(PresenterState *p, PresentReport *report) {
     report->running = p->loop_running;
     report->error = p->loop_error;
     report->frames = p->frames_composited;
     report->dropped = FramesNotShown(p);
+    report->frames_held = FramesHeld(p);
     pthread_mutex_lock(&p->lock);
     p->last = *report;
     pthread_mutex_unlock(&p->lock);
@@ -1446,6 +1555,15 @@ int32_t PresenterLoopStart(Presenter *opaque, captrim_preview_t *preview,
     p->cmd_seek = 0;
     p->loop_running = 1;
 
+    int64_t audio_start = 0;
+    if (captrim_preview_position(preview, now_wall_us, &audio_start) != 0) audio_start = 0;
+    AudioOutputSetPlaying(p->audio, 0); /* the page starts paused */
+    if (AudioOutputStart(p->audio, audio_start) != 0) {
+        // Audio is an enhancement: a device without an available renderer must
+        // still show video. The status report keeps audio_position_us at 0.
+        CAPTRIM_LOGE("audio preview unavailable; continuing with video only");
+    }
+
     if (pthread_create(&p->loop_thread, nullptr, LoopMain, p) != 0) {
         CAPTRIM_LOGE("cannot create render thread");
         p->loop_running = 0;
@@ -1468,6 +1586,7 @@ int32_t PresenterLoopStop(Presenter *opaque) {
     p->stop_requested = 1;
     Signal(p); // wake an idle wait, or a RenderAt() blocked on the codec
     pthread_join(p->loop_thread, nullptr);
+    AudioOutputStop(p->audio);
     p->loop_joinable = 0;
     p->loop_preview = nullptr;
     p->stop_requested = 0;
@@ -1522,6 +1641,7 @@ int32_t PresenterStatus(Presenter *opaque, PresentReport *out_report) {
     out_report->error = p->loop_error;
     out_report->frames = p->frames_composited;
     out_report->dropped = FramesNotShown(p);
+    out_report->frames_held = FramesHeld(p);
     return 0;
 }
 
@@ -1533,6 +1653,8 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
     PresenterState *p = reinterpret_cast<PresenterState *>(opaque);
     memset(out_report, 0, sizeof(*out_report));
     out_report->source_us = -1;
+    out_report->audio_position_us = AudioOutputPositionUs(p->audio);
+    out_report->audio_frames_written = AudioOutputFramesWritten(p->audio);
 
     // What is on screen, as opposed to what the latest step planned: an idle or
     // waiting step plans nothing, but the surface still shows the last frame, and
@@ -1541,6 +1663,21 @@ int32_t PresenterPresent(Presenter *opaque, captrim_preview_t *preview, int64_t 
     pthread_mutex_lock(&p->lock);
     on_screen = p->last;
     pthread_mutex_unlock(&p->lock);
+
+    // Audio is the master clock. Read the position the speaker actually
+    // reached before planning this frame; the Rust clock turns the drift into
+    // a small rate adjustment or a hard snap. Never do this while paused: the
+    // renderer keeps draining its buffer and would drag a frozen playhead on.
+    if (p->playing != 0) {
+        int64_t audio_pos = AudioOutputPositionUs(p->audio);
+        if (audio_pos > 0) {
+            int64_t drift = 0;
+            captrim_preview_sync_audio(preview, audio_pos, now_wall_us, &drift);
+            if (drift < -20000 || drift > 20000) {
+                CAPTRIM_LOGI("audio clock snap %{public}lld us", (long long)drift);
+            }
+        }
+    }
 
     int64_t position = 0;
     if (captrim_preview_position(preview, now_wall_us, &position) == 0) {

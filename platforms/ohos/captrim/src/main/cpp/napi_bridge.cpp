@@ -491,6 +491,12 @@ napi_value PresentReportResult(napi_env env, int32_t code, const captrim::Presen
     napi_set_named_property(env, object, "dropped", value);
     napi_create_int64(env, report.position_us, &value);
     napi_set_named_property(env, object, "position_us", value);
+    napi_create_int64(env, report.audio_position_us, &value);
+    napi_set_named_property(env, object, "audio_position_us", value);
+    napi_create_int64(env, static_cast<int64_t>(report.audio_frames_written), &value);
+    napi_set_named_property(env, object, "audio_frames", value);
+    napi_create_int64(env, static_cast<int64_t>(report.frames_held), &value);
+    napi_set_named_property(env, object, "held", value);
     return object;
 }
 

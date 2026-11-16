@@ -4,8 +4,12 @@
  * tiny C ABI means the Rust side never needs bindgen, generated bindings or
  * knowledge of FFmpeg struct layouts.
  *
- * Build as: libcaptrim_ffmpeg.so, linked dynamically against LGPL FFmpeg
- * shared libraries. Never enable --enable-gpl / --enable-nonfree / libx264.
+ * Build as: libcaptrim_ffmpeg.so, linked dynamically against FULL GPL FFmpeg
+ * shared libraries (--enable-gpl --enable-libx264 --enable-libx265). The whole
+ * CapTrim distribution is therefore GPL v2+; shipping the binaries requires
+ * publishing the FFmpeg + x264 + x265 source. The OHOS build additionally needs
+ * the NDK C++ runtime libc++_shared.so bundled in the HAP (see
+ * build-ffmpeg-ohos.sh).
  */
 #ifndef CAPTRIM_FFMPEG_H
 #define CAPTRIM_FFMPEG_H
@@ -35,6 +39,18 @@ int32_t ct_ff_probe(const char *uri, char **out_json, char **out_error);
 int32_t ct_ff_remux(const char *src_uri, const char *dst_uri,
                     ct_progress_cb progress, void *user_data,
                     char **out_error);
+
+/* Transcode: decode -> libavfilter graph -> re-encode -> mp4 mux. This is the
+ * software backbone and the fallback when a hardware codec is unavailable.
+ *   filter_desc : libavfilter graph applied to video (e.g. "scale=640:-2,fps=24,hflip").
+ *                 NULL or "" passes frames through (still re-encoded).
+ *   video_codec : encoder name, e.g. "libx264" / "libx265" / "mpeg4".
+ *                 NULL or "" defaults to "libx264".
+ * Non-video streams are stream-copied. Video is forced to yuv420p. */
+int32_t ct_ff_transcode(const char *src_uri, const char *dst_uri,
+                        const char *filter_desc, const char *video_codec,
+                        ct_progress_cb progress, void *user_data,
+                        char **out_error);
 
 void ct_ff_string_free(char *s);
 

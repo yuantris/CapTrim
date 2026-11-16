@@ -36,7 +36,7 @@ echo "== building native selftest =="
 "$CC" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
     -I"$ROOT/native" \
     "$ROOT/native/captrim_selftest.c" \
-    -L"$DIST" -Wl,-rpath,'$ORIGIN' -lcaptrim_ffmpeg \
+    -L"$DIST" -Wl,-rpath,'$ORIGIN' -lcaptrim_ffmpeg -lm \
     -o "$DIST/captrim_selftest"
 
 echo "== pushing libraries + sample to $DEVICE_DIR =="
