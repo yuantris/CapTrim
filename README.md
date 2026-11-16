@@ -121,7 +121,7 @@ bash scripts/check.sh           # 本地把 CI 的每一关（除需要 NDK/Grad
 
 ```bash
 cargo fmt --all --check            # CI 的第一关；漏跑它会让后面四关在 CI 上被跳过
-cargo test --workspace             # 94 个测试
+cargo test --workspace             # 102 个测试
 cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warnings
 bash scripts/check-native-abi.sh   # 头文件 == Rust 导出 == NAPI == d.ts
 ```
@@ -326,6 +326,12 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 官方依据（均从 `https://developer.huawei.com/config/llms.txt` 的 API Reference 索引进入）：《native_audiorenderer.h》 https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-native-audiorenderer-h.md ；《native_audiostreambuilder.h》 https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-native-audiostreambuilder-h.md 。索引页 https://developer.huawei.com/consumer/cn/llms/docs-references.txt 的同步时间为 2026-09-17。
 
+### ExportPlan / Segment
+
+导出不再逐帧向平台扔 JSON。`plan_export()` 从同一份时间线找出活跃片段发生变化的帧边界，切成连续的 `ExportSegment`：每段给出 `[start_frame, end_frame)`、活跃的视频/音频源、段首源时间和保留为 `Rational` 的速度。段内源时间是输出帧的线性函数，`ExportSegment::video_source_us_at()` / `audio_source_us_at()` 负责精确换算，避免平台把速度先转成 float 后慢慢漂移。段边界用帧索引而非裸微秒：片段起点落在两帧之间时，取**第一个 PTS 不小于起点**的帧；用 floor 会把片段提前一帧画出来。空洞也是合法段，只是源数组为空，渲染成黑场/静音。
+
+`captrim_engine_export_plan()` 把整份计划作为 `ExportPlan` JSON 返回，Android Kotlin/JNI 和鸿蒙 Node-API/ArkTS 都暴露了同名入口。导出器可以先拉一次计划、缓存解码器，再按段推进；`plan_frame_at_index()` 仍是逐帧复核的唯一真相，两者的活跃源集合由同一组测试约束。
+
 ## 七、已完成 / 未完成
 
 **已完成**
@@ -333,8 +339,9 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 - `Rational` 精确时间运算（含 NTSC 30000/1001 帧边界、无浮点比较）
 - Timeline / Track / Clip 模型、重叠校验、分割（含变速片段的源时间映射）
 - Command 栈 + 撤销重做 + 草稿 JSON 往返
-- 稳定 C ABI（29 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
+- 稳定 C ABI（30 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
 - FFmpeg 后端（`libavformat` 探测/remux、`libavfilter`+`libswscale` 复杂剪辑、`libavcodec`/`libx264`/`libx265` 软编解兜底）+ 特征门控（无 `ffmpeg` feature 时返回 `NO_BACKEND` 而非崩溃）
+- `ExportPlan` / `Segment`：帧对齐导出分段、段内稳定源集合、有理数速度与精确源时间换算，双端已暴露
 - P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - P2 音频预览：`plan_audio_at` 按原始时间规划音频（不吸附帧栅格）、native 混音器统一 48kHz/立体声/f32、鸿蒙 `OH_AudioRenderer` 输出并把真实播放位置回灌主时钟、播放态 hold-and-present 压住超前解码帧
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
@@ -346,7 +353,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 **未完成（按优先级）**
 
-- 补 `ExportPlan`/`Segment`、滤镜/转场/字幕渲染、图片与贴纸图层（P2 音频与 hold-and-present 已完成）
+- 补滤镜/转场/字幕渲染、图片与贴纸图层（P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
 
@@ -358,13 +365,14 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 94 通过 | core 单元 60（含 P2 音频规划 2）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16 |
+| `cargo test --workspace` | ✅ 102 通过 | core 单元 68（含 P2 音频规划 2、ExportPlan 8）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16；ExportPlan 8 项本轮新增 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
+| `ExportPlan` / `Segment` | ✅ 8 项通过 | 帧对齐边界、相邻片段/空洞/NTSC、变速源时间映射、与 `FramePlan` 活跃源集合一致、JSON 序列化；C ABI/NAPI/JNI 均已暴露 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
-| `check-native-abi.sh` | ✅ 通过 | 29 个 C 函数、32 个 NAPI 函数、25 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
+| `check-native-abi.sh` | ✅ 通过 | 30 个 C 函数、33 个 NAPI 函数、26 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
 | `captrim-ffi/ffmpeg` → Android arm64 | ✅ 类型检查通过 | `cargo check -p captrim-ffi --features ffmpeg --target aarch64-linux-android`，CI 独立 job 与 `check.sh` 同一命令；不链接（dist/ 不入仓库），真实链接由真机 native 自检覆盖 |
-| `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，29 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
+| `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，30 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
 | `libcaptrim.so`（ffmpeg feature）双端链接 | ✅ 通过 | OHOS + Android 双端：`libcaptrim.so` → NEEDED `libcaptrim_ffmpeg.so`（OHOS 另 NEEDED `libc.so`；Android 另 NEEDED `libdl.so`+`libc.so`）；FFI 符号 `ct_ff_probe`/`ct_ff_remux`/`ct_ff_transcode`/`ct_ff_string_free` 由 shim 导出并被 cdylib 引用；`platforms/<os>/captrim/{libs,jniLibs}/arm64-v8a` 已暂存全部动态库 |
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK；依赖包含 `libcaptrim.so` / `libcaptrim_ffmpeg.so` / `libohaudio.so` / `libace_napi.z.so` / `libhilog_ndk.z.so` / 媒体与窗口系统库 |
 | ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 3 条「.so 未校验」告警（预期） |
@@ -380,7 +388,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 | FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；12 个 `_FILTER 1` 全开，shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
 | FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；构建回执见 `FFMPEG_BUILD.txt` |
 
-鸿蒙自检同时覆盖原生库加载、29 个 C 函数、整数时间轴、预览状态机和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。17 项结果：
+鸿蒙自检同时覆盖原生库加载、30 个 C 函数、整数时间轴、预览状态机和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。17 项结果：
 
 ```
 PASS 原生库加载与 N-API 绑定 | libcaptrim CapTrim 0.1.0

@@ -364,6 +364,16 @@ napi_value PlanFrame(napi_env env, napi_callback_info info) {
     return StringResult(env, code, json);
 }
 
+napi_value ExportPlan(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    char *json = nullptr;
+    int32_t code = captrim_engine_export_plan(AsEngine(GetInt64(env, args[0])), &json);
+    return StringResult(env, code, json);
+}
+
 napi_value Duration(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {nullptr};
@@ -618,6 +628,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"planFrameAt", nullptr, PlanFrameAt, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"planFrame", nullptr, PlanFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exportPlan", nullptr, ExportPlan, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"duration", nullptr, Duration, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"previewNew", nullptr, PreviewNew, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"previewFree", nullptr, PreviewFree, nullptr, nullptr, nullptr, napi_default, nullptr},

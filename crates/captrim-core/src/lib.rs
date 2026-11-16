@@ -5,6 +5,7 @@
 
 pub mod clock;
 pub mod error;
+pub mod export;
 pub mod media;
 pub mod model;
 pub mod preview;
@@ -14,6 +15,9 @@ pub mod timeline;
 
 pub use clock::PlaybackClock;
 pub use error::{code_message, Error, Result};
+pub use export::{
+    frame_index_ceil, plan_export, ExportAudioItem, ExportPlan, ExportSegment, ExportVideoItem,
+};
 pub use media::{MediaInfo, StreamInfo, StreamKind};
 pub use model::{Clip, Id, MediaSource, Timeline, Track, TrackKind, Transform, DRAFT_VERSION};
 pub use preview::{PreviewSession, Step};

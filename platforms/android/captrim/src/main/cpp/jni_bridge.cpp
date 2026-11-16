@@ -250,6 +250,12 @@ jstring nativePlanFrame(JNIEnv *env, jobject, jlong handle, jlong tUs) {
     return planResult(env, code, json);
 }
 
+jstring nativeExportPlan(JNIEnv *env, jobject, jlong handle) {
+    char *json = nullptr;
+    int32_t code = captrim_engine_export_plan(asEngine(handle), &json);
+    return planResult(env, code, json);
+}
+
 jint nativeDuration(JNIEnv *env, jobject, jlong handle, jlongArray out) {
     int64_t duration_us = 0;
     uint64_t frames = 0;
@@ -341,6 +347,7 @@ JNINativeMethod kMethods[] = {
     {"nativeLastError", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeLastError)},
     {"nativePlanFrameAt", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrameAt)},
     {"nativePlanFrame", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrame)},
+    {"nativeExportPlan", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeExportPlan)},
     {"nativeDuration", "(J[J)I", reinterpret_cast<void *>(nativeDuration)},
     {"nativePreviewNew", "(J)J", reinterpret_cast<void *>(nativePreviewNew)},
     {"nativePreviewFree", "(J)V", reinterpret_cast<void *>(nativePreviewFree)},

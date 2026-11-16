@@ -16,10 +16,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod backend;
+pub mod export;
 pub mod frame_desc;
 pub mod preview;
 
 pub use backend::{default_backend, MediaBackend, StubBackend};
+pub use export::*;
 // The preview entry points are `#[no_mangle] extern "C"`, and Rust callers of
 // this crate expect to find them alongside the engine ones.
 pub use frame_desc::*;

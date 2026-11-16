@@ -15,6 +15,7 @@ import {
   lastErrorMessage,
   planFrameAt as nativePlanFrameAt,
   planFrame as nativePlanFrame,
+  exportPlan as nativeExportPlan,
   duration as nativeDuration,
   previewNew,
   previewFree,
@@ -72,6 +73,12 @@ export interface Transform {
   rotation_deg: number;
 }
 
+/** Integer ratio, used for frame rates and per-clip playback speed. */
+export interface Rational {
+  num: number;
+  den: number;
+}
+
 /** One composited layer of one output frame. */
 export interface FrameLayer {
   clip_id: number;
@@ -107,6 +114,52 @@ export interface FramePlan {
   audio: AudioMix[];
 }
 
+/** One video source active for a whole export segment. */
+export interface ExportVideoItem {
+  clip_id: number;
+  source_id: number;
+  uri: string;
+  z: number;
+  kind: LayerKind;
+  source_start_us: number;
+  source_end_us: number;
+  speed: Rational;
+  transform: Transform;
+  effects: string[];
+}
+
+/** One audio source active for a whole export segment. */
+export interface ExportAudioItem {
+  clip_id: number;
+  source_id: number;
+  uri: string;
+  source_start_us: number;
+  source_end_us: number;
+  speed: Rational;
+  volume: number;
+}
+
+/** A frame-aligned range whose active sources do not change. */
+export interface ExportSegment {
+  index: number;
+  start_frame: number;
+  end_frame: number;
+  start_us: number;
+  end_us: number;
+  video: ExportVideoItem[];
+  audio: ExportAudioItem[];
+}
+
+/** Full export breakdown. Segments cover [0, frame_count) with no holes. */
+export interface ExportPlan {
+  width: number;
+  height: number;
+  frame_rate: Rational;
+  duration_us: number;
+  frame_count: number;
+  segments: ExportSegment[];
+}
+
 /** What the platform render loop should do next. */
 export type StepKind = 'present' | 'wait_frame' | 'idle' | 'end';
 
@@ -126,6 +179,10 @@ function parseStep(json: string): Step {
 
 function parsePlan(json: string): FramePlan {
   return JSON.parse(json) as FramePlan;
+}
+
+function parseExportPlan(json: string): ExportPlan {
+  return JSON.parse(json) as ExportPlan;
 }
 
 /**
@@ -237,6 +294,13 @@ export class CapTrim {
     const result: StringResult = nativePlanFrameAt(this.handle, frameIndex);
     CapTrim.checkStatus(result.code);
     return parsePlan(result.value);
+  }
+
+  /** Full export breakdown: frame ranges with stable source lists. */
+  exportPlan(): ExportPlan {
+    const result: StringResult = nativeExportPlan(this.handle);
+    CapTrim.checkStatus(result.code);
+    return parseExportPlan(result.value);
   }
 
   /**

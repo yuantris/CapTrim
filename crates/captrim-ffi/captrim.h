@@ -107,6 +107,13 @@ int32_t captrim_engine_plan_frame(captrim_engine_t *engine, int64_t t_us,
 int32_t captrim_engine_plan_audio(captrim_engine_t *engine, int64_t t_us,
                                   char **out_json);
 
+/* Export plan: frame-aligned segments covering [0, frame_count). Each segment
+ * lists the active video/audio sources and their source-time ranges, so an
+ * exporter can keep decoders open instead of planning every frame. Gaps are
+ * valid segments with empty source arrays. Release out_json with
+ * captrim_string_free(). */
+int32_t captrim_engine_export_plan(captrim_engine_t *engine, char **out_json);
+
 /* Timeline length. Either out pointer may be NULL. */
 int32_t captrim_engine_duration(captrim_engine_t *engine,
                                 int64_t *out_duration_us,

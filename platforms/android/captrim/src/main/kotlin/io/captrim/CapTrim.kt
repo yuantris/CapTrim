@@ -56,6 +56,7 @@ object CapTrimNative {
 
     external fun nativePlanFrameAt(handle: Long, frameIndex: Long): String
     external fun nativePlanFrame(handle: Long, tUs: Long): String
+    external fun nativeExportPlan(handle: Long): String
     external fun nativeDuration(handle: Long, out: LongArray): Int
 
     external fun nativePreviewNew(engine: Long): Long
@@ -197,6 +198,9 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
      */
     fun planFrameAt(frameIndex: Long): String =
         CapTrimNative.nativePlanFrameAt(requireOpen(), frameIndex)
+
+    /** Full export breakdown as an ExportPlan JSON string. */
+    fun exportPlan(): String = CapTrimNative.nativeExportPlan(requireOpen())
 
     /** Open a playback session. Close any previous one first. */
     fun preview(): CapTrimPreview =

@@ -56,6 +56,8 @@ export const lastErrorMessage: () => StringResult;
 export const planFrameAt: (handle: number, frameIndex: number) => StringResult;
 /** Plan the frame covering t_us: the scrub path. Returns a FramePlan JSON. */
 export const planFrame: (handle: number, tUs: number) => StringResult;
+/** Full export breakdown: frame-aligned segments with source-time ranges. */
+export const exportPlan: (handle: number) => StringResult;
 export const duration: (handle: number) => DurationResult;
 
 export const previewNew: (handle: number) => HandleResult;
