@@ -1,16 +1,16 @@
 # CapTrim
 
-Android 与 HarmonyOS 共用的视频剪辑核心 SDK。**Rust 描述时间线，FFmpeg 负责文件封装/解封装、滤镜、缩放/重采样，以及编解码的软件兜底（首选仍是各平台硬件编解码）。**
+Android 和鸿蒙共用的视频剪辑核心 SDK。Rust 描述时间线，FFmpeg 管封装/解封装、滤镜、缩放/重采样；编解码首选各平台硬件，FFmpeg 只是软件兜底。
 
-一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI / 鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖「剪映基础剪辑」：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
+一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI、鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖剪映的基础剪辑能力：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-当前状态：**P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路，以及「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式全硬件导出，均已在鸿蒙与 Android 双端真机跑通（鸿蒙自检 17/17、Android native 自检 13/13）**（见[验证状态](#验证状态)）。OHOS 硬段的同步 Buffer 模式与回调式 Buffer 模式、Android 的 `AMediaCodec`/`AMediaMuxer` Buffer 模式都已真机验证 `fallback=[none]`，产物可被 FFmpeg 软解复验；任一段失败仍逐段回退 FFmpeg 软解/软编。两份平台硬段共用同一份 C ABI 与编排层，仅通过弱符号工厂切换。预览的帧计划、时钟与状态机已实现并有测试覆盖；鸿蒙侧已用 AVCodec 硬解把每一层送进各自的 GPU 纹理，再由 GLES 按 transform 逐层合成到 XComponent（真机实测，含画中画：两路解码同时跑，双路实时）。
+现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 17/17，Android native 自检 13/13，Android Kotlin 层自检 16/16，明细见[验证状态](#验证状态)。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
 
 ---
 
 ## 一、三条设计边界
 
-划错任何一条，都会得到一个体积巨大、预览卡顿、导出缓慢、两端各有一套 bug 的 SDK。
+这三条定错了，做出来的 SDK 就是体积大、预览卡、导出慢，而且两端各有一套 bug。
 
 | 边界 | 决策 | 理由 |
 |---|---|---|
@@ -69,18 +69,18 @@ Android 与 HarmonyOS 共用的视频剪辑核心 SDK。**Rust 描述时间线�
 
 `ct_decoder_t` / `ct_processor_t` / `ct_encoder_t` 是纯 C 函数表，工厂函数返回 `NULL` 即表示该后端不可用，由 `ct_pipeline_run()` **按段**降级，不会一段失败就整条链路退回软件。
 
-**已落地并真机跑通（2026-11-15，自检 17/17）**：`native/captrim_pipeline.c` 实现编排 + FFmpeg 软解/中间滤镜/软编三工厂 + `ct_pipeline_hardware_caps()`；`native/captrim_ohos_hw.c` 实现 OHOS 硬解（`OH_AVSource`/`OH_AVDemuxer`/`OH_VideoDecoder`）与硬编（`OH_VideoEncoder`/`OH_AVMuxer`）工厂，编译进 OHOS 版 `libcaptrim_ffmpeg.so`。Android 构建同样编入 `native/captrim_android_hw.c`（`AMediaExtractor` + `AMediaCodec` + `AMediaMuxer` 硬解/硬编工厂），真机已验证 `decoder=2 encoder=2`（即 `CT_BACKEND_ANDROID_HW`）、`reason=none` 无回退；两端仍共用同一份编排层，仅通过弱符号工厂切换。`ct_ff_transcode()` 用 `video_codec` 前缀路由：`libx264`/空 = 纯软直连；`hw:<encoder>` = 三段式硬件优先；`hw:sw:<encoder>` = 强制全软；`hw:cb:<encoder>` = 强制 OHOS 回调式 Buffer 模式（诊断）。硬件段若在流式阶段失败，`ct_ff_transcode()` 会整单重试全软，保证导出不失败。
+**2026-11-15 落地，鸿蒙自检 17/17**：`native/captrim_pipeline.c` 实现编排 + FFmpeg 软解/中间滤镜/软编三工厂 + `ct_pipeline_hardware_caps()`；`native/captrim_ohos_hw.c` 实现 OHOS 硬解（`OH_AVSource`/`OH_AVDemuxer`/`OH_VideoDecoder`）与硬编（`OH_VideoEncoder`/`OH_AVMuxer`）工厂，编进 OHOS 版 `libcaptrim_ffmpeg.so`。Android 构建编入 `native/captrim_android_hw.c`（`AMediaExtractor` + `AMediaCodec` + `AMediaMuxer`），真机验证 `decoder=2 encoder=2`（即 `CT_BACKEND_ANDROID_HW`）、`reason=none` 无回退；两端共用同一份编排层，只靠弱符号工厂切换。`ct_ff_transcode()` 按 `video_codec` 前缀路由：`libx264`/空 = 纯软直连；`hw:<encoder>` = 三段式硬件优先；`hw:sw:<encoder>` = 强制全软；`hw:cb:<encoder>` = 强制 OHOS 回调式 Buffer 模式（诊断用）。硬件段在流式阶段失败时，`ct_ff_transcode()` 整单重试全软，保证导出不失败。
 
-**硬段双模式（关键结论）**：AVCodec Kit 的 Buffer 模式两种互斥形态都在 `captrim_ohos_hw.c` 里实现，且共用同一套流式循环——只把「取空输入 buffer / 取已填充输出 buffer」两个原语换成不同实现：
+**硬段的两种 Buffer 模式**：AVCodec Kit 的两个互斥形态都在 `captrim_ohos_hw.c` 里，共用同一套流式循环，只把「取空输入 buffer / 取已填充输出 buffer」两个原语换成不同实现：
 
 | 模式 | 适用 API | 开启方式 | 真机结果 |
 | --- | --- | --- | --- |
 | 同步（快速路径） | 20+ | Configure 阶段设 `OH_MD_KEY_ENABLE_SYNC_MODE=1`，然后 `QueryInputBuffer`/`QueryOutputBuffer`/`Get*Buffer` 轮询；**不能注册回调** | `decoder=OHOS_HW encoder=OHOS_HW decoded=100 encoded=29 fallback=[none]` |
 | 回调（官方示例） | 11+ | `RegisterCallback` + `OnNeedInputBuffer`/`OnNewOutputBuffer`，回调把 `(index, OH_AVBuffer*)` 推入 mutex/condvar 队列 | 同上，`in=29 out=29` |
 
-之前 `AV_ERR_OPERATE_NOT_PERMIT(2)` 的根因不是「设备不支持同步模式」，而是**默认就是异步模式**：`Query*Buffer` 的头文件注释明确写了「仅同步模式可用 / 异步模式下返回 `AV_ERR_OPERATE_NOT_PERMIT`」。同步键通过 `dlsym` 运行时解析（不产生硬符号依赖，老设备自动走回调）；若设备仍拒绝轮询，`open()` 会销毁 codec 并就地重建为回调模式。
+之前 `AV_ERR_OPERATE_NOT_PERMIT(2)` 的根因不是「设备不支持同步模式」，而是默认就是异步模式：`Query*Buffer` 的头文件注释写了「仅同步模式可用 / 异步模式下返回 `AV_ERR_OPERATE_NOT_PERMIT`」。同步键用 `dlsym` 运行时解析，不产生硬符号依赖，老设备自动走回调；设备仍拒绝轮询的话，`open()` 销毁 codec 就地重建为回调模式。
 
-**真机证据（Mate 60 / ALN-AL00 / OpenHarmony 7.0.0 / API 26）**：
+Mate 60（ALN-AL00 / OpenHarmony 7.0.0 / API 26）上的日志：
 ```text
 CapTrim OHOS: hardware decoder ACTIVE mode=sync NV12 1260x2720 dur=22729000us
 CapTrim OHOS: hardware encoder ACTIVE mode=sync NV12 320x180 -> mp4
@@ -90,7 +90,7 @@ CapTrim pipeline: decoder=OHOS_HW encoder=OHOS_HW decoded=100 encoded=29 3448ms 
 ```
 回调模式（`hw:cb:`）同样 `fallback=[none]`。两个硬编产物再被 FFmpeg 软 H.264 解码器重新解码 + 重编码成功（各 26 次进度回调），证明不是「只有容器元数据」的空壳 mp4。
 
-⚠️ **YUV 跨距对齐**是硬段桥接的第一坑：硬件解码器输出的每行按 16/32/64 字节对齐，`stride > width`，不能按 `width*height` 连续拷贝。`ct_frame_t.stride[4]` 必须逐平面填入，② 用 `AVFrame.linesize[] = stride[]` 包装后再交给 libswscale 归一到 yuv420p。
+YUV 跨距对齐是硬段桥接的第一坑：硬件解码器输出的每行按 16/32/64 字节对齐，`stride > width`，不能按 `width*height` 连续拷贝。`ct_frame_t.stride[4]` 必须逐平面填入，第②段用 `AVFrame.linesize[] = stride[]` 包装后再交给 libswscale 归一到 yuv420p。
 
 依据的鸿蒙官方文档（2026-11-15 查阅）：文档中心索引 `https://developer.huawei.com/config/llms.txt` → [API Reference](https://developer.huawei.com/consumer/cn/llms/docs-references.txt) / [Guides](https://developer.huawei.com/consumer/cn/llms/docs-capabilities.txt) → [基于Buffer模式进行视频转码](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/video-transcoding-buffer.md)、[视频编解码宽高、跨距与裁剪信息说明](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/video-dimension-guide.md)、[视频编码](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/video-encoding.md)、[视频解码](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/video-decoding.md)、[VideoEncoder C API](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-videoencoder.md)、[VideoDecoder C API](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-videodecoder.md)、[OH_AVCodecCallback](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-codecbase-oh-avcodeccallback.md)、[AVMuxer C API](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-avmuxer.md)（其中回调结构体与跨距指南经 `devecocli docs search/read` 复核）。具体函数签名以本机 OHOS NDK 头文件 `native_avcodec_base.h`（`OH_AVCodecCallback`、`OH_MD_KEY_ENABLE_SYNC_MODE`）、`native_avcodec_videoencoder.h`、`native_avcodec_videodecoder.h`、`native_avmuxer.h` 为准。
 
@@ -99,11 +99,12 @@ CapTrim pipeline: decoder=OHOS_HW encoder=OHOS_HW decoded=100 encoded=29 3448ms 
 ```
 crates/captrim-core/      纯 Rust 核心：时间、模型、命令、草稿（零平台依赖）
 crates/captrim-ffi/       稳定 C ABI + 后端抽象（captrim.h 是唯一契约）
-native/                   FFmpeg C shim（probe / remux / 滤镜转码）
+native/                   FFmpeg C shim（probe / remux / 滤镜转码）+ 三段式管线 + 双端硬段工厂
 platforms/android/        Gradle AAR + CMake + JNI + Kotlin
+platforms/android/app/    Kotlin 层真机自检 App（16 项，结果写 logcat）
 platforms/ohos/           HAR 工程 + CMake + Node-API + ArkTS + .d.ts
 platforms/ohos/entry/     真机自检 App（17 项检查，结果写 hilog）
-scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建、本地 CI 全套（check.sh）
+scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建、双端真机自检、本地 CI 全套（check.sh）
 ```
 
 ## 四、快速开始
@@ -125,7 +126,7 @@ cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warni
 bash scripts/check-native-abi.sh   # 头文件 == Rust 导出 == NAPI == d.ts
 ```
 
-`check.sh` 存在的原因很具体：`b2d3158` 在 `cargo fmt --all --check` 上失败，GitHub 于是跳过了后面的测试、clippy 与 ABI 三步——本地跑过的三项结果一次都没被报出来，推送看着是验证过的，其实没有。一个不能只跑一半的命令比多一条纪律更可靠。
+`check.sh` 的由来很具体：`b2d3158` 在 `cargo fmt --all --check` 上失败，GitHub 就把后面的测试、clippy、ABI 三步全跳过了——本地跑过的结果一次都没报出来，推送看着验证过，其实没有。所以把 CI 的每一关按同样顺序收进一个脚本，一次跑完。
 
 **2. 鸿蒙侧（先跑 stub 后端，不需要 FFmpeg）**
 
@@ -157,7 +158,13 @@ bash scripts/build-rust.sh ohos        # 或 android，默认 FEATURES=ffmpeg
 export ANDROID_NDK_HOME="/path/to/ndk"
 bash scripts/build-ffmpeg-android.sh
 bash scripts/build-rust.sh android
-cd platforms/android && ./gradlew :captrim:assembleRelease
+```
+
+仓库没带 gradlew，本机用缓存的 Gradle 构建；两个真机自检脚本会自己找 Gradle 8.13：
+
+```bash
+bash scripts/run-android-selftest.sh        # native 层 13 项，推 /data/local/tmp 跑
+bash scripts/run-android-app-selftest.sh    # Kotlin/JNI 层 16 项，装 App 跑
 ```
 
 **5. 鸿蒙真机自检**
@@ -236,7 +243,7 @@ ArkTS 侧 `Step` / `FramePlan` 是类型化的（`JSON.parse` 是原生实现）
 
 ## 六、P1：预览管线
 
-P1 的成果不是「能放视频」，而是**把预览和导出钉在同一条时间线上**。做法是把三件事从平台层收进 Rust：
+P1 做的事是把预览和导出钉在同一条时间线上，而不只是「能放视频」。做法是把三件事从平台层收进 Rust：
 
 | 模块 | 职责 | 为什么必须在 Rust |
 |---|---|---|
@@ -256,7 +263,7 @@ when (step.kind) {
 }
 ```
 
-**三条容易踩的实现约定**
+三条实现约定，都踩过：
 
 1. **`nowUs` 必须是单调时钟**。传 `System.currentTimeMillis()` 会出两种故障：时钟回拨导致播放卡死，向前跳跃导致整段缓冲被丢弃。鸿蒙用 `OH_GetTimeSinceBoot` 系列的微秒值。
 2. **导出按帧索引走，按时间戳走会重复帧**。`frame_pts_us(1)` 对 30000/1001 返回 33366，但第 1 帧真正的起点是 33366.67 µs；再把这个值喂给按下取整的接口就会塌回第 0 帧。所以 `plan_frame_at(frame_index)` 是导出 API，`plan_frame(t_us)` 只用于拖动和播放。这条有专门的集成测试守着。
@@ -292,11 +299,11 @@ presentControl(playing,seek) ─▶ 命令队列 ──┤
 presentStatus() ◀── 快照(非阻塞) ──────────┘
 ```
 
-关键点：**解码器不直接写 XComponent**。它写到 `OH_NativeImage`（鸿蒙的 SurfaceTexture），帧变成 GPU 纹理，再由合成器按计划画成 quad。直出更快，但只能画一个全屏画面 —— 一旦有缩放、位移、第二个图层，就必须合成。
+这里的关键是解码器不直接写 XComponent：它写到 `OH_NativeImage`（鸿蒙的 SurfaceTexture），帧变成 GPU 纹理，再由合成器按计划画成 quad。直出更快，但只能画一个全屏画面——一旦有缩放、位移、第二个图层，就必须合成。
 
 **每个视频图层一个解码器**。`presenter.cpp` 里没有「当前那个解码器」，只有一组 `SourceSlot`（demuxer + codec + NativeImage + texture，外加自己的 target/eos/reached）。一次 present 会按计划里出现的图层逐个要槽位：没有就开一个，开不出来就记一笔并跳过这一层（SoC 解码器实例用尽是真实可能），槽位不够就淘汰「最久没出现在计划里」的那个。画中画因此不再需要 core 做任何调度——计划早就在每一层上写了 `source_id` 和 `source_us`，平台侧照着开解码器即可。
 
-六条约束决定了这个形状：
+有六条约束决定了这个形状：
 
 1. **`present` 会阻塞**。它要等解码器把帧交给 surface（最多 ~120 ms）。早期版本在 ArkUI 的 `setInterval` 里直接调，系统判定主线程无响应并杀掉进程（`THREAD_BLOCK_6S`, `signal:9`）。现在循环跑在自己的线程，页面只发命令 + 读快照。
 2. **预览会话只有一个所有者**。`seek` / `setPlaying` 若从 UI 线程直接打进去，会和正在解码的循环抢时钟锚点。命令通过队列交给渲染线程执行（`PresenterControl` 只是入队 + 唤醒条件变量）。
@@ -314,23 +321,25 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 - Command 栈 + 撤销重做 + 草稿 JSON 往返
 - 稳定 C ABI（27 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
 - FFmpeg 后端（`libavformat` 探测/remux、`libavfilter`+`libswscale` 复杂剪辑、`libavcodec`/`libx264`/`libx265` 软编解兜底）+ 特征门控（无 `ffmpeg` feature 时返回 `NO_BACKEND` 而非崩溃）
-- **P1 调度内核**：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
+- P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
 - 鸿蒙真机自检 App：17 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘、三段式管线的软件基线 / 同步硬段 / 回调式硬段与回退，以及硬编产物的 FFmpeg 软解复验
-- **鸿蒙硬解 + GL 多图层合成上屏**：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放均已真机验证
+- Android native 自检：13 项，含真实 x265 HEVC 编码复探和 AMediaCodec 硬解硬编链路（`scripts/run-android-selftest.sh`）
+- Android Kotlin/JNI 层自检 App：16 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）
+- 鸿蒙硬解 + GL 多图层合成上屏：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放都在真机验证过
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包、本地 CI 全套
 
 **未完成（按优先级）**
 
-- P2：音频输出 + hold-and-present（同时解决 A/V 偏移）；**Android AAR/JNI/Kotlin 层真机自检**（native 全硬件链路已 13/13 通过，可将 OHOS `SelfCheck.ets` 同构移植为 Kotlin 自检 App）；再补 `ExportPlan`/`Segment`、滤镜/转场/字幕渲染、图片与贴纸图层
+- P2：音频输出 + hold-and-present（同时解决 A/V 偏移）；再补 `ExportPlan`/`Segment`、滤镜/转场/字幕渲染、图片与贴纸图层
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
 
-**逐帧数据不要走 JSON 往返**：当前 `planFrame` / `step` 返回 JSON，是为了让 P1 骨架在没有渲染器时也能跑通、也能两端对齐。真实的合成器应当从 C++ 直接调 C ABI（同一份 `captrim_preview_step`），避免每帧一次 JSON 解析与跨语言拷贝。ArkTS 侧已做类型化封装，Android 侧返回原始 JSON 是刻意的：AAR 保持零依赖，也不塞一个无法用单元测试验证的手写解析器。
+逐帧数据不要走 JSON 往返：当前 `planFrame` / `step` 返回 JSON，是为了让 P1 骨架在没有渲染器时也能跑通、也能两端对齐。真实的合成器应当从 C++ 直接调 C ABI（同一份 `captrim_preview_step`），避免每帧一次 JSON 解析与跨语言拷贝。ArkTS 侧已做类型化封装，Android 侧返回原始 JSON 是刻意的：AAR 保持零依赖，也不塞一个无法用单元测试验证的手写解析器。
 
 ## 八、验证状态
 
-区分「本机实测通过」和「已写好但未在此环境验证」，避免误判成熟度。
+只记在本机或真机上实际跑过的；没验证过的会单独标出来，别当成成熟度。
 
 | 项 | 状态 | 说明 |
 |---|---|---|
@@ -344,16 +353,17 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK；依赖仅 `libcaptrim.so` / `libace_napi.z.so` / `libc.so` |
 | ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 2 条「.so 未校验」告警（预期） |
 | 鸿蒙构建脚本端到端 | ✅ 通过 | Windows + Git Bash 实测产出、暂存、`hdc install` 一条命令 |
-| **鸿蒙 HAP 打包** | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内含 `libcaptrim.so`(NAPI) + `libcaptrim_ffmpeg.so` + FFmpeg 全套(`libav*`/`libsw*`) + `libc++_shared.so`(NDK C++ 运行时，由 `build-ffmpeg-ohos.sh` 自动打入 `dist/ohos/...` 再随 `stage_libs` 进 HAP) |
-| **鸿蒙真机自检** | ✅ 17/17 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a；含 FFmpeg 软后端 probe + remux + 复杂剪辑、三段式管线的软件基线 / 同步硬段 / 回调式硬段，以及两个硬编 mp4 的 FFmpeg 软解复验，详见下节 |
-| **鸿蒙硬解 + GL 合成** | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（468 次合成，解码 458 帧仅 7 帧未上屏）；暂停落点误差 ≤1 帧；缩放/平移/旋转经 `set_transform` 全链路生效（截图对比） |
-| **画中画（双路解码）** | ✅ 真机出画面 | 主轨 + overlay 轨同时解码：`slots=2`、两路各自 latch 并合成，截图可见主画面与右下角内嵌画面；8 s 时间线双路播放 `pos` 与壁钟同为 6012 ms（1.00× 实时）；只改主视频的 transform 时内嵌画面保持原位（截图对比），证明两个图层互不干扰 |
-| **Android AAR 编译** | ⚠️ Gradle 包装器未随仓库提供 | 本机有 SDK/NDK，但 `platforms/android/` 没有 `gradlew` 且 PATH 无 `gradle`；Kotlin 与 JNI 签名已逐一手工核对。native 层已单独真机验证，见下一行 |
-| **Android 真机自检（native）** | ✅ 13/13 通过 | 小米 2211133C（fuxi）/ Android 16 / API 36 / arm64-v8a：`scripts/run-android-selftest.sh` 一条命令编译+推送+运行；probe / remux / 软件复杂剪辑 / **libx265 真实 HEVC 软编（输出复探 `codec=hevc`）** / 三段式管线（`decoder=2 encoder=2`，即 `CT_BACKEND_ANDROID_HW`，`reason=none` 无回退）/ 硬编产物 FFmpeg 软解复验 / 硬件能力查询全通过，详见下节 |
-| **FFmpeg 实际编译（Android）** | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + **真实交叉编译的 `libx265.so`（7.45 MB 动态库，119 个 `x265_*` 导出符号）**；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 由该依赖在运行时解析（不再是装载桩 / `LD_PRELOAD`）；`config_components.h` 的 12 个 `_FILTER 1` 全开，shim 公共编入 `captrim_pipeline.c`，并编入 `captrim_android_hw.c`（NEEDED `libmediandk.so`/`liblog.so`）。构建脚本会校验 dist 里的 `libx265.so` 必须 >1 MB，杜绝桩回归。构建回执见 `FFMPEG_BUILD.txt` |
-| **FFmpeg 实际编译（HarmonyOS）** | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；构建回执见 `FFMPEG_BUILD.txt` |
+| 鸿蒙 HAP 打包 | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内含 `libcaptrim.so`(NAPI) + `libcaptrim_ffmpeg.so` + FFmpeg 全套(`libav*`/`libsw*`) + `libc++_shared.so`(NDK C++ 运行时，由 `build-ffmpeg-ohos.sh` 自动打入 `dist/ohos/...` 再随 `stage_libs` 进 HAP) |
+| 鸿蒙真机自检 | ✅ 17/17 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a；含 FFmpeg 软后端 probe + remux + 复杂剪辑、三段式管线的软件基线 / 同步硬段 / 回调式硬段，以及两个硬编 mp4 的 FFmpeg 软解复验，详见下节 |
+| 鸿蒙硬解 + GL 合成 | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（468 次合成，解码 458 帧仅 7 帧未上屏）；暂停落点误差 ≤1 帧；缩放/平移/旋转经 `set_transform` 全链路生效（截图对比） |
+| 画中画（双路解码） | ✅ 真机出画面 | 主轨 + overlay 轨同时解码：`slots=2`、两路各自 latch 并合成，截图可见主画面与右下角内嵌画面；8 s 时间线双路播放 `pos` 与壁钟同为 6012 ms（1.00× 实时）；只改主视频的 transform 时内嵌画面保持原位（截图对比），证明两个图层互不干扰 |
+| Android AAR 编译 | ✅ 构建通过 | `platforms/android` 没有 gradlew，本机用缓存的 Gradle 8.13 构建（`scripts/run-android-app-selftest.sh` 会自动找）；AGP 8.7.3 / Kotlin 2.0.21 / compileSdk 35 / NDK 27.0.12077973 |
+| Android 真机自检（Kotlin/JNI 层） | ✅ 16/16 通过 | 小米 2211133C / Android 16 / API 36；走 `CapTrim.kt` 公开 API，覆盖库加载、时间线、分割撤销重做、29.97fps 栅格、预览时钟、probe / remux / x264 / 真实 x265（复探 `codec=hevc`）/ 三段式管线软硬链路 / 硬编产物软解复验，详见下节 |
+| Android 真机自检（native） | ✅ 13/13 通过 | 小米 2211133C（fuxi）/ Android 16 / API 36 / arm64-v8a：`scripts/run-android-selftest.sh` 一条命令编译+推送+运行；probe / remux / 软件复杂剪辑 / libx265 真实 HEVC 软编（输出复探 `codec=hevc`）/ 三段式管线（`decoder=2 encoder=2`，即 `CT_BACKEND_ANDROID_HW`，`reason=none` 无回退）/ 硬编产物 FFmpeg 软解复验 / 硬件能力查询全通过，详见下节 |
+| FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；12 个 `_FILTER 1` 全开，shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
+| FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；构建回执见 `FFMPEG_BUILD.txt` |
 
-真机自检现在同时覆盖「原生库加载 / 27 个 C 函数可用 / 整数时间轴 / 预览状态机」与 **FFmpeg 软后端**（probe 探测、remux 无损重封装、复杂剪辑：decode → libavfilter → libx264 重编码 → mp4 封装）。后者要求 HAP 内必须随附 NDK 的 `libc++_shared.so`——`libavcodec.so.61` 的 NEEDED 指向它，而该运行时不在设备系统镜像里，缺失会直接导致 `captrim_napi` 模块加载失败、ArkTS 侧报 `does not provide an export name 'version'`。本次已修复（见 `build-ffmpeg-ohos.sh` 自动拷贝）并在真机验证通过。HAP 内塞入真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面把它拷进沙箱供 probe/remux/transcode 使用。17 项自检结果：
+鸿蒙自检同时覆盖原生库加载、27 个 C 函数、整数时间轴、预览状态机和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。17 项结果：
 
 ```
 PASS 原生库加载与 N-API 绑定 | libcaptrim CapTrim 0.1.0
@@ -377,7 +387,7 @@ PASS 硬编产物可被 FFmpeg 软解（pipeline_cb.mp4） | FFmpeg 软解→重
 
 > 五项转码自检都用 `trim=duration=2` 只处理前 2 秒。原因是 OHOS 的 `ThreadBlock6S` watchdog：自检同步跑在 UI 线程，一次完整 22 秒转码（约 17 s）会耗尽主线程阻塞预算，之后任何重任务都会让 App 被 `signal 9` 杀死（`AppKilledReporter: reason: ThreadBlock6S`）。因此 `ct_ff_transcode()` / `ct_pipeline_run()` 都支持「终止型滤镜提前关闭滤镜图」并立即停止解码；四项重管线检查（软件基线 / 同步硬段 / 回调硬段 / 软解复验）分别放到延迟的 UI 任务中分批执行，每批之间留 8 s 空闲窗口。
 
-**复杂剪辑（`exportTranscode`）真机实现要点**：`ct_ff_transcode` 走 `av_read_frame → 解码 → libavfilter graph → libx264 → mp4`，音频流无损复制，支持进度回调与取消。三个必须记住的坑：
+**复杂剪辑（`exportTranscode`）的实现要点**：`ct_ff_transcode` 走 `av_read_frame → 解码 → libavfilter graph → libx264 → mp4`，音频流无损复制，支持进度回调与取消。三个要记住的坑：
 
 - 滤镜图、编码器、muxer **必须从第一帧解码结果延迟构建**：容器 `codecpar->format` 通常是 `AV_PIX_FMT_NONE(-1)`，拿它描述 buffer 源会在格式协商里解引用空描述符而 SIGSEGV。
 - 给 buffersink 设 `pix_fmts` 必须用 `av_opt_set_int_list(..., AV_PIX_FMT_NONE, ...)`（在哨兵处截断）；用 `av_opt_set_bin(sizeof(array))` 会把 `-1` 当成真实格式写进列表，同样导致 `av_pix_fmt_desc_get(-1) == NULL` 崩溃。
@@ -405,9 +415,43 @@ PASS Hardware capability query             | vendor=Android MediaCodec decoderAv
 
 `decoder=2 / encoder=2` 即 `CT_BACKEND_ANDROID_HW`，`reason=none` 表示**没有发生任何软回退**：`native/captrim_android_hw.c` 用 `AMediaExtractor` 喂 `AMediaCodec` 硬解、`libavfilter` 处理、`AMediaCodec` 硬编 + `AMediaMuxer` 封装。与 OHOS 版共用 `captrim_pipeline.c` 的编排和逐段回退，仅通过弱符号工厂 `ct_decoder_create_android()` / `ct_encoder_create_android()` 切换。
 
-三个 Android 专属坑：① NDK 的 `COLOR_FormatYUV420SemiPlanar` 等常量未导出，按 AOSP 数值（NV12=21）硬编码；`AMediaCodec_getInputFormat` 是 API 28+，minSdk 26 下 stride 要从输入 buffer 容量推算，且 slice 高度**不能**按 16 对齐（用户首次看到的 `input layout invalid (cap=86400 stride=0 slice=0)` 就是这个）。② x265 静态 archive 在本机 Windows/NDK 工具链下会给 `libavcodec.so` 留下 `x265_api_get_198` 未定义符号，Android 加载器会直接拒绝加载——早期曾用 5 KB 装载桩 + `LD_PRELOAD` 绕过，现已换成**真实交叉编译的 7.45 MB `libx265.so`**：`libavcodec.so` 通过 `DT_NEEDED` 正常依赖它，自检脚本只需 `LD_LIBRARY_PATH=.`。③ x265 的 CMakeLists 把 shared 库与 `.pc` 的 install 规则包在 `if(X265_LATEST_TAG)` 里，浅克隆没有 tag 时 `make install` 静默不装；构建脚本改为手动把产物装进 prefix，并用 `NEEDED libx265.so` + 文件大小 >1 MB 双重校验防桩回归。详见第十节坑 38–43。
+Android 侧踩过三个坑：① NDK 不导出 `COLOR_FormatYUV420SemiPlanar` 这些颜色格式常量，按 AOSP 数值硬编码（NV12=21）；`AMediaCodec_getInputFormat` 是 API 28+，minSdk 26 下 stride 只能从输入 buffer 容量反推，slice 高度也不能按 16 对齐（`input layout invalid (cap=86400 stride=0 slice=0)` 就是对齐多了）。② x265 静态 archive 在本机 Windows/NDK 工具链下会给 `libavcodec.so` 留下 `x265_api_get_198` 未定义符号，Android 加载器直接拒绝加载；早期用 5 KB 装载桩加 `LD_PRELOAD` 绕过，后来换成真实交叉编译的 7.45 MB `libx265.so`，`libavcodec.so` 通过 `DT_NEEDED` 正常依赖它，自检脚本只需要 `LD_LIBRARY_PATH=.`。③ x265 的 CMakeLists 把 shared 库和 `.pc` 的 install 规则包在 `if(X265_LATEST_TAG)` 里，浅克隆没有 tag 时 `make install` 静默不装；构建脚本改为手动把产物装进 prefix，再用 `NEEDED libx265.so` 加文件大小大于 1 MB 双重校验。详见第十节坑 38–43。
 
-CI 已配置为在上述缺口处开工（Gradle AAR 打包），见 `.github/workflows/ci.yml`。
+### Android 真机自检（Kotlin/JNI 层，16/16）
+
+native 自检验的是 C ABI，这一层验的是宿主 App 实际走的路：`CapTrim.kt` → JNI → Rust → FFmpeg。`platforms/android/app` 是个最小 Activity，把 16 项检查跑在后台线程，结果打到 logcat（tag `CapTrimSelfCheck`）、屏幕和 `files/selfcheck.txt`。检查项和鸿蒙 `SelfCheck.ets` 同构：时间线、分割撤销重做、29.97fps 栅格、预览时钟、probe、remux、x264 复杂剪辑、真实 x265（复探 `codec=hevc`）、三段式管线软件基线与硬解硬编优先、硬编产物软解复验。
+
+```bash
+bash scripts/run-android-app-selftest.sh
+# 构建 app-debug.apk（自动找本机缓存的 Gradle 8.13）→ adb install →
+# 把 sample.mp4 推进 App 沙箱 → 拉起 → 轮询 logcat 里的 == selfcheck N/M passed ==
+```
+
+小米 2211133C（Android 16 / API 36）实测 16/16：
+
+```
+PASS 原生库加载与 JNI 绑定 | libcaptrim CapTrim 0.1.0
+PASS 时间线构建（2 轨 3 片段） | 9.000s / 270 帧
+PASS 分割 / 撤销 / 重做 | 4 → 3 → 4
+PASS 29.97fps 帧栅格不塌陷 | 270 帧全部严格递增，最大误差 ≤1us
+PASS 逐帧源时间唯一（不重复帧） | 前 60 帧源时间严格递增
+PASS 预览时钟与丢帧统计 | 呈现 45 次 / 等待 45 次 / 位置 1499ms / 丢帧 0
+PASS 编辑后自动重绘 | 同帧不重复，改动后立即重绘
+PASS 音频主导时钟校正 | 漂移 50000us 已被校正
+PASS 错误码可读 | 0 → "ok"，未知片段正确报错
+PASS FFmpeg 探测（软后端 probe） | format=mov,mp4,m4a,3gp,3g2,mj2 dur=22.73s streams=1[video]
+PASS FFmpeg 重封装（软后端 remux） | 写回 21.34MB，复探 1 路流
+PASS FFmpeg 复杂剪辑（滤镜+libx264重编码） | 1260x2720→320x180 codec=h264 fps≈15 0.06MB 进度 22 次
+PASS FFmpeg 复杂剪辑（libx265 HEVC） | x265 真实编码 0.04MB codec=hevc 进度 21 次
+PASS 三段式管线（软件基线 / 回退链路） | decode→filter→encode 0.06MB codec=h264 进度 29 次
+PASS 三段式管线（硬解/硬编优先，失败自动回退） | decode→filter→encode 0.06MB codec=h264 进度 29 次
+PASS 硬编产物可被 FFmpeg 软解（pipeline_hw.mp4） | FFmpeg 软解→重编码成功，进度 26 次
+== selfcheck 16/16 passed ==
+```
+
+推 sample 进 App 沙箱不能把 `adb shell` 当管道用：多参数会被设备 shell 重新解析，`>` 会落在错误的目录，stdin 转发 21 MB 还会被截断到几百字节。可靠做法是 `adb push` 到 `/data/local/tmp`，再在设备内 `cat ... | run-as ... sh -c 'cat > files/a.mp4'`，`scripts/run-android-app-selftest.sh` 里就是这么做的。
+
+CI 的 android job 会打 AAR，见 `.github/workflows/ci.yml`。
 
 ## 九、许可与专利
 
@@ -458,7 +502,7 @@ CI 已配置为在上述缺口处开工（Gradle AAR 打包），见 `.github/wo
 37. **`probe` 只能证明容器元数据合法，不能证明硬编码出的码流可解码**。自检里额外加一步：把硬编 mp4 再交给 FFmpeg 软 H.264 解码器走 `exportTranscode(..., 'scale=64:64', 'libx264')`，看到多次进度回调才算数；否则 muxer 写出一个结构完好、帧却全废的 mp4 也会一路 PASS。
 38. **Android NDK 不导出 `COLOR_FormatYUV420SemiPlanar` 等颜色格式常量**。`NdkMediaCodec.h`/`NdkMediaFormat.h` 里找不到这些 OMX 数值，只能按 AOSP 定义硬编码（NV12=21、I420=19、PackedSemiPlanar=39、Flexible=42）——它们的稳定性由平台 ABI 保证，不是 NDK API。
 39. **`AMediaCodec_getInputFormat` 是 API 28+，minSdk 26 下拿不到编码器 stride**。要么按 buffer 容量反推（连续布局 `cap/(w*h*3/2)`），要么直接用未对齐的 `width`/`height`。踩过的坑：把 slice 高度按 16 对齐后 `320x180` 需要 `320*192*3/2=92160` 字节，而编码器只给了 `86400`（`stride=0 slice=0` 时按连续布局分配），于是报 `hardware encoder input layout invalid (cap=86400 stride=0 slice=0)`。`stride` 可用时再按填充布局写，且 NV12 的 UV 平面起点是 `stride*slice`，不是 `stride*height`。
-40. **Android 版 x265 必须用真实动态库，不能用装载桩**。静态 archive 在本机 Windows/NDK 工具链下会省略 `api.cpp.o`（它定义 `x265_api_get_198`），`-Wl,--undefined` 被 FFmpeg 的 version script 吃掉、`--whole-archive` 带来 compiler-rt 重复符号、直接加 `.o` 又在 libavformat 重复定义，于是 `libavcodec.so` 留下未解析符号，Android 加载器直接拒绝加载。早期方案是生成 5 KB `libx265.so` 桩 + `LD_PRELOAD` 注入——**能让自检 11/11 全绿，但 HEVC 根本没被编码**，已彻底废弃。正确做法：x265 用 `-DENABLE_SHARED=ON` 编成 7.45 MB 真库（`-DANDROID_STL=c++_static` 把 C++ 运行时静态嵌入；另放一个空 `libpthread.a` 垫片满足 x265 CMakeLists 硬编码的 `-lpthread`，因为 bionic 的 pthread 在 libc 里），FFmpeg 以 `-lx265` 链上它。判据：`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 保持 `UND` 由加载器解析；真机自检实际编码 29 帧并复探出 `codec=hevc` 才算做完。
-41. **浅克隆没有 git tag 时，x265 的 `make install` 会静默什么都不装**。x265 `source/CMakeLists.txt` 把 `install(TARGETS x265-shared ...)` 和 `install(FILES x265.pc ...)` 都包在 `if(X265_LATEST_TAG)`（来自 `git describe`），而 `git_clone_robust` 用 `--depth 1` 克隆不带 tag，`git fetch --tags` 在本机也补不上。现象：cmake+make 已经打印 `[100%] Built target x265-shared`、真库就在构建目录里，`prefix/lib` 却是空的，FFmpeg configure 因此拿不到 `--enable-libx265`。解法：`install_x265_artifacts()` 手动把 `libx265.so`、头文件与干净的 `x265.pc` 放进 prefix（x265 生成的 `.pc` 还带畸形 `Libs.private: -l-l:libunwind.a`），并在 shared 模式下删掉同目录的 `libx265.a`，避免链接器又去挑静态库。
-42. **`prefix` 就在 `build/x265-<abi>/` 里面，无条件 `rm -rf "$b"` 会把已安装产物一起删掉**。`build_x264()` / `build_x265()` 原先都在函数开头 `rm -rf "$b"; mkdir -p "$b"`，而 `resolve_external_codecs()` 传入的 prefix 恰是 `$b/prefix`。任何一次中断（Windows 上 x265 cmake+make 要十几分钟，常被取消）后重试，缓存检测 `[ -f "$prefix/lib/libx265.so" ]` 永远为假，于是又从头全量重编，表现就是「反复卡住」。现在只 `mkdir -p`，并加断点续跑：若 `CMakeCache.txt` + `libx265.so` 已存在，直接 stage 进 prefix 并返回，不再重编。
-43. **Windows 上 libavcodec 的链接行约 8.3 KB，超过 `cmd.exe` 的 8191 字符上限**。`libx265.o` 加入后参数尾部的 `-L/-l` 会被静默截断（日志里出现过半截的 `-pthre`），导致 x264/x265 符号 unresolved。解法两层：`ld-rsp.sh` 直接调原生 `clang.exe`（绕开 `.cmd` 批处理，CreateProcess 上限约 32 KB）并把参数写成 response file；`patch_ffmpeg_link_rsp()` 再改写 FFmpeg `ffbuild/library.mak` 的 shared 库链接规则，用 make 的 `$(file >$@.rsp,...)` 生成 rsp、以 `$(LD) @$@.rsp` 链接（`@` 不能漏，否则 lld 把 rsp 当普通目标文件）。另外 `build_c_shim()` 原先从 FFmpeg 的 `PREFIX/lib` 找 `libx265.so`，那里永远没有，dist 里于是长期残留旧桩；改为从 `X265_PREFIX/lib` 拷贝。
+40. **Android 版 x265 必须是真实动态库，不能用装载桩**。静态 archive 在本机 Windows/NDK 工具链下会省略 `api.cpp.o`（`x265_api_get_198` 就在里面），`-Wl,--undefined` 被 FFmpeg 的 version script 吃掉、`--whole-archive` 带来 compiler-rt 重复符号、直接加 `.o` 又在 libavformat 重复定义，`libavcodec.so` 于是留下未解析符号，Android 加载器拒绝加载。早期用 5 KB 的 `libx265.so` 桩加 `LD_PRELOAD` 骗过加载器——自检 11/11 全绿，但 HEVC 一次都没真编过，已废弃。现在的做法：x265 用 `-DENABLE_SHARED=ON` 编成 7.45 MB 真库（`-DANDROID_STL=c++_static` 静态嵌入 C++ 运行时；x265 的 CMakeLists 硬编码 `-lpthread` 而 bionic 的 pthread 在 libc 里，所以垫一个空的 `libpthread.a`），FFmpeg 以 `-lx265` 链上。判据是 `libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`、`x265_api_get_198` 保持 `UND` 交给加载器解析，真机自检实际编码出 `codec=hevc` 才算数。
+41. **浅克隆没有 git tag 时，x265 的 `make install` 什么都不装**。x265 `source/CMakeLists.txt` 把 shared 库和 `x265.pc` 的 install 规则都包在 `if(X265_LATEST_TAG)`（来自 `git describe`）里，`git_clone_robust` 用 `--depth 1` 克隆不带 tag，`git fetch --tags` 在本机也补不上。现象是 cmake+make 打印了 `[100%] Built target x265-shared`、真库就在构建目录里，`prefix/lib` 却是空的，FFmpeg configure 拿不到 `--enable-libx265`。现在由 `install_x265_artifacts()` 手动把 `libx265.so`、头文件和干净的 `x265.pc` 放进 prefix（x265 自己生成的 `.pc` 还带畸形 `Libs.private: -l-l:libunwind.a`），shared 模式下同时删掉同目录的 `libx265.a`，免得链接器又去挑静态库。
+42. **`prefix` 就在 `build/x265-<abi>/` 里，无条件 `rm -rf "$b"` 会把装好的产物一起删掉**。`build_x264()` / `build_x265()` 原先开头都是 `rm -rf "$b"; mkdir -p "$b"`，而传进来的 prefix 恰好是 `$b/prefix`。中断一次（Windows 上 x265 要编十几分钟，经常被取消）再重跑，缓存检查永远为假，于是每次从头全量重编，看起来就是「一直卡住」。现在只 `mkdir -p`，并加了断点续跑：`CMakeCache.txt` 和 `libx265.so` 都在就直接 stage 进 prefix 返回。
+43. **Windows 上 libavcodec 的链接行约 8.3 KB，超过 cmd.exe 的 8191 字符上限**。`libx265.o` 一进来，参数尾部的 `-L/-l` 就被静默截断（日志里出现过半截的 `-pthre`），x264/x265 符号全 unresolved。分两层解决：`ld-rsp.sh` 直接调原生 `clang.exe` 绕开 `.cmd` 批处理（CreateProcess 上限约 32 KB），参数写成 response file；`patch_ffmpeg_link_rsp()` 再改写 FFmpeg `ffbuild/library.mak` 的 shared 库链接规则，用 make 的 `$(file >$@.rsp,...)` 生成 rsp、以 `$(LD) @$@.rsp` 链接（`@` 不能漏，漏了 lld 把 rsp 当普通目标文件）。另外 `build_c_shim()` 原先从 FFmpeg 的 `PREFIX/lib` 找 `libx265.so`，那里永远没有，dist 里一直残留旧桩；改成从 `X265_PREFIX/lib` 拷。

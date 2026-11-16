@@ -64,3 +64,6 @@ Thumbs.db
 # Patch artifacts
 *.orig
 *.rej
+
+# Gradle build log written by scripts/run-android-app-selftest.sh
+/platforms/android/build-app.log

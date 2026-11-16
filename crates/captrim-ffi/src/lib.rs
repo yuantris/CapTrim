@@ -403,8 +403,7 @@ pub extern "C" fn captrim_engine_export_transcode(
             Some(cb) => unsafe { cb(value, user_data) == 0 },
             None => true,
         };
-        e.backend
-            .transcode(src, dst, filter, codec, &mut report)?;
+        e.backend.transcode(src, dst, filter, codec, &mut report)?;
         Ok(0)
     })
 }
