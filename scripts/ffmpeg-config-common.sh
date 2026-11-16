@@ -74,12 +74,18 @@ build_x264() {
     [ "$BUILD_X264" = "1" ] || return 0
     local abi="$1" cc="$2" cxx="$3" arch="$4" sysroot="$5" prefix="$6"
     local src="$X264_SRC"
+    # Reuse a completed install. The prefix lives INSIDE build/x264-<abi>/,
+    # so an unconditional `rm -rf "$b"` used to wipe the very artifact this
+    # check looks for and forced a full rebuild on every retry.
+    if [ -f "$prefix/lib/libx264.a" ] && [ -f "$prefix/lib/pkgconfig/x264.pc" ]; then
+        log "x264 already built -> $prefix"
+        return 0
+    fi
     if [ ! -d "$src" ]; then
         git_clone_robust https://code.videolan.org/videolan/x264.git "$src" "$X264_REF" \
             || log "x264 clone FAILED; continuing without libx264"
     fi
-    local b="${ROOT_DIR}/build/x264-${abi}"
-    rm -rf "$b"; mkdir -p "$b"
+    mkdir -p "$prefix"
     # The NDK clang lives at <dir>aarch64-linux-androidNN-clang; the binutils
     # counterparts (llvm-ar/llvm-strip/llvm-ranlib/llvm-strings) sit in the
     # same bin/ directory, all with the .exe suffix. For HarmonyOS the CC is a
@@ -129,19 +135,118 @@ SHIM
     fi
 }
 
-# Build static x265 for one ABI (cmake cross-build; may need tuning per NDK).
+# Stage x265 artifacts into its install prefix.
+# x265's CMakeLists wraps BOTH the shared-library install rule and the x265.pc
+# install rule in `if(X265_LATEST_TAG)` (derived from `git describe`).
+# git_clone_robust makes a --depth 1 clone with no tags, and `git fetch --tags`
+# does not reliably add any on this host either, so `make install` silently
+# installs headers + the static archive but NO libx265.so and NO x265.pc.
+# FFmpeg configure then drops --enable-libx265 entirely. Stage the artifacts
+# ourselves so the build works with a tag-less shallow clone.
+# Args: build_dir prefix shared src_dir
+install_x265_artifacts() {
+    local b="$1" prefix="$2" shared="$3" src="$4"
+    mkdir -p "$prefix/include" "$prefix/lib/pkgconfig" || return 1
+    if [ -f "$src/source/x265.h" ]; then
+        cp -f "$src/source/x265.h" "$prefix/include/" || return 1
+    fi
+    if [ -f "$b/x265_config.h" ]; then
+        cp -f "$b/x265_config.h" "$prefix/include/" || return 1
+    fi
+    if [ "$shared" = "ON" ]; then
+        # Android: install ONLY the real shared library. Leaving libx265.a on
+        # the same -L path can make the linker pick the archive, which drops
+        # api.cpp.o and leaves x265_api_get_198 unresolved in libavcodec.so.
+        [ -f "$b/libx265.so" ] || return 1
+        rm -f "$prefix/lib/libx265.a"
+        cp -L -f "$b/libx265.so" "$prefix/lib/libx265.so" || return 1
+    else
+        [ -f "$b/libx265.a" ] || return 1
+        cp -f "$b/libx265.a" "$prefix/lib/libx265.a" || return 1
+    fi
+    # Write a clean .pc: the generated one carries a malformed Libs.private
+    # (-l-l:libunwind.a) and is not installed at all when no tag exists.
+    local pc_prefix="$prefix"
+    command -v cygpath >/dev/null 2>&1 && pc_prefix="$(cygpath -m -- "$prefix")"
+    cat > "$prefix/lib/pkgconfig/x265.pc" <<EOF
+prefix=$pc_prefix
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${exec_prefix}/include
+
+Name: x265
+Description: H.265/HEVC video encoder
+Version: 3.4
+Libs: -L\${libdir} -lx265
+Cflags: -I\${includedir}
+EOF
+    return 0
+}
+
+# Build x265 for one ABI (cmake cross-build; may need tuning per NDK).
+# SHARED decides ENABLE_SHARED: Android needs a SHARED libx265.so, everything
+# else keeps the static archive.
 # Args: abi cc cxx arch sysroot prefix
 build_x265() {
     [ "$BUILD_X265" = "1" ] || return 0
     local abi="$1" cc="$2" cxx="$3" arch="$4" sysroot="$5" prefix="$6"
     local src="$X265_SRC"
+    # Reuse a completed install: cmake+make for x265 costs several minutes
+    # and occasionally hangs on the SVE assembly step under heavy -j. The
+    # required artifact depends on the mode: Android needs the SHARED .so,
+    # everything else the static archive.
+    local shared=OFF
+    case "$cc" in *android*) shared=ON ;; esac
+    if [ "$shared" = "ON" ] && [ -f "$prefix/lib/libx265.so" ] &&
+       [ -f "$prefix/lib/pkgconfig/x265.pc" ]; then
+        log "x265 already built (shared) -> $prefix"
+        return 0
+    fi
+    if [ "$shared" = "OFF" ] && [ -f "$prefix/lib/libx265.a" ]; then
+        log "x265 already built (static) -> $prefix"
+        return 0
+    fi
     if [ ! -d "$src" ]; then
         git_clone_robust https://github.com/videolan/x265.git "$src" "$X265_REF" \
             || log "x265 clone FAILED; continuing without libx265"
     fi
+    # x265's CMake installs x265-shared only when a git tag exists
+    # (X265_LATEST_TAG comes from `git describe`), but git_clone_robust makes
+    # a --depth 1 clone that carries no tags. Fetch them non-fatally or the
+    # shared build would compile yet silently install nothing.
+    ( cd "$src" && git fetch origin --tags --depth 1 >/dev/null 2>&1 ) \
+        || log "x265 tag fetch failed; shared library install may be skipped"
     local b="${ROOT_DIR}/build/x265-${abi}"
-    rm -rf "$b"; mkdir -p "$b"
+    # Never `rm -rf "$b"`: prefix IS "$b/prefix". Wiping the build dir also
+    # destroyed completed installs, so the cache check above could never fire
+    # after an interrupted run and every retry recompiled x265 from scratch.
+    mkdir -p "$b" "$prefix"
+    # Resume after an interrupted run: the compiled library often exists even
+    # though make install never ran (or installed nothing due to a missing git
+    # tag). Stage it directly instead of paying for another full cmake+make.
+    if [ -f "$b/CMakeCache.txt" ] && [ -f "$b/x265_config.h" ] && {
+           { [ "$shared" = "ON" ]  && [ -f "$b/libx265.so" ]; } ||
+           { [ "$shared" = "OFF" ] && [ -f "$b/libx265.a" ]; }
+       }; then
+        if install_x265_artifacts "$b" "$prefix" "$shared" "$src"; then
+            log "x265 installed from existing build -> $prefix"
+            return 0
+        fi
+        log "staging cached x265 artifacts failed; rebuilding"
+        rm -f "$b/CMakeCache.txt"
+    fi
     log "building x265 for ${abi}"
+    # Android links libx265 as a SHARED library. The static archive's api.cpp.o
+    # (which defines the versioned x265_api_get_198 accessor FFmpeg calls) is
+    # skipped by this host's archive linker, leaving libavcodec.so with an
+    # undefined symbol the Android loader rejects. Every way to force the
+    # object in (--undefined is eaten by FFmpeg's version script, --whole-
+    # archive duplicates compiler-rt symbols, a direct .o duplicates it again
+    # in libavformat) breaks somewhere else. A shared libx265.so carries its
+    # own SONAME dependency, which the Android loader resolves normally.
+    local shared=OFF
+    case "$cc" in *android*) shared=ON ;; esac
+    log "x265 ENABLE_SHARED=$shared for ${abi}"
     # On Windows cmake defaults to the NMake generator (needs nmake, absent) and
     # can't identify the NDK clang, so force Unix Makefiles + the platform's
     # cmake toolchain file (X265_CMAKE_TOOLCHAIN) when provided.
@@ -182,10 +287,24 @@ build_x265() {
     local cmake_flags=(
         -G "Unix Makefiles"
         -DCMAKE_BUILD_TYPE=Release
-        -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_PIC=ON
+        -DENABLE_SHARED=$shared -DENABLE_CLI=OFF -DENABLE_PIC=ON
         -DENABLE_ASSEMBLY=OFF
         -DCMAKE_INSTALL_PREFIX="$prefix"
     )
+    if [ "$shared" = "ON" ]; then
+        # The Android NDK/bionic has no libpthread: pthread symbols live in
+        # libc. x265's CMakeLists unconditionally appends `pthread` to
+        # PLATFORM_LIBS for UNIX-like targets (Android included), so the
+        # shared-library link fails with "unable to find library -lpthread".
+        # Ship an EMPTY static archive on the link path: -lpthread resolves to
+        # an archive with no members, nothing is pulled in and libx265.so
+        # carries no bogus NEEDED entry — bionic's libc provides the real
+        # pthread_* symbols at runtime.
+        local shims="${ROOT_DIR}/build/_shims/android-nostl"
+        mkdir -p "$shims"
+        [ -f "$shims/libpthread.a" ] || "${llvm_dir}llvm-ar.exe" rc "$shims/libpthread.a"
+        cmake_flags+=(-DCMAKE_SHARED_LINKER_FLAGS="-L${shims}")
+    fi
     if [ -n "$tc" ]; then
         cmake_flags+=(-DCMAKE_TOOLCHAIN_FILE="$tc" $extra)
     else
@@ -201,11 +320,17 @@ build_x265() {
         )
     fi
     if ( cd "$b" && cmake "$src/source" "${cmake_flags[@]}" && \
-         make -j"$JOBS" && make install ); then
-        log "x265 built -> $prefix"
+         make -j"$JOBS" ); then
+        log "x265 compiled -> $b"
+        # make install is best-effort: its shared-library and .pc rules are
+        # gated on X265_LATEST_TAG, which a shallow clone does not have.
+        ( cd "$b" && make install ) \
+            || log "x265 make install incomplete (no git tag?); staging manually"
     else
         log "x265 build FAILED; continuing without libx265"
     fi
+    install_x265_artifacts "$b" "$prefix" "$shared" "$src" \
+        || log "x265 artifacts not staged; FFmpeg will build without libx265"
 }
 
 # Build (or skip) the external codecs and accumulate FFmpeg configure flags.
@@ -437,4 +562,14 @@ build_c_shim() {
         [ -e "$lib" ] || continue
         cp -a "$lib" "$out_dir/"
     done
+
+    # External codecs: Android ships the REAL libx265.so. X265_PREFIX is set
+    # by resolve_external_codecs() for the current ABI; FFmpeg's own PREFIX
+    # only holds libav*/libsw* libs, so searching it here always found nothing
+    # and left an old 5 KB placeholder in dist. Copy by SONAME (libx265.so —
+    # a tag-less build has no versioned suffix). OHOS builds x265 static-only,
+    # so its prefix has no .so and nothing is copied there.
+    if [ -n "${X265_PREFIX:-}" ] && [ -e "${X265_PREFIX}/lib/libx265.so" ]; then
+        cp -L -f "${X265_PREFIX}/lib/libx265.so" "$out_dir/libx265.so"
+    fi
 }

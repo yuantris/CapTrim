@@ -14,7 +14,145 @@ export PATH="${ROOT_DIR}/scripts:$PATH"
 
 # FFmpeg's configure writes temp test files under TMPDIR; the default Windows
 # path with backslashes gets mangled, so point it at Git Bash's /tmp.
-export TMPDIR=/tmp
+# Recipes (and the ld response-file shim) may also run under the copied POSIX
+# shell, whose root differs from Git Bash's: an MSYS-style /tmp path would
+# resolve against the WRONG root there, so hand every consumer a Windows path.
+export TMPDIR="$(cygpath -m -- "${TMPDIR:-/tmp}")"
+
+# Windows cmd.exe caps a single BATCH invocation at 8191 characters. FFmpeg
+# invokes its linker — the aarch64-*-clang.cmd batch wrapper — with the full
+# object list, and libavcodec's line crosses that limit (~8.3 KB) once
+# libx265.o joins it; cmd.exe then dies with "命令行太长" (command line too
+# long), which is the root cause of the flaky libavcodec/libavformat link
+# failures in earlier build attempts. This shim funnels the whole command
+# into a response file and calls the real driver through @file, so the
+# process command line stays tiny. FFmpeg uses it via --ld below.
+LD_RSP="${ROOT_DIR}/build/_shims/ld-rsp.sh"
+mkdir -p "$(dirname "$LD_RSP")"
+cat > "$LD_RSP" <<'WRAP'
+#!/bin/sh
+# Route a potentially huge linker command through a response file.
+# CAPTRIM_LD_CC_EXE must point at the native clang.exe and
+# CAPTRIM_LD_TARGET at the triple (e.g. aarch64-linux-android26).
+#
+# Two Windows quirks are worked around here:
+# 1. cmd.exe caps a BATCH invocation at 8191 characters and the native
+#    make.exe funnels recipes through it; FFmpeg's libavcodec link line is
+#    ~8.3 KB once libx265.o joins it, so the tail of the argument list
+#    silently disappeared ("-pthre" was a clipped "-pthread"). We call
+#    clang.exe DIRECTLY — a native executable, CreateProcess-limited
+#    (~32 KB) — and inject the --target the .cmd wrapper would have added.
+#    (build-ffmpeg-android.sh additionally rewrites FFmpeg's shared-library
+#    link rule to hand the object list over as an @rsp file, so no recipe
+#    line is long in the first place.)
+# 2. When arguments travel on a real command line, the MSYS runtime
+#    silently rewrites POSIX-style paths (/c/Users/..., /tmp/...) into
+#    Windows form for native executables. Arguments inside a response file
+#    get NO such treatment, so every path-bearing argument shape (bare
+#    path, -L/-I/-R/-F<path>, --sysroot=<path>) is converted with cygpath.
+# Arguments that are ALREADY @response files pass through verbatim.
+: "${CAPTRIM_LD_CC_EXE:?CAPTRIM_LD_CC_EXE must point at clang.exe}"
+: "${CAPTRIM_LD_TARGET:?CAPTRIM_LD_TARGET must be the target triple}"
+conv() {
+    case "$1" in
+        /*)
+            cygpath -m -- "$1" 2>/dev/null || printf '%s' "$1" ;;
+        -[LIRF]/*)
+            rest="${1#-[LIRF]}"
+            printf '%s%s' "${1%"$rest"}" "$(cygpath -m -- "$rest" 2>/dev/null || printf '%s' "$rest")" ;;
+        --sysroot=/*)
+            rest="${1#--sysroot=}"
+            printf '%s%s' "--sysroot=" "$(cygpath -m -- "$rest" 2>/dev/null || printf '%s' "$rest")" ;;
+        *)
+            printf '%s' "$1" ;;
+    esac
+}
+rsp="$(mktemp "${TMPDIR:-/tmp}/captrim-ld-XXXXXX")"
+rspw="$rsp"
+if command -v cygpath >/dev/null 2>&1; then
+    # clang.exe is native: hand it a Windows path, it cannot open /tmp/...
+    rspw="$(cygpath -m -- "$rsp")"
+fi
+at_args=""
+for arg in "$@"; do
+    case "$arg" in
+        # Already a response file: clang expands @args found INSIDE a
+        # response file (nested expansion, verified with this NDK), so
+        # embedding it verbatim is safe. Quoting tricks (re-parsing quote
+        # characters from an expanded variable) are NOT: POSIX shells treat
+        # quotes in expanded values as data, and the quotes then leak into
+        # the argument and clang/lld stop recognizing the @.
+        @*) printf '%s\n' "$arg" ;;
+        *" "*|*'"'*|*'&'*|*'|'*) printf '"%s"\n' "$(conv "$arg")" ;;
+        *) printf '%s\n' "$(conv "$arg")" ;;
+    esac
+done > "$rsp"
+"$CAPTRIM_LD_CC_EXE" "--target=$CAPTRIM_LD_TARGET" "@$rspw"
+rc=$?
+rm -f "$rsp"
+exit $rc
+WRAP
+chmod +x "$LD_RSP"
+
+# Native make.exe cannot resolve "/bin/sh" and silently falls back to
+# cmd.exe — which TRUNCATES recipe lines longer than 8191 characters. That
+# cut FFmpeg's ~8.3 KB libavcodec link line mid-token ("-pthre") before it
+# ever reached the response-file shim above. Give make a real POSIX shell at
+# a space-free Windows path: a copied sh.exe, because Git Bash's own sh.exe
+# lives under "C:\Program Files\Git", which make's CreateProcess cannot
+# split correctly.
+MSYS_SH="${ROOT_DIR}/build/_shims/shbin/sh.exe"
+if [ ! -f "$MSYS_SH" ]; then
+    mkdir -p "$(dirname "$MSYS_SH")"
+    cp /usr/bin/sh.exe "$MSYS_SH"
+    cp /usr/bin/msys-2.0.dll "$(dirname "$MSYS_SH")/msys-2.0.dll"
+fi
+export CAPTRIM_MAKE_SHELL="$(cygpath -m -- "$MSYS_SH")"
+# Pass the linker as "sh.exe ld-rsp.sh" so the recipe never relies on the
+# script's shebang resolution either.
+export CAPTRIM_LD_CMD="$(cygpath -m -- "$LD_RSP")"
+ld_invoke() { printf '%s %s' "$CAPTRIM_MAKE_SHELL" "$CAPTRIM_LD_CMD"; }
+
+# Windows: recipe lines are truncated at ~8 KB regardless of which shell
+# make spawns (the native NDK make.exe funnels every recipe through
+# cmd.exe), and libavcodec's shared-library link line is ~8.3 KB once
+# libx265.o joins the object list — the tail of the argument list (the
+# -L/-l flags!) silently disappeared, leaving x264/x265 symbols unresolved.
+# FFmpeg's shared-library link rule is the only place with such a huge
+# line: rewrite it to emit an @rsp file via make's $(file ) function
+# (expanded inside make, immune to OS limits) and link through "@rsp".
+# Idempotent: a second run detects the patch and skips it.
+patch_ffmpeg_link_rsp() {
+    local mak="${FFMPEG_SRC}/ffbuild/library.mak"
+    if grep -q '\$LD) @\$\$@\.rsp' "$mak" 2>/dev/null; then
+        log "library.mak already patched for @rsp linking"
+        return 0
+    fi
+    python - "$mak" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', newline='').read()
+inline = ('\t$$(LD) $(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+          '$$(filter %.o,$$^) $(FFEXTRALIBS)\n\t$(SLIB_EXTRA_CMD)\n')
+rsp_noflag = ('\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+              '$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
+              '\t$$(LD) $$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
+rsp_ok = ('\t$$(file >$$@.rsp,$(SHFLAGS) $(LDFLAGS) $(LDSOFLAGS) $$(LD_O) '
+          '$$(filter %.o,$$^) $(FFEXTRALIBS))\n'
+          '\t$$(LD) @$$@.rsp\n\t$(SLIB_EXTRA_CMD)\n')
+if rsp_ok in s:
+    print('[captrim] library.mak already patched for @rsp linking')
+    sys.exit(0)
+if inline in s:
+    s = s.replace(inline, rsp_ok, 1)
+elif rsp_noflag in s:
+    s = s.replace(rsp_noflag, rsp_ok, 1)
+else:
+    raise SystemExit('library.mak shared-library link rule not recognized')
+open(p, 'w', encoding='utf-8', newline='').write(s)
+print('[captrim] library.mak patched: shared-library links via @rsp file')
+PYEOF
+}
 
 need_env ANDROID_NDK_HOME
 
@@ -76,18 +214,29 @@ for ABI in $ABIS; do
     CC="${TOOLCHAIN}/bin/${TRIPLE}${ANDROID_API}-clang.cmd"
     CXX="${TOOLCHAIN}/bin/${TRIPLE}${ANDROID_API}-clang++.cmd"
     [ -f "$CC" ] || die "missing compiler: $CC"
+    # The ld-rsp.sh shim calls the native clang.exe directly (no cmd.exe in
+    # the chain) and injects the --target the .cmd wrapper would have added.
+    export CAPTRIM_LD_CC_EXE="${TOOLCHAIN}/bin/clang.exe"
+    export CAPTRIM_LD_TARGET="aarch64-linux-android${ANDROID_API}"
+    [ "$ARCH" != "aarch64" ] && export CAPTRIM_LD_TARGET="${ARCH}-linux-android${ANDROID_API}"
 
     SYSROOT="${TOOLCHAIN}/sysroot"
-    # x265 cross-build: use the NDK's official cmake toolchain file so cmake can
-    # identify the Clang compiler and target the right ABI.
-    export X265_CMAKE_TOOLCHAIN="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"
-    export X265_CMAKE_EXTRA="-DANDROID_ABI=${ABI} -DANDROID_PLATFORM=android-${ANDROID_API}"
-    resolve_external_codecs "$ABI" "$CC" "$CXX" "$ARCH" "$SYSROOT"
-
-    # x265 is a C++ static archive; FFmpeg's link test for it needs the C++
-    # runtime resolvable. The NDK provides libc++/libc++abi; -ldl/-lm cover the
+    # x265 is a C++ library; FFmpeg's link test for it needs the C++ runtime
+    # resolvable. The NDK provides libc++/libc++abi; -ldl/-lm cover the
     # rest of x265's private deps. (Set FFMPEG_EXTRA_LIBS to override.)
+    # libx265 is built as a SHARED library for Android (see build_x265 in
+    # ffmpeg-config-common.sh): the static archive leaves x265_api_get_198
+    # undefined in libavcodec.so on this host's toolchain, and every way to
+    # force the object in breaks the configure probe or duplicate symbols.
+    # Keep FFMPEG_EXTRA_LIBS free of link flags: configure uses it for its own
+    # probes but does not carry it into EXTRALIBS-avcodec.
     FFMPEG_EXTRA_LIBS="${FFMPEG_EXTRA_LIBS:--lc++ -lc++abi -ldl -lm}"
+
+    # Single shared C++ library: embed libc++ statically into libx265.so so
+    # no extra libc++_shared.so needs shipping (the C API never throws).
+    export X265_CMAKE_TOOLCHAIN="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"
+    export X265_CMAKE_EXTRA="-DANDROID_ABI=${ABI} -DANDROID_PLATFORM=android-${ANDROID_API} -DANDROID_STL=c++_static"
+    resolve_external_codecs "$ABI" "$CC" "$CXX" "$ARCH" "$SYSROOT"
 
     BUILD="${ROOT_DIR}/build/ffmpeg-android/${ABI}"
     PREFIX="${BUILD}/prefix"
@@ -101,14 +250,20 @@ for ABI in $ABIS; do
         --arch="$ARCH"
         --cpu="$CPU"
         --enable-cross-compile
-        --cc="$CC"
-        --cxx="$CXX"
-        --host-cc="$HOSTCC"
-        --nm="${TOOLCHAIN}/bin/llvm-nm.exe"
-        --ar="${TOOLCHAIN}/bin/llvm-ar.exe"
-        --ranlib="${TOOLCHAIN}/bin/llvm-ranlib.exe"
-        --strip="${TOOLCHAIN}/bin/llvm-strip.exe"
-        --sysroot="${TOOLCHAIN}/sysroot"
+        # Tool COMMANDS must be in Windows form: the recipes run under the
+        # copied POSIX shell (CAPTRIM_MAKE_SHELL), whose standalone msys
+        # runtime cannot resolve /c/, /d/... command paths. ARGUMENT paths
+        # are auto-converted by the msys runtime when it spawns a native
+        # process, so flags like --sysroot=/d/... may stay as they are.
+        --cc="$(cygpath -m -- "$CC")"
+        --cxx="$(cygpath -m -- "$CXX")"
+        --ld="$(ld_invoke)"
+        --host-cc="$(cygpath -m -- "$HOSTCC")"
+        --nm="$(cygpath -m -- "${TOOLCHAIN}/bin/llvm-nm.exe")"
+        --ar="$(cygpath -m -- "${TOOLCHAIN}/bin/llvm-ar.exe")"
+        --ranlib="$(cygpath -m -- "${TOOLCHAIN}/bin/llvm-ranlib.exe")"
+        --strip="$(cygpath -m -- "${TOOLCHAIN}/bin/llvm-strip.exe")"
+        --sysroot="$(cygpath -m -- "${TOOLCHAIN}/sysroot")"
     )
     CFG+=(
         ${FFMPEG_EXTRA_ENABLE:-}
@@ -122,10 +277,36 @@ for ABI in $ABIS; do
     log "configure FFmpeg for ${ABI} (API ${ANDROID_API})"
     ( cd "$BUILD" && "$FFMPEG_SRC/configure" "${CFG[@]}" )
     fix_ffmpeg_generated_paths "$BUILD"
-    make -C "$BUILD" -j"$JOBS"
-    make -C "$BUILD" install
+    patch_ffmpeg_link_rsp
+    make -C "$BUILD" -j"$JOBS" SHELL="$CAPTRIM_MAKE_SHELL"
+    make -C "$BUILD" install SHELL="$CAPTRIM_MAKE_SHELL"
 
-    build_c_shim "$OUT" "$CC"
+    # Link the Android hardware first/last mile into the same shim. Without
+    # this file the weak factories resolve to NULL and the pipeline runs
+    # fully in software (the pre-AMediaCodec baseline).
+    build_c_shim "$OUT" "$CC" \
+        "${ROOT_DIR}/native/captrim_android_hw.c" \
+        -lmediandk -llog
+
+    # Guard: libavcodec.so must not carry an x265 symbol it cannot resolve at
+    # runtime. With the shared libx265.so the versioned symbol is expected to
+    # stay UND in the dynamic table (the loader resolves it from the
+    # dependency), so only a missing NEEDED entry — with an x265 reference
+    # still present — means the link went wrong.
+    if "${TOOLCHAIN}/bin/llvm-readelf.exe" -d "$OUT/libavcodec.so" 2>/dev/null | grep -q 'NEEDED.*libx265.so'; then
+        log "libavcodec.so links against shared libx265.so"
+    elif "${TOOLCHAIN}/bin/llvm-nm.exe" -D "$OUT/libavcodec.so" 2>/dev/null | grep -q 'x265_api_get_198'; then
+        die "libavcodec.so references x265 but has no libx265.so dependency"
+    else
+        log "libavcodec.so carries no x265 dependency (x265 disabled?)"
+    fi
+    # An early experiment shipped a 5 KB placeholder libx265.so plus LD_PRELOAD
+    # so the loader saw a fake x265_api_get_198. Reject any non-real build:
+    # a genuine x265 shared library is several MB on arm64.
+    x265_size="$(stat -c %s "$OUT/libx265.so" 2>/dev/null || echo 0)"
+    [ "$x265_size" -gt 1000000 ] \
+        || die "dist libx265.so is not a real x265 build (${x265_size} bytes)"
+    log "dist libx265.so is a real ${x265_size}-byte shared library"
     write_build_receipt "$OUT" "$FFMPEG_SRC/configure" "${CFG[@]}"
     log "Android ${ABI} artifacts -> ${OUT}"
 done

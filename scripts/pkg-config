@@ -57,6 +57,10 @@ fi
 # Parse the .pc: capture both `key=value` and `key: value` lines.
 declare -A V
 while IFS= read -r line; do
+    # x265's CMake installs .pc files with CRLF on Windows. A trailing CR
+    # makes `-L<libdir>` point at a nonexistent directory, so the library is
+    # silently not linked and leaves undefined symbols in libavcodec.so.
+    line="${line%$'\r'}"
     line="${line%%#*}"                       # strip comments
     [ -z "$line" ] && continue
     if [[ "$line" == *=* ]]; then
