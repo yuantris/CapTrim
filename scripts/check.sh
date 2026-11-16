@@ -8,7 +8,9 @@
 # discipline, it is one command that cannot be run partially.
 #
 # What it does NOT cover (no DevEco NDK or device here): the NAPI/HAR/HAP build
-# and anything that needs a real decoder. CI does not cover those either.
+# and anything that needs a real decoder. CI does not cover those either. The
+# Android FFmpeg check is a type-check, not a link: dist/ is generated and not
+# checked in, so only the on-device native self-test proves the real link.
 #
 # Usage:
 #   bash scripts/check.sh          # everything
@@ -55,6 +57,16 @@ if [ "$FAST" -eq 0 ]; then
         echo "[captrim] skipped: target aarch64-unknown-linux-ohos not installed"
         echo "[captrim]   rustup target add aarch64-unknown-linux-ohos"
     fi
+fi
+
+step "check FFmpeg backend for Android arm64"
+# Same command as the CI job. Needs the Rust target but neither an NDK nor the
+# generated FFmpeg libraries, because cargo check does not invoke the linker.
+if rustup target list --installed | grep -qx 'aarch64-linux-android'; then
+    cargo check -p captrim-ffi --features ffmpeg --target aarch64-linux-android
+else
+    echo "[captrim] skipped: target aarch64-linux-android not installed"
+    echo "[captrim]   rustup target add aarch64-linux-android"
 fi
 
 printf '\n[captrim] all gates passed\n'

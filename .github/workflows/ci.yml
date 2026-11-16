@@ -52,14 +52,41 @@ jobs:
       - name: Cross-check core for HarmonyOS arm64
         run: cargo check -p captrim-core --target aarch64-unknown-linux-ohos
 
-  # The AAR can only be built where an Android SDK/NDK exists. It is not
-  # verified on the machine this repository was bootstrapped from, so it starts
-  # as non-blocking: flip `continue-on-error` to false once the first green run
-  # confirms the NDK/AGP versions below.
-  android:
-    name: Android AAR (provisional)
+  # The shipped AAR uses the FFmpeg backend, but `dist/` is generated and never
+  # checked in, so CI cannot link against libcaptrim_ffmpeg.so. `cargo check`
+  # type-checks the whole feature on the Android target without a linker, which
+  # catches cfg/API drift in the Rust side. Real linking stays covered by the
+  # on-device native self-test (scripts/run-android-selftest.sh).
+  android-ffmpeg:
+    name: Android arm64 FFmpeg backend (type-check)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ffmpeg-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check FFmpeg backend for Android arm64
+        run: cargo check -p captrim-ffi --features ffmpeg --target aarch64-linux-android
+
+  # The stub-backend AAR is the integration baseline: it needs an NDK/AGP but
+  # no generated FFmpeg libraries. Run #11 was the first green run with the
+  # toolchain versions pinned below, so this job is now blocking.
+  android:
+    name: Android AAR (stub backend)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

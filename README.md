@@ -109,12 +109,12 @@ scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验�
 
 ## 四、快速开始
 
-前置：Rust（含 `rustup target add aarch64-unknown-linux-ohos`）。
+前置：Rust（含 `rustup target add aarch64-unknown-linux-ohos aarch64-linux-android`）。
 
 **1. 只验证核心逻辑（不需要任何移动端环境）**
 
 ```bash
-bash scripts/check.sh           # 本地把 CI 的每一关按同样顺序跑一遍
+bash scripts/check.sh           # 本地把 CI 的每一关（除需要 NDK/Gradle 的 AAR 构建）按同样顺序跑一遍
 ```
 
 单独跑某一步时：
@@ -348,6 +348,7 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
 | `check-native-abi.sh` | ✅ 通过 | 27 个 C 函数、31 个 NAPI 函数，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
+| `captrim-ffi/ffmpeg` → Android arm64 | ✅ 类型检查通过 | `cargo check -p captrim-ffi --features ffmpeg --target aarch64-linux-android`，CI 独立 job 与 `check.sh` 同一命令；不链接（dist/ 不入仓库），真实链接由真机 native 自检覆盖 |
 | `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，27 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
 | `libcaptrim.so`（ffmpeg feature）双端链接 | ✅ 通过 | OHOS + Android 双端：`libcaptrim.so` → NEEDED `libcaptrim_ffmpeg.so`（OHOS 另 NEEDED `libc.so`；Android 另 NEEDED `libdl.so`+`libc.so`）；FFI 符号 `ct_ff_probe`/`ct_ff_remux`/`ct_ff_transcode`/`ct_ff_string_free` 由 shim 导出并被 cdylib 引用；`platforms/<os>/captrim/{libs,jniLibs}/arm64-v8a` 已暂存全部动态库 |
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK；依赖仅 `libcaptrim.so` / `libace_napi.z.so` / `libc.so` |
@@ -451,7 +452,7 @@ PASS 硬编产物可被 FFmpeg 软解（pipeline_hw.mp4） | FFmpeg 软解→重
 
 推 sample 进 App 沙箱不能把 `adb shell` 当管道用：多参数会被设备 shell 重新解析，`>` 会落在错误的目录，stdin 转发 21 MB 还会被截断到几百字节。可靠做法是 `adb push` 到 `/data/local/tmp`，再在设备内 `cat ... | run-as ... sh -c 'cat > files/a.mp4'`，`scripts/run-android-app-selftest.sh` 里就是这么做的。
 
-CI 的 android job 会打 AAR，见 `.github/workflows/ci.yml`。
+CI 有两个 Android job：`android` 打 stub 后端 AAR（已去掉 `continue-on-error`，失败即红），`android-ffmpeg` 用 `cargo check` 检查 FFmpeg 后端在 Android arm64 上的类型正确性（不链接）；见 `.github/workflows/ci.yml`。
 
 ## 九、许可与专利
 
