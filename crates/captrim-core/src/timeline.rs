@@ -2,7 +2,7 @@
 //! which is the entire undo/redo mechanism.
 
 use crate::error::{Error, Result};
-use crate::model::{Clip, Id, Timeline, Track, TrackKind};
+use crate::model::{Clip, Id, Timeline, Track, TrackKind, Transition};
 use crate::time::Rational;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,13 @@ pub enum Command {
     SetTransform {
         clip_id: Id,
         transform: crate::model::Transform,
+    },
+    /// Attach (`Some`) or clear (`None`) the dissolve at a clip's start.
+    /// The cut does not have to have a predecessor yet — a lone clip simply
+    /// fades in from black, and a later neighbour turns it into a dissolve.
+    SetTransition {
+        clip_id: Id,
+        transition: Option<Transition>,
     },
     RemoveTrack {
         track_id: Id,
@@ -139,6 +146,18 @@ impl Timeline {
                 right.id = new_id;
                 right.in_us = source_at;
                 right.start_us = *at_us;
+                // A dissolve belongs to the cut at the clip's start: the right
+                // half opens a fresh cut of its own, and the left half keeps
+                // the window only while it still has room for it. Splitting
+                // inside the window would leave a fade longer than the half
+                // that owns it, so the dissolve is dropped rather than
+                // failing the whole split.
+                right.transition_in = None;
+                if let Some(transition) = &original.transition_in {
+                    if *at_us <= original.start_us.saturating_add(transition.duration_us) {
+                        track.clips[idx].transition_in = None;
+                    }
+                }
                 track.clips[idx].out_us = source_at;
                 track.clips.insert(idx + 1, right.clone());
                 Ok(Some(right.id))
@@ -215,6 +234,16 @@ impl Timeline {
                 }
                 let clip = find_clip_mut(self, *clip_id)?;
                 clip.transform = transform.clone();
+                clip.validate()?;
+                Ok(None)
+            }
+
+            Command::SetTransition {
+                clip_id,
+                transition,
+            } => {
+                let clip = find_clip_mut(self, *clip_id)?;
+                clip.transition_in = *transition;
                 clip.validate()?;
                 Ok(None)
             }
@@ -554,5 +583,102 @@ mod tests {
         let restored = Editor::from_draft(&json).unwrap();
         assert_eq!(restored.timeline(), e.timeline());
         assert_eq!(restored.timeline().version, DRAFT_VERSION);
+    }
+
+    #[test]
+    fn set_transition_attaches_clears_and_rejects_bad_windows() {
+        use crate::model::{Transition, TransitionKind};
+        let (mut e, media, track) = seeded();
+        let clip_id = e
+            .apply(&Command::InsertClip {
+                track_id: track,
+                clip: Clip::new(media, 0, 4_000_000, 0),
+            })
+            .unwrap()
+            .unwrap();
+        let fade = Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 1_000_000,
+        };
+        e.apply(&Command::SetTransition {
+            clip_id,
+            transition: Some(fade),
+        })
+        .unwrap();
+        assert_eq!(e.timeline().tracks[0].clips[0].transition_in, Some(fade));
+
+        // The JSON bridge is the format platforms actually send.
+        e.apply_json(&format!(
+            r#"{{"type":"set_transition","clip_id":{clip_id},"transition":null}}"#
+        ))
+        .unwrap();
+        assert!(e.timeline().tracks[0].clips[0].transition_in.is_none());
+        assert!(e.undo(), "clearing a transition is an undoable step");
+        assert_eq!(e.timeline().tracks[0].clips[0].transition_in, Some(fade));
+
+        // A window longer than the clip it sits on would push the ramp past
+        // the clip's own end, so it is rejected without mutating the draft.
+        let before = e.timeline().clone();
+        let err = e.apply(&Command::SetTransition {
+            clip_id,
+            transition: Some(Transition {
+                kind: TransitionKind::Fade,
+                duration_us: 9_000_000,
+            }),
+        });
+        assert!(err.is_err());
+        assert_eq!(*e.timeline(), before);
+    }
+
+    #[test]
+    fn split_keeps_a_dissolve_only_while_the_left_half_still_fits_it() {
+        use crate::model::{Transition, TransitionKind};
+        let (mut e, media, track) = seeded();
+        let clip_id = e
+            .apply(&Command::InsertClip {
+                track_id: track,
+                clip: Clip::new(media, 0, 6_000_000, 0),
+            })
+            .unwrap()
+            .unwrap();
+        e.apply(&Command::SetTransition {
+            clip_id,
+            transition: Some(Transition {
+                kind: TransitionKind::Fade,
+                duration_us: 1_000_000,
+            }),
+        })
+        .unwrap();
+
+        // Split after the window: the left half still owns the whole dissolve.
+        let right = e
+            .apply(&Command::SplitClip {
+                clip_id,
+                at_us: 5_000_000,
+            })
+            .unwrap()
+            .unwrap();
+        let parts = &e.timeline().tracks[0].clips;
+        assert!(parts[0].transition_in.is_some());
+        assert!(
+            parts[1].transition_in.is_none(),
+            "right half opens a new cut"
+        );
+        assert_eq!(parts[1].id, right);
+
+        // Split inside the window: the left half would end up shorter than
+        // its own fade, so the dissolve is dropped rather than failing the
+        // whole split.
+        e.apply(&Command::SplitClip {
+            clip_id,
+            at_us: 500_000,
+        })
+        .unwrap();
+        let parts = &e.timeline().tracks[0].clips;
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].transition_in.is_none());
+        assert!(parts[1].transition_in.is_none());
+        assert!(parts[2].transition_in.is_none());
+        assert_eq!(e.timeline().duration_us(), 6_000_000);
     }
 }

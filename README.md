@@ -332,6 +332,16 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 `captrim_engine_export_plan()` 把整份计划作为 `ExportPlan` JSON 返回，Android Kotlin/JNI 和鸿蒙 Node-API/ArkTS 都暴露了同名入口。导出器可以先拉一次计划、缓存解码器，再按段推进；`plan_frame_at_index()` 仍是逐帧复核的唯一真相，两者的活跃源集合由同一组测试约束。
 
+### 转场：Fade 交叉溶解
+
+模型上转场是切入片段自己的属性：`Clip.transition_in: Option<Transition{kind, duration_us}>`（`Option` 缺省为硬切，`#[serde(default)]` 让旧草稿照常解析），配套 `set_transition` 命令（`transition: null` 即清除）。转场窗是**切入片起始处的半开区间** `[start, start + d)`，窗口长必须为正且短于片段本身。
+
+窗口内的排布只有一条派生规则：**同轨相邻前驱的视频延长到 `end + d`**（`video_extension_us` 按「下一片段 start == 本片段 end 且带 transition」推导），源时间越过 `out_us` 后由 `clamp_source_us` 冻结在最后一帧；前驱 opacity 恒 1，切入片 opacity 从 0 线性升到 1，绘制序按 `(z, start_us, clip_id)` 让前驱垫底——合成结果恰好是 `B·u + A·(1-u)`，前驱若也渐变会二次衰减成 `A(1-u)²`。无前驱（首片段或空隙）时同一段 ramp 就是从黑淡入；邻接关系一消失（Move/Trim/Remove 都不用知道转场的存在）规则自动降级，草稿永远不会因为转场而加载失败。
+
+选「窗口在切入片之内」而不是之前：片段位置、时长、split 语义全部不动，总时长不变，代价是前驱被多画 `d` 长（冻结帧）。音频 v1 刻意**硬切**：`plan_audio_at` 走 `contains`，前驱声音在切点准时结束、切入片满音量进入，避免冻结帧配持续出声的直流感；转场期音频交叉渐变留作后续项。`SplitClip` 里右半恒清转场（它开的是新切点），左半只有在窗放得下时才保留，放不下就丢弃转场而不是让整个 split 失败。
+
+导出侧把同一窗口翻译成段边界（窗末多切一刀），`ExportVideoItem` 新增 `opacity_start` / `opacity_end`（serde 缺省 1.0），段内按帧号线性插值。两端数学上同源：预览是 `(t - start)/d`，导出是两个端点的 lerp，而 PTS 对帧索引是线性的，所以逐帧相等（测试里只留 1e-6 的 f32 舍入余量）。**零 ABI 变更、零 FFmpeg filter 白名单变更、GL 合成器零改动**——`opacity` 管道在 P1 就已铺到着色器。
+
 ## 七、已完成 / 未完成
 
 **已完成**
@@ -342,6 +352,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 - 稳定 C ABI（30 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
 - FFmpeg 后端（`libavformat` 探测/remux、`libavfilter`+`libswscale` 复杂剪辑、`libavcodec`/`libx264`/`libx265` 软编解兜底）+ 特征门控（无 `ffmpeg` feature 时返回 `NO_BACKEND` 而非崩溃）
 - `ExportPlan` / `Segment`：帧对齐导出分段、段内稳定源集合、有理数速度与精确源时间换算，双端已暴露
+- 转场 Fade 交叉溶解：`set_transition` 命令 + 切入片起始的窗口，前驱视频派生延长（冻结帧）、切入片 opacity ramp、绘制序 `(z, start_us, clip_id)`；导出翻译成段边界 + `opacity_start/opacity_end`，与预览逐帧同源；音频 v1 硬切
 - P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - P2 音频预览：`plan_audio_at` 按原始时间规划音频（不吸附帧栅格）、native 混音器统一 48kHz/立体声/f32、鸿蒙 `OH_AudioRenderer` 输出并把真实播放位置回灌主时钟、播放态 hold-and-present 压住超前解码帧
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
@@ -353,7 +364,8 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 **未完成（按优先级）**
 
-- 补滤镜/转场/字幕渲染、图片与贴纸图层（P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
+- 补滤镜、字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
+- 转场后续：转场期音频交叉渐变（v1 刻意硬切）、更多转场类型（擦除/推拉等，复用同一窗口模型）、前驱素材越出裁剪点时用 handle material 代替冻结帧
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
 
@@ -365,9 +377,9 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 102 通过 | core 单元 68（含 P2 音频规划 2、ExportPlan 8）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16；ExportPlan 8 项本轮新增 |
+| `cargo test --workspace` | ✅ 113 通过 | core 单元 79（含 P2 音频规划 2、ExportPlan 10、转场 11）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16；转场 11 项本轮新增 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
-| `ExportPlan` / `Segment` | ✅ 8 项通过 | 帧对齐边界、相邻片段/空洞/NTSC、变速源时间映射、与 `FramePlan` 活跃源集合一致、JSON 序列化；C ABI/NAPI/JNI 均已暴露 |
+| `ExportPlan` / `Segment` | ✅ 10 项通过 | 帧对齐边界、相邻片段/空洞/NTSC、变速源时间映射、与 `FramePlan` 活跃源集合一致、JSON 序列化（含转场窗边界与 `opacity_start/opacity_end` ramp、缺字段兼容）；C ABI/NAPI/JNI 均已暴露 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
 | `check-native-abi.sh` | ✅ 通过 | 30 个 C 函数、33 个 NAPI 函数、26 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |

@@ -9,7 +9,7 @@
 //! Everything here is integer maths. A frame PTS is derived from `frame_index`
 //! and `frame_rate`, never accumulated, so a two-hour timeline cannot drift.
 
-use crate::model::{Clip, Id, Timeline, TrackKind, Transform};
+use crate::model::{Clip, Id, Timeline, Track, TrackKind, Transform};
 use crate::time::Rational;
 use serde::{Deserialize, Serialize};
 
@@ -188,6 +188,42 @@ fn clamp_source_us(clip: &Clip, source_us: i64) -> i64 {
     source_us.clamp(clip.in_us, last)
 }
 
+/// How long the *video* of `clip` keeps drawing past its own out point.
+///
+/// A dissolve is anchored on the incoming clip, so the outgoing neighbour has
+/// to hold its last frame until the window closes. The extension is derived
+/// from adjacency alone -- the next clip on this track starts exactly where
+/// this one ends *and* carries a transition -- so moving, trimming or
+/// removing either clip turns the cross-dissolve back into a plain cut (or a
+/// fade from black) with no bookkeeping in those commands. The source time
+/// runs past `out_us` here on purpose; `clamp_source_us` freezes it on the
+/// last frame, and the audio plan never sees the extension, so sound still
+/// cuts exactly at the edit point.
+fn video_extension_us(track: &Track, clip: &Clip) -> i64 {
+    track
+        .clips
+        .iter()
+        .find(|next| next.start_us == clip.end_us())
+        .and_then(|next| next.transition_in.as_ref())
+        .map(|transition| transition.duration_us)
+        .unwrap_or(0)
+}
+
+/// Linear 0..=1 progress through the dissolve this clip opens with.
+///
+/// The incoming layer ramps up while the outgoing neighbour (extended by
+/// [`video_extension_us`]) stays at full opacity underneath, so the composite
+/// is exactly `incoming * u + outgoing * (1 - u)` in one draw list. Fading the
+/// outgoing layer as well would square the falloff and show the background
+/// through the middle of the dissolve.
+fn transition_opacity(clip: &Clip, t_us: i64) -> f32 {
+    let Some((window_start, window_end)) = clip.transition_window_us() else {
+        return 1.0;
+    };
+    let span = (window_end - window_start).max(1) as f64;
+    ((t_us - window_start) as f64 / span).clamp(0.0, 1.0) as f32
+}
+
 /// Audio contributors at an arbitrary instant, without frame quantisation.
 ///
 /// The audio renderer pulls at its own callback rate (often 10 ms), which is
@@ -236,12 +272,18 @@ pub fn plan_audio_at(timeline: &Timeline, t_us: i64) -> Vec<AudioMix> {
 pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
     let snapped_us = frame_pts_us(&timeline.frame_rate, frame_index);
 
-    let mut layers = Vec::new();
+    // Pairs with the clip's timeline start so the draw order below can break
+    // ties inside one track without adding a field to the exported layer.
+    let mut layers: Vec<(i64, Layer)> = Vec::new();
 
     for (z, track) in timeline.tracks.iter().enumerate() {
         let z = z as i32;
         for clip in &track.clips {
-            if !clip.contains(snapped_us) {
+            // Active window: normally the clip's own [start, end), extended
+            // when a dissolve on the next clip holds this one's picture past
+            // its out point.
+            let extension = video_extension_us(track, clip);
+            if snapped_us < clip.start_us || snapped_us >= clip.end_us().saturating_add(extension) {
                 continue;
             }
             let source_us = clamp_source_us(clip, clip.to_source_us(snapped_us));
@@ -254,24 +296,35 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
 
             let source_is_video = source_may_have(timeline, clip.source, true);
             if track.kind != TrackKind::Audio && source_is_video && clip.transform.scale > 0.0 {
-                layers.push(Layer {
-                    clip_id: clip.id,
-                    source_id: clip.source,
-                    uri: uri.clone(),
-                    source_us,
-                    z,
-                    kind: layer_kind(track.kind, source_is_video),
-                    transform: clip.transform.clone(),
-                    opacity: 1.0,
-                    effects: clip.effects.clone(),
-                });
+                layers.push((
+                    clip.start_us,
+                    Layer {
+                        clip_id: clip.id,
+                        source_id: clip.source,
+                        uri: uri.clone(),
+                        source_us,
+                        z,
+                        kind: layer_kind(track.kind, source_is_video),
+                        transform: clip.transform.clone(),
+                        opacity: transition_opacity(clip, snapped_us),
+                        effects: clip.effects.clone(),
+                    },
+                ));
             }
         }
     }
 
     // Track order already gives z, but clips inside one track are unordered in
-    // the draft; sort so the compositor gets a stable draw list.
-    layers.sort_by(|a, b| a.z.cmp(&b.z).then(a.clip_id.cmp(&b.clip_id)));
+    // the draft -- and a dissolve deliberately makes two clips of one track
+    // active at once, where the incoming one must draw above the outgoing one
+    // regardless of which was inserted first (ids do not encode position).
+    layers.sort_by(|a, b| {
+        a.1.z
+            .cmp(&b.1.z)
+            .then(a.0.cmp(&b.0))
+            .then(a.1.clip_id.cmp(&b.1.clip_id))
+    });
+    let layers = layers.into_iter().map(|(_, layer)| layer).collect();
 
     FramePlan {
         t_us: snapped_us,
@@ -294,7 +347,7 @@ pub fn plan_frame(timeline: &Timeline, t_us: i64) -> FramePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MediaSource, Track};
+    use crate::model::{MediaSource, Track, Transition, TransitionKind};
 
     fn timeline_with(clips: Vec<(TrackKind, Clip)>) -> Timeline {
         let mut t = Timeline {
@@ -532,5 +585,154 @@ mod tests {
         assert!(json.contains("\"effects\":[\"brightness\"]"), "{json}");
         let back: FramePlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back.layers.len(), 1);
+    }
+
+    /// Two adjacent clips sharing one main-video track, the second one
+    /// opening a 1 s dissolve: A = [0, 2 s), B = [2 s, 4 s), window
+    /// [2 s, 3 s). `a_id` is parameterised because draw order must not
+    /// depend on which clip was inserted first.
+    fn dissolve_timeline(a_id: Id) -> Timeline {
+        let mut t = Timeline {
+            frame_rate: Rational::new(30, 1).unwrap(),
+            ..Timeline::default()
+        };
+        t.media.push(MediaSource {
+            id: 1,
+            uri: "file:///v.mp4".into(),
+            info: None,
+        });
+        let mut a = Clip::new(1, 0, 2_000_000, 0);
+        a.id = a_id;
+        let mut b = Clip::new(1, 0, 2_000_000, 2_000_000);
+        b.id = 11;
+        b.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 1_000_000,
+        });
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![a, b],
+        });
+        t
+    }
+
+    #[test]
+    fn dissolve_holds_the_outgoing_frame_and_ramps_the_incoming_one() {
+        let t = dissolve_timeline(10);
+
+        // Cut instant: the outgoing clip still fills the frame while the
+        // incoming one starts fully transparent (so the compositor can skip
+        // it) -- no flash of background at the edit point.
+        let at_cut = plan_frame(&t, 2_000_000);
+        assert_eq!(at_cut.layers.len(), 2);
+        assert_eq!(at_cut.layers[0].clip_id, 10);
+        assert_eq!(at_cut.layers[0].opacity, 1.0);
+        assert_eq!(at_cut.layers[1].clip_id, 11);
+        assert_eq!(at_cut.layers[1].opacity, 0.0);
+
+        // Halfway through the window both layers are up: the outgoing one at
+        // full strength underneath, the incoming one at exactly half.
+        let mid = plan_frame(&t, 2_500_000);
+        assert_eq!(mid.layers.len(), 2);
+        assert_eq!(mid.layers[0].clip_id, 10);
+        assert_eq!(mid.layers[0].opacity, 1.0);
+        assert_eq!(mid.layers[1].clip_id, 11);
+        assert_eq!(mid.layers[1].opacity, 0.5);
+
+        // Window closed: the held frame drops out on its own, the incoming
+        // clip is fully opaque. Total duration never moved.
+        let after = plan_frame(&t, 3_000_000);
+        assert_eq!(after.layers.len(), 1);
+        assert_eq!(after.layers[0].clip_id, 11);
+        assert_eq!(after.layers[0].opacity, 1.0);
+        assert_eq!(t.duration_us(), 4_000_000);
+
+        // Before the cut nothing anticipates: plain single layer.
+        let before = plan_frame(&t, 1_966_666); // frame 59
+        assert_eq!(before.layers.len(), 1);
+        assert_eq!(before.layers[0].clip_id, 10);
+    }
+
+    #[test]
+    fn held_outgoing_source_freezes_on_the_last_frame() {
+        let t = dissolve_timeline(10);
+        // Past the clip's out point the mapped source would run to 2.5 s of
+        // material that does not exist; the clamp pins it to the last frame
+        // instead, which is exactly what the preview compositor draws.
+        let mid = plan_frame(&t, 2_500_000);
+        assert_eq!(mid.layers[0].clip_id, 10);
+        assert_eq!(mid.layers[0].source_us, 1_999_999);
+        let late = plan_frame(&t, 2_966_666); // frame 89, still inside window
+        assert_eq!(late.layers[0].source_us, 1_999_999);
+    }
+
+    #[test]
+    fn audio_cuts_at_the_edit_point_while_the_picture_dissolves() {
+        let t = dissolve_timeline(10);
+        // Mid-window the outgoing clip's sound is gone even though its
+        // picture is still on screen: audio follows `contains`, never the
+        // video extension, so a dissolve cannot double-play two clips.
+        let mid = plan_frame(&t, 2_500_000);
+        assert_eq!(mid.audio.len(), 1);
+        assert_eq!(mid.audio[0].clip_id, 11);
+        let before = plan_frame(&t, 1_966_666); // frame 59
+        assert_eq!(before.audio.len(), 1);
+        assert_eq!(before.audio[0].clip_id, 10);
+    }
+
+    #[test]
+    fn dissolve_without_an_adjacent_predecessor_fades_in_from_black() {
+        // No predecessor at all: the same window reads as a fade-in.
+        let mut t = Timeline {
+            frame_rate: Rational::new(30, 1).unwrap(),
+            ..Timeline::default()
+        };
+        t.media.push(MediaSource {
+            id: 1,
+            uri: "file:///v.mp4".into(),
+            info: None,
+        });
+        let mut b = Clip::new(1, 0, 2_000_000, 2_000_000);
+        b.id = 11;
+        b.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 1_000_000,
+        });
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![b],
+        });
+        assert_eq!(plan_frame(&t, 2_000_000).layers[0].opacity, 0.0);
+        assert_eq!(plan_frame(&t, 2_500_000).layers[0].opacity, 0.5);
+        assert_eq!(plan_frame(&t, 3_000_000).layers[0].opacity, 1.0);
+
+        // A predecessor that merely ends *near* the cut does not extend: the
+        // degrade path is "fade from black", never a stretched neighbour.
+        let mut gap_a = Clip::new(1, 0, 1_000_000, 0);
+        gap_a.id = 10;
+        t.tracks[0].clips.insert(0, gap_a);
+        let mid = plan_frame(&t, 2_500_000);
+        assert_eq!(
+            mid.layers.len(),
+            1,
+            "non-adjacent neighbour must not extend"
+        );
+        assert_eq!(mid.layers[0].clip_id, 11);
+        assert_eq!(mid.layers[0].opacity, 0.5);
+    }
+
+    #[test]
+    fn incoming_clip_draws_above_outgoing_whatever_the_insertion_order() {
+        // Ids run backwards against time (B was created first). Sorting by id
+        // alone would put the incoming clip *under* the held frame and the
+        // dissolve would visibly not happen.
+        let t = dissolve_timeline(20); // A carries the larger id
+        let mid = plan_frame(&t, 2_500_000);
+        assert_eq!(mid.layers.len(), 2);
+        assert_eq!(mid.layers[0].clip_id, 20, "outgoing stays on the bottom");
+        assert_eq!(mid.layers[1].clip_id, 11, "incoming ramps on top");
+        assert_eq!(mid.layers[1].opacity, 0.5);
     }
 }

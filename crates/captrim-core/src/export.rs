@@ -19,6 +19,13 @@ use crate::time::Rational;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// Opacity of a layer in a timeline that has no dissolve touching it. Also the
+/// serde default so export-plan JSON written before transitions existed keeps
+/// parsing (and older JSON without the field means "fully opaque").
+fn full_opacity() -> f32 {
+    1.0
+}
+
 /// One video contributor that stays active for a whole export segment.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExportVideoItem {
@@ -38,6 +45,16 @@ pub struct ExportVideoItem {
     pub speed: Rational,
     pub transform: Transform,
     pub effects: Vec<String>,
+    /// Layer opacity at the segment's first frame. Export boundaries split on
+    /// every dissolve window, so a cross-dissolve is carried as a linear ramp
+    /// across one short segment -- identical maths to the preview's
+    /// `plan_frame_at_index`, sampled at frame PTS instead of recomputed.
+    #[serde(default = "full_opacity")]
+    pub opacity_start: f32,
+    /// Layer opacity just after the segment's last frame. Equal to
+    /// `opacity_start` in every segment that holds no part of a window.
+    #[serde(default = "full_opacity")]
+    pub opacity_end: f32,
 }
 
 /// One audio contributor that stays active for a whole export segment.
@@ -195,6 +212,16 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
                 .insert(frame_index_ceil(&timeline.frame_rate, clip.start_us).min(frame_count));
             boundaries
                 .insert(frame_index_ceil(&timeline.frame_rate, clip.end_us()).min(frame_count));
+            // A dissolve splits the picture once more where its window closes:
+            // that is where the held outgoing frame drops out and the incoming
+            // ramp reaches full opacity, so the ramp gets its own segment
+            // instead of being smeared across whatever came after it. The
+            // outgoing neighbour's extension ends at the same instant (its
+            // end equals this clip's start), so one boundary covers both.
+            if let Some((_, window_end)) = clip.transition_window_us() {
+                boundaries
+                    .insert(frame_index_ceil(&timeline.frame_rate, window_end).min(frame_count));
+            }
         }
     }
 
@@ -207,6 +234,10 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
             continue;
         }
         let plan = plan_frame_at_index(timeline, start_frame);
+        // Opacity is only frame-linear if it is anchored to frame PTS on both
+        // ends of the segment, so sample the same plan the preview would draw
+        // rather than deriving the ramp from segment-local arithmetic.
+        let end_plan = plan_frame_at_index(timeline, end_frame);
         let mut video = Vec::new();
         let mut audio = Vec::new();
 
@@ -216,6 +247,12 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
             };
             let source_end_us =
                 source_at_or_clamped(clip, frame_pts_us(&timeline.frame_rate, end_frame));
+            let opacity_end = end_plan
+                .layers
+                .iter()
+                .find(|end_layer| end_layer.clip_id == layer.clip_id)
+                .map(|end_layer| end_layer.opacity)
+                .unwrap_or(layer.opacity);
             video.push(ExportVideoItem {
                 clip_id: layer.clip_id,
                 source_id: layer.source_id,
@@ -227,6 +264,8 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
                 speed: clip.speed,
                 transform: layer.transform.clone(),
                 effects: layer.effects.clone(),
+                opacity_start: layer.opacity,
+                opacity_end,
             });
         }
 
@@ -271,7 +310,7 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Clip, MediaSource, Track, TrackKind};
+    use crate::model::{Clip, MediaSource, Track, TrackKind, Transition, TransitionKind};
 
     fn timeline_with(clips: Vec<(TrackKind, Clip)>) -> Timeline {
         let mut t = Timeline {
@@ -444,5 +483,108 @@ mod tests {
         assert!(json.contains("\"effects\":[\"flip\"]"), "{json}");
         let back: ExportPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back.segments.len(), 1);
+    }
+
+    /// A = [0, 2 s), B = [2 s, 4 s) on one main-video track, B opening a 1 s
+    /// dissolve, so the window is [2 s, 3 s) at frames [60, 90) of 30 fps.
+    fn dissolve_timeline() -> Timeline {
+        let mut t = Timeline {
+            frame_rate: Rational::new(30, 1).unwrap(),
+            ..Timeline::default()
+        };
+        t.media.push(MediaSource {
+            id: 1,
+            uri: "file:///v.mp4".into(),
+            info: None,
+        });
+        let mut a = Clip::new(1, 0, 2_000_000, 0);
+        a.id = 10;
+        let mut b = Clip::new(1, 0, 2_000_000, 2_000_000);
+        b.id = 11;
+        b.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 1_000_000,
+        });
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![a, b],
+        });
+        t
+    }
+
+    #[test]
+    fn dissolve_gets_its_own_segment_and_ramps_opacity_linearly() {
+        let t = dissolve_timeline();
+        let plan = t.export_plan();
+        assert_eq!(plan.frame_count, 120);
+        assert_eq!(plan.segments.len(), 3, "cut and window-end both split");
+        let ramp = &plan.segments[1];
+        assert_eq!(ramp.start_frame, 60);
+        assert_eq!(ramp.end_frame, 90);
+        assert_eq!(clip_ids(ramp), vec![10, 11]);
+
+        let held = ramp.video.iter().find(|i| i.clip_id == 10).unwrap();
+        let incoming = ramp.video.iter().find(|i| i.clip_id == 11).unwrap();
+        // The outgoing picture holds full opacity with its source frozen on
+        // the last frame; the incoming one owns the whole ramp.
+        assert_eq!((held.opacity_start, held.opacity_end), (1.0, 1.0));
+        assert_eq!(held.source_start_us, 1_999_999);
+        assert_eq!(held.source_end_us, 1_999_999);
+        assert_eq!((incoming.opacity_start, incoming.opacity_end), (0.0, 1.0));
+
+        // Every frame in the window: the exporter's linear interpolation
+        // reproduces the preview's plan opacity. The maths is exact in
+        // rationals (both are linear in the same frame PTS), so the epsilon
+        // only covers f32 rounding.
+        for frame in ramp.start_frame..ramp.end_frame {
+            let pos = (frame - ramp.start_frame) as f32 / ramp.frame_count() as f32;
+            let exported =
+                incoming.opacity_start + (incoming.opacity_end - incoming.opacity_start) * pos;
+            let preview = plan_frame_at_index(&t, frame)
+                .layers
+                .iter()
+                .find(|layer| layer.clip_id == 11)
+                .unwrap()
+                .opacity;
+            assert!(
+                (exported - preview).abs() < 1e-6,
+                "frame {frame}: exported {exported} vs preview {preview}"
+            );
+        }
+
+        // The ramp cannot leak into neighbouring segments: before the cut the
+        // held frame is a plain full-opacity item, after the window the
+        // incoming clip is a single full-opacity item.
+        let before = &plan.segments[0];
+        let plain = before.video.iter().find(|i| i.clip_id == 10).unwrap();
+        assert_eq!((plain.opacity_start, plain.opacity_end), (1.0, 1.0));
+        let after = &plan.segments[2];
+        assert_eq!(clip_ids(after), vec![11]);
+        assert_eq!(
+            (after.video[0].opacity_start, after.video[0].opacity_end),
+            (1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn export_plan_json_without_opacity_fields_still_parses() {
+        // Plans written before transitions existed carry no opacity fields;
+        // they must keep parsing as fully opaque layers.
+        let mut clip = Clip::new(1, 0, 1_000_000, 0);
+        clip.id = 30;
+        let t = timeline_with(vec![(TrackKind::MainVideo, clip)]);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&t.export_plan().to_json().unwrap()).unwrap();
+        for segment in value["segments"].as_array_mut().unwrap() {
+            for item in segment["video"].as_array_mut().unwrap() {
+                let item = item.as_object_mut().unwrap();
+                item.remove("opacity_start");
+                item.remove("opacity_end");
+            }
+        }
+        let back: ExportPlan = serde_json::from_value(value).unwrap();
+        assert_eq!(back.segments[0].video[0].opacity_start, 1.0);
+        assert_eq!(back.segments[0].video[0].opacity_end, 1.0);
     }
 }

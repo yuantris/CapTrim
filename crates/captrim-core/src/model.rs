@@ -22,6 +22,30 @@ pub enum TrackKind {
     Subtitle,
 }
 
+/// Visual transition used at a cut. v1 ships `Fade` only; the enum is open so
+/// later kinds (slide, wipe, ...) extend the draft without a version bump.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionKind {
+    Fade,
+}
+
+/// A cross-dissolve anchored at the *start* of the clip that carries it.
+///
+/// The window is the half-open range `[clip.start_us, clip.start_us +
+/// duration_us)`. Inside it the incoming clip ramps from transparent to
+/// opaque; when a same-track predecessor ends exactly at `clip.start_us` it
+/// keeps drawing (video only) until the window closes, so the two layers form
+/// a true cross-dissolve. Without a predecessor the same ramp reads as a
+/// fade-in from black. See `render` / `export` for the exact scheduling rules.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    /// Window length in timeline microseconds; must be > 0 and shorter than
+    /// the clip that carries the transition.
+    pub duration_us: i64,
+}
+
 /// How a layer is placed on the canvas.
 ///
 /// The compositor is the only consumer, and it applies these in this order:
@@ -74,6 +98,10 @@ pub struct Clip {
     pub volume: f32,
     pub transform: Transform,
     pub effects: Vec<String>,
+    /// Dissolve into this clip at its start. `None` (the default) is a hard
+    /// cut. Serialised away when absent so older drafts still parse.
+    #[serde(default)]
+    pub transition_in: Option<Transition>,
 }
 
 impl Clip {
@@ -88,6 +116,7 @@ impl Clip {
             volume: 1.0,
             transform: Transform::default(),
             effects: Vec::new(),
+            transition_in: None,
         }
     }
 
@@ -119,6 +148,16 @@ impl Clip {
             .saturating_add(Rational::scaled_us_to_us(elapsed, &self.speed))
     }
 
+    /// The dissolve window this clip opens with, if any: `(start, end)` in
+    /// timeline microseconds, half-open. Every scheduling rule (preview
+    /// activation, opacity ramp, export boundaries) derives from this one
+    /// definition so the two paths cannot drift apart.
+    pub fn transition_window_us(&self) -> Option<(i64, i64)> {
+        self.transition_in
+            .as_ref()
+            .map(|t| (self.start_us, self.start_us.saturating_add(t.duration_us)))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.speed.is_positive() {
             return Err(Error::invalid("clip speed must be positive"));
@@ -134,6 +173,18 @@ impl Clip {
         }
         if !self.transform.scale.is_finite() || self.transform.scale <= 0.0 {
             return Err(Error::invalid("clip scale must be finite and > 0"));
+        }
+        if let Some(transition) = &self.transition_in {
+            if transition.duration_us <= 0 {
+                return Err(Error::invalid(
+                    "transition duration must be greater than zero",
+                ));
+            }
+            if transition.duration_us >= self.duration_us() {
+                return Err(Error::invalid(
+                    "transition duration must be shorter than the clip",
+                ));
+            }
         }
         Ok(())
     }
@@ -315,5 +366,45 @@ mod tests {
             }],
         });
         assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn transition_must_be_positive_and_shorter_than_the_clip() {
+        let mut c = Clip::new(1, 0, 1_000_000, 0);
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 0,
+        });
+        assert!(c.validate().is_err());
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 2_000_000,
+        });
+        assert!(c.validate().is_err());
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 500_000,
+        });
+        assert!(c.validate().is_ok());
+        assert_eq!(c.transition_window_us(), Some((0, 500_000)));
+        assert_eq!(c.end_us(), 1_000_000, "transition must not move the clip");
+    }
+
+    #[test]
+    fn transition_is_optional_in_json_and_round_trips_when_set() {
+        // A draft written before transitions existed still parses.
+        let legacy = r#"{"id":0,"source":1,"in_us":0,"out_us":1000000,"start_us":0,"speed":{"num":1,"den":1},"volume":1.0,"transform":{"scale":1.0,"dx":0.0,"dy":0.0,"rotation_deg":0.0},"effects":[]}"#;
+        let c: Clip = serde_json::from_str(legacy).expect("legacy clip parses");
+        assert!(c.transition_in.is_none());
+
+        let mut c = Clip::new(1, 0, 1_000_000, 0);
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 300_000,
+        });
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"fade\""));
+        let back: Clip = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transition_in, c.transition_in);
     }
 }
