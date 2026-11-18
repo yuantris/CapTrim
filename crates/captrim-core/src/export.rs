@@ -475,12 +475,12 @@ mod tests {
     fn export_plan_serialises_for_platform_bridges() {
         let mut clip = Clip::new(1, 0, 1_000_000, 0);
         clip.id = 30;
-        clip.effects.push("flip".into());
+        clip.effects.push("hflip".into());
         let t = timeline_with(vec![(TrackKind::MainVideo, clip)]);
         let json = t.export_plan().to_json().unwrap();
         assert!(json.contains("\"segments\""), "{json}");
         assert!(json.contains("\"source_end_us\":999999"), "{json}");
-        assert!(json.contains("\"effects\":[\"flip\"]"), "{json}");
+        assert!(json.contains("\"effects\":[\"hflip\"]"), "{json}");
         let back: ExportPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back.segments.len(), 1);
     }

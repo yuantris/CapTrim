@@ -186,6 +186,11 @@ impl Clip {
                 ));
             }
         }
+        for effect in &self.effects {
+            if !crate::effects::is_known_effect(effect) {
+                return Err(Error::invalid(format!("unknown effect: {effect}")));
+            }
+        }
         Ok(())
     }
 }
@@ -406,5 +411,20 @@ mod tests {
         assert!(json.contains("\"fade\""));
         let back: Clip = serde_json::from_str(&json).unwrap();
         assert_eq!(back.transition_in, c.transition_in);
+    }
+
+    #[test]
+    fn effects_must_come_from_the_vocabulary() {
+        let mut c = Clip::new(1, 0, 1_000_000, 0);
+        c.effects.push("hflip".into());
+        c.effects.push("blur".into());
+        c.validate().expect("vocabulary names are accepted");
+
+        // An effect no backend implements would silently do nothing, so it is
+        // rejected at the model boundary instead.
+        c.effects.push("sepia".into());
+        let err = c.validate().expect_err("unknown effects are rejected");
+        assert!(err.to_string().contains("sepia"), "{err}");
+        assert_eq!(err.code(), -1);
     }
 }

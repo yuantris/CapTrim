@@ -203,6 +203,8 @@ hdc shell "hilog -x" | grep CapTrimDemo      # 看 check PASS/FAIL
 | `set_volume` | `clip_id` · `volume` |
 | `set_out_point` | `clip_id` · `out_us` |
 | `set_transform` | `clip_id` · `transform{scale,dx,dy,rotation_deg}` |
+| `set_transition` | `clip_id` · `transition{kind,duration_us}`（`null` 清除） |
+| `set_effects` | `clip_id` · `effects[]`（整表替换，名字必须在 v1 词汇内） |
 | `set_canvas` | `width` · `height` · `frame_rate{num,den}` |
 
 ### 两端用法
@@ -342,6 +344,24 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 导出侧把同一窗口翻译成段边界（窗末多切一刀），`ExportVideoItem` 新增 `opacity_start` / `opacity_end`（serde 缺省 1.0），段内按帧号线性插值。两端数学上同源：预览是 `(t - start)/d`，导出是两个端点的 lerp，而 PTS 对帧索引是线性的，所以逐帧相等（测试里只留 1e-6 的 f32 舍入余量）。**零 ABI 变更、零 FFmpeg filter 白名单变更、GL 合成器零改动**——`opacity` 管道在 P1 就已铺到着色器。
 
+### 滤镜：v1 词汇
+
+滤镜的名字表只有一份：`effects.rs` 的 `CANONICAL_ORDER`，八个名字 `hflip / vflip / brightness / contrast / saturation / grayscale / invert / blur`。`effects` 是**集合**——顺序和重复都不携带语义，两端都按 canonical order 应用（几何翻转最先、色彩居中、模糊最后），重复项折叠成一次。`Clip::validate` 拒绝词汇外的名字，草稿在模型边界就带着一个没人渲染的效果加载不进来；`set_effects` 命令整表替换，和其余命令一样走撤销栈。
+
+导出侧的唯一真相是 `effects_to_filter_desc()`：按 canonical order 拼成 FFmpeg 链，空表给空串，调用方可以无条件拼接。各名字的落点（与 GLSL 共享同一组常数，改动必须双边同步）：
+
+| 名字 | FFmpeg | GLSL（合成器） |
+|---|---|---|
+| `hflip` / `vflip` | `hflip` / `vflip` | 局部坐标镜像 |
+| `brightness` | `eq=brightness=0.15` | `c + 0.15` |
+| `contrast` | `eq=contrast=1.30` | `(c - 0.5) * 1.30 + 0.5` |
+| `saturation` | `eq=saturation=1.30` | `mix(luma, c, 1.30)` |
+| `grayscale` | `hue=s=0` | `vec3(luma)` |
+| `invert` | `negate` | `1.0 - c` |
+| `blur` | `boxblur=2:1` | 5×5 box（半径 2，每轴一趟） |
+
+FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等（和 `scale`/`fit` 既有取舍一致）；必须相等的是「跑哪些效果、什么顺序」。这四个 filter（`eq`/`hue`/`negate`/`boxblur`）还没进 FFmpeg 裁剪白名单，预览侧合成器也还没读 `effects`（`CaptrimLayerDesc` 要扩效果位）——所以词汇层、校验、翻译器先落地并被测试钉死，白名单重编、GLSL 分支与导出接线是接下来的三步。
+
 ## 七、已完成 / 未完成
 
 **已完成**
@@ -353,6 +373,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 - FFmpeg 后端（`libavformat` 探测/remux、`libavfilter`+`libswscale` 复杂剪辑、`libavcodec`/`libx264`/`libx265` 软编解兜底）+ 特征门控（无 `ffmpeg` feature 时返回 `NO_BACKEND` 而非崩溃）
 - `ExportPlan` / `Segment`：帧对齐导出分段、段内稳定源集合、有理数速度与精确源时间换算，双端已暴露
 - 转场 Fade 交叉溶解：`set_transition` 命令 + 切入片起始的窗口，前驱视频派生延长（冻结帧）、切入片 opacity ramp、绘制序 `(z, start_us, clip_id)`；导出翻译成段边界 + `opacity_start/opacity_end`，与预览逐帧同源；音频 v1 硬切
+- 滤镜 v1 词汇层：`effects.rs` 单一词汇表（8 个名字，集合语义 + canonical order），`Clip::validate` 拒绝词汇外名字，`set_effects` 命令走撤销栈，`effects_to_filter_desc()` 把词汇翻译成 FFmpeg filter 链（与 GLSL 分支共享同一组常数）
 - P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - P2 音频预览：`plan_audio_at` 按原始时间规划音频（不吸附帧栅格）、native 混音器统一 48kHz/立体声/f32、鸿蒙 `OH_AudioRenderer` 输出并把真实播放位置回灌主时钟、播放态 hold-and-present 压住超前解码帧
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
@@ -364,7 +385,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 **未完成（按优先级）**
 
-- 补滤镜、字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
+- 补滤镜（词汇表/校验/FFmpeg 翻译层已完成，剩 FFmpeg 白名单重编、GLSL 消费、导出接线）、字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
 - 转场后续：转场期音频交叉渐变（v1 刻意硬切）、更多转场类型（擦除/推拉等，复用同一窗口模型）、前驱素材越出裁剪点时用 handle material 代替冻结帧
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
@@ -377,7 +398,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 113 通过 | core 单元 79（含 P2 音频规划 2、ExportPlan 10、转场 11）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16；转场 11 项本轮新增 |
+| `cargo test --workspace` | ✅ 120 通过 | core 单元 86（含 P2 音频规划 2、ExportPlan 10、转场 11、滤镜词汇 7）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16；滤镜词汇 7 项本轮新增 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
 | `ExportPlan` / `Segment` | ✅ 10 项通过 | 帧对齐边界、相邻片段/空洞/NTSC、变速源时间映射、与 `FramePlan` 活跃源集合一致、JSON 序列化（含转场窗边界与 `opacity_start/opacity_end` ramp、缺字段兼容）；C ABI/NAPI/JNI 均已暴露 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |

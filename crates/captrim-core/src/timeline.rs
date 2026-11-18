@@ -63,6 +63,14 @@ pub enum Command {
         clip_id: Id,
         transition: Option<Transition>,
     },
+    /// Replace a clip's effect list outright. Names must come from the v1
+    /// vocabulary ([`crate::effects::CANONICAL_ORDER`]); `Clip::validate`
+    /// rejects anything else so an unknown name never reaches a backend.
+    /// The list is a set: order and duplicates carry no meaning.
+    SetEffects {
+        clip_id: Id,
+        effects: Vec<String>,
+    },
     RemoveTrack {
         track_id: Id,
     },
@@ -244,6 +252,13 @@ impl Timeline {
             } => {
                 let clip = find_clip_mut(self, *clip_id)?;
                 clip.transition_in = *transition;
+                clip.validate()?;
+                Ok(None)
+            }
+
+            Command::SetEffects { clip_id, effects } => {
+                let clip = find_clip_mut(self, *clip_id)?;
+                clip.effects = effects.clone();
                 clip.validate()?;
                 Ok(None)
             }
@@ -680,5 +695,46 @@ mod tests {
         assert!(parts[1].transition_in.is_none());
         assert!(parts[2].transition_in.is_none());
         assert_eq!(e.timeline().duration_us(), 6_000_000);
+    }
+
+    #[test]
+    fn set_effects_updates_the_list_and_rejects_unknown_names() {
+        let (mut e, media, track) = seeded();
+        let clip_id = e
+            .apply(&Command::InsertClip {
+                track_id: track,
+                clip: Clip::new(media, 0, 3_000_000, 0),
+            })
+            .unwrap()
+            .unwrap();
+
+        // The JSON bridge is the format platforms actually send.
+        e.apply_json(&format!(
+            r#"{{"type":"set_effects","clip_id":{clip_id},"effects":["blur","hflip"]}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            e.timeline().tracks[0].clips[0].effects,
+            vec!["blur".to_string(), "hflip".to_string()]
+        );
+
+        // Clearing the list is an ordinary undoable step.
+        e.apply_json(&format!(
+            r#"{{"type":"set_effects","clip_id":{clip_id},"effects":[]}}"#
+        ))
+        .unwrap();
+        assert!(e.timeline().tracks[0].clips[0].effects.is_empty());
+        assert!(e.undo(), "clearing effects is an undoable step");
+        assert_eq!(e.timeline().tracks[0].clips[0].effects.len(), 2);
+
+        // An unknown name would reach a backend that cannot render it, so it
+        // is rejected without mutating the draft.
+        let before = e.timeline().clone();
+        let err = e.apply(&Command::SetEffects {
+            clip_id,
+            effects: vec!["sepia".to_string()],
+        });
+        assert!(err.is_err());
+        assert_eq!(*e.timeline(), before);
     }
 }

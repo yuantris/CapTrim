@@ -4,6 +4,7 @@
 //! and test on the host, on Android, and on HarmonyOS from the same source.
 
 pub mod clock;
+pub mod effects;
 pub mod error;
 pub mod export;
 pub mod media;
@@ -14,6 +15,7 @@ pub mod time;
 pub mod timeline;
 
 pub use clock::PlaybackClock;
+pub use effects::{effects_to_filter_desc, is_known_effect};
 pub use error::{code_message, Error, Result};
 pub use export::{
     frame_index_ceil, plan_export, ExportAudioItem, ExportPlan, ExportSegment, ExportVideoItem,
