@@ -360,7 +360,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 | `invert` | `negate` | `1.0 - c` |
 | `blur` | `boxblur=2:1` | 5×5 box（半径 2，每轴一趟） |
 
-FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等（和 `scale`/`fit` 既有取舍一致）；必须相等的是「跑哪些效果、什么顺序」。这四个 filter（`eq`/`hue`/`negate`/`boxblur`）还没进 FFmpeg 裁剪白名单，预览侧合成器也还没读 `effects`（`CaptrimLayerDesc` 要扩效果位）——所以词汇层、校验、翻译器先落地并被测试钉死，白名单重编、GLSL 分支与导出接线是接下来的三步。
+FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等（和 `scale`/`fit` 既有取舍一致）；必须相等的是「跑哪些效果、什么顺序」。这四个 filter（`eq`/`hue`/`negate`/`boxblur`，外加 `negate` 依赖的 `lut`）现已编进双端 FFmpeg 裁剪白名单（两端 `config.mak` 均为 `CONFIG_*_FILTER=yes`），`effects_to_filter_desc()` 产出的链在真机可执行。预览侧合成器还没读 `effects`（`CaptrimLayerDesc` 要扩效果位）——GLSL 分支与导出接线是接下来的两步。
 
 ## 七、已完成 / 未完成
 
@@ -385,7 +385,7 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 
 **未完成（按优先级）**
 
-- 补滤镜（词汇表/校验/FFmpeg 翻译层已完成，剩 FFmpeg 白名单重编、GLSL 消费、导出接线）、字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
+- 补滤镜（词汇表/校验/FFmpeg 翻译层/双端 FFmpeg 白名单重编已完成，剩 GLSL 消费、导出接线）、字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
 - 转场后续：转场期音频交叉渐变（v1 刻意硬切）、更多转场类型（擦除/推拉等，复用同一窗口模型）、前驱素材越出裁剪点时用 handle material 代替冻结帧
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
@@ -418,8 +418,8 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 | Android AAR 编译 | ✅ 构建通过 | `platforms/android` 没有 gradlew，本机用缓存的 Gradle 8.13 构建（`scripts/run-android-app-selftest.sh` 会自动找）；AGP 8.7.3 / Kotlin 2.0.21 / compileSdk 35 / NDK 27.0.12077973 |
 | Android 真机自检（Kotlin/JNI 层） | ✅ 16/16 通过 | 小米 2211133C / Android 16 / API 36；走 `CapTrim.kt` 公开 API，覆盖库加载、时间线、分割撤销重做、29.97fps 栅格、预览时钟、probe / remux / x264 / 真实 x265（复探 `codec=hevc`）/ 三段式管线软硬链路 / 硬编产物软解复验，详见下节 |
 | Android 真机自检（native） | ✅ 18/18 通过 | 小米 2211133C（fuxi）/ Android 16 / API 36 / arm64-v8a：`scripts/run-android-selftest.sh` 一条命令编译+推送+运行；probe / remux / 软件复杂剪辑 / libx265 真实 HEVC 软编（输出复探 `codec=hevc`）/ 三段式管线（`decoder=2 encoder=2`，即 `CT_BACKEND_ANDROID_HW`，`reason=none` 无回退）/ 硬编产物 FFmpeg 软解复验 / 硬件能力查询 / P2 音频解码重采样 seek 音量静音全通过，详见下节 |
-| FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；12 个 `_FILTER 1` 全开，shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
-| FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；构建回执见 `FFMPEG_BUILD.txt` |
+| FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；滤镜词汇所需的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；`.so` 被 strip，符号表不可读，以 configure 记录为准）；shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
+| FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；滤镜词汇的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`）；构建回执见 `FFMPEG_BUILD.txt` |
 
 鸿蒙自检同时覆盖原生库加载、30 个 C 函数、整数时间轴、预览状态机和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。17 项结果：
 

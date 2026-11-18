@@ -372,19 +372,33 @@ resolve_external_codecs() {
     # are NOT interchangeable: an Android x264.a references bionic's
     # __assert2, which musl on OHOS cannot resolve (configure then reports
     # "x264 not found using pkg-config" with an undefined-symbol link log).
-    # Keep one prefix per platform. Migrate the old shared directory to the
-    # Android name once so its completed build is not thrown away.
+    # Keep one prefix per platform, and migrate every older layout so a
+    # completed build is not thrown away: the shared pre-split directory
+    # (x264-<abi>) AND the previous tag order (x264-<abi>-<tag>). A failed
+    # run also leaves an empty stub at the current name — drop it first so
+    # the migration can land, then repair the pkg-config prefix, which still
+    # points at the pre-migration location.
     local codec_tag="ohos"
     case "$cc" in *android*) codec_tag="android" ;; esac
-    local legacy264="${ROOT_DIR}/build/x264-${abi}"
-    local legacy265="${ROOT_DIR}/build/x265-${abi}"
-    if [ "$codec_tag" = "android" ] && [ -d "$legacy264" ] &&
-       [ ! -d "${legacy264}-android" ]; then
-        mv "$legacy264" "${legacy264}-android"
-    fi
-    if [ "$codec_tag" = "android" ] && [ -d "$legacy265" ] &&
-       [ ! -d "${legacy265}-android" ]; then
-        mv "$legacy265" "${legacy265}-android"
+    local legacy dir old
+    if [ "$codec_tag" = "android" ]; then
+        for legacy in x264 x265; do
+            dir="${ROOT_DIR}/build/${legacy}-${codec_tag}-${abi}"
+            if [ -d "$dir" ] && [ ! -f "$dir/prefix/lib/lib${legacy}.a" ] &&
+               [ ! -f "$dir/prefix/lib/lib${legacy}.so" ]; then
+                rm -rf "$dir"
+            fi
+            for old in "${ROOT_DIR}/build/${legacy}-${abi}" \
+                       "${ROOT_DIR}/build/${legacy}-${abi}-${codec_tag}"; do
+                if [ -d "$old" ] && [ "$old" != "$dir" ] && [ ! -d "$dir" ]; then
+                    mv "$old" "$dir"
+                fi
+            done
+            if [ -f "$dir/prefix/lib/pkgconfig/${legacy}.pc" ]; then
+                sed -i "s|^prefix=.*|prefix=$dir/prefix|" \
+                    "$dir/prefix/lib/pkgconfig/${legacy}.pc"
+            fi
+        done
     fi
     local p264="${ROOT_DIR}/build/x264-${codec_tag}-${abi}/prefix"
     local p265="${ROOT_DIR}/build/x265-${codec_tag}-${abi}/prefix"
@@ -611,6 +625,10 @@ FFMPEG_COMMON_CFG=(
     # format are the workhorses (resize + pixel-format conversion); fps/crop/
     # trim/setpts/null/hflip/vflip/pad/overlay/rotate make up a useful "complex
     # edit command" vocabulary shared by both software and hardware paths.
+    # eq/hue/negate/boxblur back the v1 filter vocabulary in
+    # crates/captrim-core/src/effects.rs (brightness/contrast/saturation,
+    # grayscale, invert, blur) — all four are native yuv420p, no format
+    # negotiation needed in the chain.
     --enable-filter=buffer
     --enable-filter=buffersink
     --enable-filter=scale
@@ -625,6 +643,14 @@ FFMPEG_COMMON_CFG=(
     --enable-filter=pad
     --enable-filter=overlay
     --enable-filter=rotate
+    --enable-filter=eq
+    --enable-filter=hue
+    # negate uses LutContext from vf_lut.c; without --enable-filter=lut the
+    # configure run disables negate_filter ("dependencies are not satisfied")
+    # and the invert effect silently disappears from the build.
+    --enable-filter=lut
+    --enable-filter=negate
+    --enable-filter=boxblur
 )
 
 # FFmpeg's configure writes MSYS-style absolute paths (/c/Users/...) into the

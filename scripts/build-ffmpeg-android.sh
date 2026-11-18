@@ -14,8 +14,8 @@ export PATH="${ROOT_DIR}/scripts:$PATH"
 
 # FFmpeg's configure writes temp test files under TMPDIR; the default Windows
 # path with backslashes gets mangled, so point it at Git Bash's /tmp.
-# Recipes (and the ld response-file shim) may also run under the copied POSIX
-# shell, whose root differs from Git Bash's: an MSYS-style /tmp path would
+# Recipes (and the ld response-file shim) run under make's POSIX shell, whose
+# MSYS root may differ from this script's: an MSYS-style /tmp path would
 # resolve against the WRONG root there, so hand every consumer a Windows path.
 export TMPDIR="$(cygpath -m -- "${TMPDIR:-/tmp}")"
 
@@ -97,17 +97,17 @@ chmod +x "$LD_RSP"
 # Native make.exe cannot resolve "/bin/sh" and silently falls back to
 # cmd.exe — which TRUNCATES recipe lines longer than 8191 characters. That
 # cut FFmpeg's ~8.3 KB libavcodec link line mid-token ("-pthre") before it
-# ever reached the response-file shim above. Give make a real POSIX shell at
-# a space-free Windows path: a copied sh.exe, because Git Bash's own sh.exe
-# lives under "C:\Program Files\Git", which make's CreateProcess cannot
-# split correctly.
-MSYS_SH="${ROOT_DIR}/build/_shims/shbin/sh.exe"
-if [ ! -f "$MSYS_SH" ]; then
-    mkdir -p "$(dirname "$MSYS_SH")"
-    cp /usr/bin/sh.exe "$MSYS_SH"
-    cp /usr/bin/msys-2.0.dll "$(dirname "$MSYS_SH")/msys-2.0.dll"
-fi
-export CAPTRIM_MAKE_SHELL="$(cygpath -m -- "$MSYS_SH")"
+# ever reached the response-file shim above. Give make the Git Bash sh.exe
+# itself: it shares this script's MSYS runtime, so /bin/sh (used by the
+# ffbuild/*.sh wrappers) and environment handoff into ld-rsp.sh both work.
+# A COPIED sh.exe instead gets a standalone MSYS root with no /bin/sh, so
+# make dies with "ffbuild/version.sh: cannot execute: required file not
+# found ... Error 127" after configure has already succeeded. On this host
+# Git lives at a space-free path, so CreateProcess splits it correctly;
+# build-ffmpeg-ohos.sh uses the same approach. Use "$(command -v sh)" so the
+# sh always matches the running bash's own MSYS runtime (version skew breaks
+# the spawn handshake), never a copy.
+export CAPTRIM_MAKE_SHELL="$(cygpath -m -- "$(command -v sh)")"
 # Pass the linker as "sh.exe ld-rsp.sh" so the recipe never relies on the
 # script's shebang resolution either.
 export CAPTRIM_LD_CMD="$(cygpath -m -- "$LD_RSP")"
@@ -210,11 +210,10 @@ for ABI in $ABIS; do
         --arch="$ARCH"
         --cpu="$CPU"
         --enable-cross-compile
-        # Tool COMMANDS must be in Windows form: the recipes run under the
-        # copied POSIX shell (CAPTRIM_MAKE_SHELL), whose standalone msys
-        # runtime cannot resolve /c/, /d/... command paths. ARGUMENT paths
-        # are auto-converted by the msys runtime when it spawns a native
-        # process, so flags like --sysroot=/d/... may stay as they are.
+        # Tool COMMANDS must be in Windows form: native make.exe launches
+        # them via CreateProcess, which cannot split /c/, /d/... command
+        # paths. ARGUMENT paths are auto-converted by the msys runtime when
+        # it spawns a native process, so flags like --sysroot=/d/... may stay.
         --cc="$(cygpath -m -- "$CC")"
         --cxx="$(cygpath -m -- "$CXX")"
         --ld="$(ld_invoke)"
