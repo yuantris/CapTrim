@@ -99,6 +99,48 @@ fn apply_command_and_draft_round_trip() {
 }
 
 #[test]
+fn export_plan_effects_translate_to_a_filter_desc() {
+    // End-to-end for the v1 filter export wiring: an effect set applied as a
+    // command survives into the export plan and translates through the ABI into
+    // the same FFmpeg chain the preview shader applies (canonical order).
+    let e = TestEngine::new();
+    let mut created: u64 = 0;
+    for cmd in [
+        r#"{"type":"add_media","uri":"file:///a.mp4"}"#,
+        r#"{"type":"add_track","kind":"main_video"}"#,
+        r#"{"type":"insert_clip","track_id":2,"clip":{"id":0,"source":1,"in_us":0,"out_us":1000000,"start_us":0,"speed":{"num":1,"den":1},"volume":1.0,"transform":{"scale":1.0,"dx":0.0,"dy":0.0,"rotation_deg":0.0},"effects":[]}}"#,
+        r#"{"type":"set_effects","clip_id":3,"effects":["blur","invert","hflip"]}"#,
+    ] {
+        let cmd = c(cmd);
+        assert_eq!(
+            captrim_engine_apply(e.handle(), cmd.as_ptr(), &mut created),
+            0,
+            "{}",
+            unsafe { last_error() }
+        );
+    }
+
+    // The export plan carries the effect list on its video item.
+    let mut plan: *mut c_char = ptr::null_mut();
+    assert_eq!(captrim_engine_export_plan(e.handle(), &mut plan), 0);
+    let plan_json = unsafe { take_string(plan) };
+    assert!(plan_json.contains("\"hflip\""), "{plan_json}");
+
+    // Feed the exact effects array back through the translation ABI: the result
+    // is the FFmpeg filter_desc exportTranscode expects, in canonical order.
+    let effects = c(r#"["blur","invert","hflip"]"#);
+    let mut desc: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        captrim_effects_to_filter_desc(effects.as_ptr(), &mut desc),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    let desc = unsafe { take_string(desc) };
+    assert_eq!(desc, "hflip,negate,boxblur=2:1");
+}
+
+#[test]
 fn null_arguments_are_rejected_not_dereferenced() {
     let e = TestEngine::new();
     assert_eq!(

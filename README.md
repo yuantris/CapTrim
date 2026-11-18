@@ -4,7 +4,7 @@ Android 和鸿蒙共用的视频剪辑核心 SDK。Rust 描述时间线，FFmpeg
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI、鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖剪映的基础剪辑能力：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 17/17，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 16/16，明细见[验证状态](#验证状态)。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
+现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 18/18，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 17/17，明细见[验证状态](#验证状态)。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
 
 ---
 
@@ -69,7 +69,7 @@ Android 和鸿蒙共用的视频剪辑核心 SDK。Rust 描述时间线，FFmpeg
 
 `ct_decoder_t` / `ct_processor_t` / `ct_encoder_t` 是纯 C 函数表，工厂函数返回 `NULL` 即表示该后端不可用，由 `ct_pipeline_run()` **按段**降级，不会一段失败就整条链路退回软件。
 
-**2026-11-15 落地，鸿蒙自检 17/17**：`native/captrim_pipeline.c` 实现编排 + FFmpeg 软解/中间滤镜/软编三工厂 + `ct_pipeline_hardware_caps()`；`native/captrim_ohos_hw.c` 实现 OHOS 硬解（`OH_AVSource`/`OH_AVDemuxer`/`OH_VideoDecoder`）与硬编（`OH_VideoEncoder`/`OH_AVMuxer`）工厂，编进 OHOS 版 `libcaptrim_ffmpeg.so`。Android 构建编入 `native/captrim_android_hw.c`（`AMediaExtractor` + `AMediaCodec` + `AMediaMuxer`），真机验证 `decoder=2 encoder=2`（即 `CT_BACKEND_ANDROID_HW`）、`reason=none` 无回退；两端共用同一份编排层，只靠弱符号工厂切换。`ct_ff_transcode()` 按 `video_codec` 前缀路由：`libx264`/空 = 纯软直连；`hw:<encoder>` = 三段式硬件优先；`hw:sw:<encoder>` = 强制全软；`hw:cb:<encoder>` = 强制 OHOS 回调式 Buffer 模式（诊断用）。硬件段在流式阶段失败时，`ct_ff_transcode()` 整单重试全软，保证导出不失败。
+**2026-11-15 落地，最新鸿蒙自检 18/18**：`native/captrim_pipeline.c` 实现编排 + FFmpeg 软解/中间滤镜/软编三工厂 + `ct_pipeline_hardware_caps()`；`native/captrim_ohos_hw.c` 实现 OHOS 硬解（`OH_AVSource`/`OH_AVDemuxer`/`OH_VideoDecoder`）与硬编（`OH_VideoEncoder`/`OH_AVMuxer`）工厂，编进 OHOS 版 `libcaptrim_ffmpeg.so`。Android 构建编入 `native/captrim_android_hw.c`（`AMediaExtractor` + `AMediaCodec` + `AMediaMuxer`），真机验证 `decoder=2 encoder=2`（即 `CT_BACKEND_ANDROID_HW`）、`reason=none` 无回退；两端共用同一份编排层，只靠弱符号工厂切换。`ct_ff_transcode()` 按 `video_codec` 前缀路由：`libx264`/空 = 纯软直连；`hw:<encoder>` = 三段式硬件优先；`hw:sw:<encoder>` = 强制全软；`hw:cb:<encoder>` = 强制 OHOS 回调式 Buffer 模式（诊断用）。硬件段在流式阶段失败时，`ct_ff_transcode()` 整单重试全软，保证导出不失败。
 
 **硬段的两种 Buffer 模式**：AVCodec Kit 的两个互斥形态都在 `captrim_ohos_hw.c` 里，共用同一套流式循环，只把「取空输入 buffer / 取已填充输出 buffer」两个原语换成不同实现：
 
@@ -101,9 +101,9 @@ crates/captrim-core/      纯 Rust 核心：时间、模型、命令、草稿（
 crates/captrim-ffi/       稳定 C ABI + 后端抽象（captrim.h 是唯一契约）
 native/                   FFmpeg C shim（probe / remux / 滤镜转码）+ 三段式管线 + 双端硬段工厂
 platforms/android/        Gradle AAR + CMake + JNI + Kotlin
-platforms/android/app/    Kotlin 层真机自检 App（16 项，结果写 logcat）
+platforms/android/app/    Kotlin 层真机自检 App（17 项，结果写 logcat）
 platforms/ohos/           HAR 工程 + CMake + Node-API + ArkTS + .d.ts
-platforms/ohos/entry/     真机自检 App（17 项检查，结果写 hilog）
+platforms/ohos/entry/     真机自检 App（18 项检查，结果写 hilog）
 scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建、双端真机自检、本地 CI 全套（check.sh）
 ```
 
@@ -121,7 +121,7 @@ bash scripts/check.sh           # 本地把 CI 的每一关（除需要 NDK/Grad
 
 ```bash
 cargo fmt --all --check            # CI 的第一关；漏跑它会让后面四关在 CI 上被跳过
-cargo test --workspace             # 102 个测试
+cargo test --workspace             # 127 个测试
 cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warnings
 bash scripts/check-native-abi.sh   # 头文件 == Rust 导出 == NAPI == d.ts
 ```
@@ -164,12 +164,12 @@ bash scripts/build-rust.sh android
 
 ```bash
 bash scripts/run-android-selftest.sh        # native 层 18 项，推 /data/local/tmp 跑
-bash scripts/run-android-app-selftest.sh    # Kotlin/JNI 层 16 项，装 App 跑
+bash scripts/run-android-app-selftest.sh    # Kotlin/JNI 层 17 项，装 App 跑
 ```
 
 **5. 鸿蒙真机自检**
 
-`platforms/ohos/entry` 是个可直接装到手机上的 App：打开即在设备上跑 17 项检查，把每一行结果写进 hilog。下半部分是真机预览：`播放 / 回到 0s / 跳到 4s` 走时间线与源切换，`缩放 + 平移` 通过 `set_transform` 改草稿，验证 `engine → plan → C ABI → GL 合成` 整条链路都按 `Transform` 契约工作。
+`platforms/ohos/entry` 是个可直接装到手机上的 App：打开即在设备上跑 18 项检查，把每一行结果写进 hilog。下半部分是真机预览：`播放 / 回到 0s / 跳到 4s` 走时间线与源切换，`缩放 + 平移` 通过 `set_transform` 改草稿，验证 `engine → plan → C ABI → GL 合成` 整条链路都按 `Transform` 契约工作。
 
 ```bash
 export DEVECO_HOME="/path/to/DevEco Studio"   # 未设置时按 hdc 位置推断
@@ -324,7 +324,7 @@ presentStatus() ◀── 快照(非阻塞) ──────────┘
 
 hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过播放头的帧先留在 codec buffer（最多 4 帧），等音频时钟追上再由渲染线程交给 surface；队列满就先释放最旧的，避免反压把解码器卡死。暂停、seek、销毁统一清空。状态快照新增 `audio_position_us` / `audio_frames` / `held` 三个数，能直接看出音频是否在走、hold 是否生效。
 
-真机验证（最终 HAP，默认暂停启动）：自检仍 17/17。暂停态视频 `pos=0`，音频位置从 6.69 s 增到 10.69 s、音频帧从 311296 增到 487424，说明 renderer 回调一直在写 PCM；播放态日志 `pos=2023739 audio=1998250 frames=106496 held=131` → `pos=4864731 audio=4857375 frames=233472 held=285`，播放头与音频位置差 7~25 ms，`held` 随预读从 131 增到 285。Android native 18/18 另覆盖音频解码/重采样/seek/音量/静音。
+真机验证（最终 HAP，默认暂停启动）：自检 18/18。暂停态视频 `pos=0`，音频位置从 6.69 s 增到 10.69 s、音频帧从 311296 增到 487424，说明 renderer 回调一直在写 PCM；播放态日志 `pos=2023739 audio=1998250 frames=106496 held=131` → `pos=4864731 audio=4857375 frames=233472 held=285`，播放头与音频位置差 7~25 ms，`held` 随预读从 131 增到 285。Android native 18/18 另覆盖音频解码/重采样/seek/音量/静音。
 
 官方依据（均从 `https://developer.huawei.com/config/llms.txt` 的 API Reference 索引进入）：《native_audiorenderer.h》 https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-native-audiorenderer-h.md ；《native_audiostreambuilder.h》 https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/capi-native-audiostreambuilder-h.md 。索引页 https://developer.huawei.com/consumer/cn/llms/docs-references.txt 的同步时间为 2026-09-17。
 
@@ -360,7 +360,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 | `invert` | `negate` | `1.0 - c` |
 | `blur` | `boxblur=2:1` | 5×5 box（半径 2，每轴一趟） |
 
-FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等（和 `scale`/`fit` 既有取舍一致）；必须相等的是「跑哪些效果、什么顺序」。这四个 filter（`eq`/`hue`/`negate`/`boxblur`，外加 `negate` 依赖的 `lut`）现已编进双端 FFmpeg 裁剪白名单（两端 `config.mak` 均为 `CONFIG_*_FILTER=yes`），`effects_to_filter_desc()` 产出的链在真机可执行。预览侧合成器还没读 `effects`（`CaptrimLayerDesc` 要扩效果位）——GLSL 分支与导出接线是接下来的两步。
+FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等（和 `scale`/`fit` 既有取舍一致）；必须相等的是「跑哪些效果、什么顺序」。这四个 filter（`eq`/`hue`/`negate`/`boxblur`，外加 `negate` 依赖的 `lut`）现已编进双端 FFmpeg 裁剪白名单（两端 `config.mak` 均为 `CONFIG_*_FILTER=yes`），`effects_to_filter_desc()` 产出的链在真机可执行。预览侧：`captrim_layer_desc_t` 新增 `effects` 位掩码（8 个 `CAPTRIM_EFFECT_*`，与 core 的 `EFFECT_*` 和 canonical order 同源），OHOS GLSL 片元着色器按同一顺序应用八个效果（翻转走 UV、色彩运算走 RGB、模糊走 5×5 box），presenter 把位直接透传。导出侧：`captrim_effects_to_filter_desc()` 把 `ExportVideoItem.effects` 翻成 FFmpeg 链，双端（NAPI `effectsToFilterDesc` / JNI `nativeEffectsToFilterDesc`）已接线，词汇与常数始终只在 core 定义一次。
 
 ## 七、已完成 / 未完成
 
@@ -369,23 +369,23 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 - `Rational` 精确时间运算（含 NTSC 30000/1001 帧边界、无浮点比较）
 - Timeline / Track / Clip 模型、重叠校验、分割（含变速片段的源时间映射）
 - Command 栈 + 撤销重做 + 草稿 JSON 往返
-- 稳定 C ABI（30 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
+- 稳定 C ABI（31 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
 - FFmpeg 后端（`libavformat` 探测/remux、`libavfilter`+`libswscale` 复杂剪辑、`libavcodec`/`libx264`/`libx265` 软编解兜底）+ 特征门控（无 `ffmpeg` feature 时返回 `NO_BACKEND` 而非崩溃）
 - `ExportPlan` / `Segment`：帧对齐导出分段、段内稳定源集合、有理数速度与精确源时间换算，双端已暴露
 - 转场 Fade 交叉溶解：`set_transition` 命令 + 切入片起始的窗口，前驱视频派生延长（冻结帧）、切入片 opacity ramp、绘制序 `(z, start_us, clip_id)`；导出翻译成段边界 + `opacity_start/opacity_end`，与预览逐帧同源；音频 v1 硬切
-- 滤镜 v1 词汇层：`effects.rs` 单一词汇表（8 个名字，集合语义 + canonical order），`Clip::validate` 拒绝词汇外名字，`set_effects` 命令走撤销栈，`effects_to_filter_desc()` 把词汇翻译成 FFmpeg filter 链（与 GLSL 分支共享同一组常数）
+- 滤镜 v1 全链路：`effects.rs` 单一词汇表（8 个名字，集合语义 + canonical order），`Clip::validate` 拒绝词汇外名字，`set_effects` 命令走撤销栈；双端 FFmpeg 白名单含 `eq/hue/lut/negate/boxblur`；`captrim_layer_desc_t.effects` 位掩码把词汇透传给 OHOS GLSL 片元着色器（八效果分支，共享常数）；`captrim_effects_to_filter_desc()` 供导出把 effects 翻成 FFmpeg 链，双端平台已接线
 - P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - P2 音频预览：`plan_audio_at` 按原始时间规划音频（不吸附帧栅格）、native 混音器统一 48kHz/立体声/f32、鸿蒙 `OH_AudioRenderer` 输出并把真实播放位置回灌主时钟、播放态 hold-and-present 压住超前解码帧
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
-- 鸿蒙真机自检 App：17 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘、三段式管线的软件基线 / 同步硬段 / 回调式硬段与回退，以及硬编产物的 FFmpeg 软解复验；P2 音频输出与 hold-and-present 另有真机日志验证
+- 鸿蒙真机自检 App：18 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘、滤镜 v1（effect 位 + filter_desc 翻译）、三段式管线的软件基线 / 同步硬段 / 回调式硬段与回退，以及硬编产物的 FFmpeg 软解复验；P2 音频输出与 hold-and-present 另有真机日志验证
 - Android native 自检：18 项，含 P2 音频解码/重采样/seek/音量/静音、真实 x265 HEVC 编码复探和 AMediaCodec 硬解硬编链路（`scripts/run-android-selftest.sh`）
-- Android Kotlin/JNI 层自检 App：16 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）
+- Android Kotlin/JNI 层自检 App：17 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）
 - 鸿蒙硬解 + GL 多图层合成上屏：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放都在真机验证过
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包、本地 CI 全套
 
 **未完成（按优先级）**
 
-- 补滤镜（词汇表/校验/FFmpeg 翻译层/双端 FFmpeg 白名单重编已完成，剩 GLSL 消费、导出接线）、字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment` 已完成）
+- 补字幕渲染、图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment`、滤镜 v1 全链路已完成）
 - 转场后续：转场期音频交叉渐变（v1 刻意硬切）、更多转场类型（擦除/推拉等，复用同一窗口模型）、前驱素材越出裁剪点时用 handle material 代替冻结帧
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
@@ -398,30 +398,30 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 120 通过 | core 单元 86（含 P2 音频规划 2、ExportPlan 10、转场 11、滤镜词汇 7）+ P0 集成 1 + P1 预览/导出一致性 5 + 二进制帧描述单元 5 + FFI ABI 7 + P1 ABI 契约 16；滤镜词汇 7 项本轮新增 |
+| `cargo test --workspace` | ✅ 127 通过 | core 单元 88（含 P2 音频规划 2、ExportPlan 10、转场 11、滤镜词汇/位掩码 7）+ P0 集成 1 + P1 预览/导出一致性 5 + FFI 单元 9 + ABI 8（含 effects→filter_desc 端到端）+ P1 ABI 契约 16 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
 | `ExportPlan` / `Segment` | ✅ 10 项通过 | 帧对齐边界、相邻片段/空洞/NTSC、变速源时间映射、与 `FramePlan` 活跃源集合一致、JSON 序列化（含转场窗边界与 `opacity_start/opacity_end` ramp、缺字段兼容）；C ABI/NAPI/JNI 均已暴露 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
-| `check-native-abi.sh` | ✅ 通过 | 30 个 C 函数、33 个 NAPI 函数、26 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
+| `check-native-abi.sh` | ✅ 通过 | 31 个 C 函数、34 个 NAPI 函数、27 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
 | `captrim-ffi/ffmpeg` → Android arm64 | ✅ 类型检查通过 | `cargo check -p captrim-ffi --features ffmpeg --target aarch64-linux-android`，CI 独立 job 与 `check.sh` 同一命令；不链接（dist/ 不入仓库），真实链接由真机 native 自检覆盖 |
-| `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，30 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
+| `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，31 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
 | `libcaptrim.so`（ffmpeg feature）双端链接 | ✅ 通过 | OHOS + Android 双端：`libcaptrim.so` → NEEDED `libcaptrim_ffmpeg.so`（OHOS 另 NEEDED `libc.so`；Android 另 NEEDED `libdl.so`+`libc.so`）；FFI 符号 `ct_ff_probe`/`ct_ff_remux`/`ct_ff_transcode`/`ct_ff_string_free` 由 shim 导出并被 cdylib 引用；`platforms/<os>/captrim/{libs,jniLibs}/arm64-v8a` 已暂存全部动态库 |
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK；依赖包含 `libcaptrim.so` / `libcaptrim_ffmpeg.so` / `libohaudio.so` / `libace_napi.z.so` / `libhilog_ndk.z.so` / 媒体与窗口系统库 |
 | ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 3 条「.so 未校验」告警（预期） |
 | 鸿蒙构建脚本端到端 | ✅ 通过 | Windows + Git Bash 实测产出、暂存、`hdc install` 一条命令 |
 | 鸿蒙 HAP 打包 | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内含 `libcaptrim.so`(NAPI) + `libcaptrim_ffmpeg.so` + FFmpeg 全套(`libav*`/`libsw*`) + `libc++_shared.so`(NDK C++ 运行时，由 `build-ffmpeg-ohos.sh` 自动打入 `dist/ohos/...` 再随 `stage_libs` 进 HAP) |
-| 鸿蒙真机自检 | ✅ 17/17 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a；含 FFmpeg 软后端 probe + remux + 复杂剪辑、三段式管线的软件基线 / 同步硬段 / 回调式硬段，以及两个硬编 mp4 的 FFmpeg 软解复验，详见下节 |
-| P2 鸿蒙 HAP 真机验证 | ✅ 通过 | 最终 HAP 自检 17/17；暂停态音频位置 6.69 s → 10.69 s、音频帧 311296 → 487424；播放态播放头与音频主时钟差 7~25 ms，`held` 131 → 285，证明 `OH_AudioRenderer` 输出、时钟回灌与 hold-and-present 均生效 |
+| 鸿蒙真机自检 | ✅ 18/18 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a；含滤镜 v1（effect 位 + filter_desc 翻译）、FFmpeg 软后端 probe + remux + 复杂剪辑、三段式管线的软件基线 / 同步硬段 / 回调式硬段，以及两个硬编 mp4 的 FFmpeg 软解复验，详见下节 |
+| P2 鸿蒙 HAP 真机验证 | ✅ 通过 | 最终 HAP 自检 18/18；暂停态音频位置 6.69 s → 10.69 s、音频帧 311296 → 487424；播放态播放头与音频主时钟差 7~25 ms，`held` 131 → 285，证明 `OH_AudioRenderer` 输出、时钟回灌与 hold-and-present 均生效 |
 | 鸿蒙硬解 + GL 合成 | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（468 次合成，解码 458 帧仅 7 帧未上屏）；暂停落点误差 ≤1 帧；缩放/平移/旋转经 `set_transform` 全链路生效（截图对比） |
 | 画中画（双路解码） | ✅ 真机出画面 | 主轨 + overlay 轨同时解码：`slots=2`、两路各自 latch 并合成，截图可见主画面与右下角内嵌画面；8 s 时间线双路播放 `pos` 与壁钟同为 6012 ms（1.00× 实时）；只改主视频的 transform 时内嵌画面保持原位（截图对比），证明两个图层互不干扰 |
 | Android AAR 编译 | ✅ 构建通过 | `platforms/android` 没有 gradlew，本机用缓存的 Gradle 8.13 构建（`scripts/run-android-app-selftest.sh` 会自动找）；AGP 8.7.3 / Kotlin 2.0.21 / compileSdk 35 / NDK 27.0.12077973 |
-| Android 真机自检（Kotlin/JNI 层） | ✅ 16/16 通过 | 小米 2211133C / Android 16 / API 36；走 `CapTrim.kt` 公开 API，覆盖库加载、时间线、分割撤销重做、29.97fps 栅格、预览时钟、probe / remux / x264 / 真实 x265（复探 `codec=hevc`）/ 三段式管线软硬链路 / 硬编产物软解复验，详见下节 |
+| Android 真机自检（Kotlin/JNI 层） | ✅ 17/17 通过 | 小米 2211133C / Android 16 / API 36；走 `CapTrim.kt` 公开 API，覆盖库加载、时间线、分割撤销重做、29.97fps 栅格、预览时钟、滤镜 v1（filter_desc 翻译）、probe / remux / x264 / 真实 x265（复探 `codec=hevc`）/ 三段式管线软硬链路 / 硬编产物软解复验，详见下节 |
 | Android 真机自检（native） | ✅ 18/18 通过 | 小米 2211133C（fuxi）/ Android 16 / API 36 / arm64-v8a：`scripts/run-android-selftest.sh` 一条命令编译+推送+运行；probe / remux / 软件复杂剪辑 / libx265 真实 HEVC 软编（输出复探 `codec=hevc`）/ 三段式管线（`decoder=2 encoder=2`，即 `CT_BACKEND_ANDROID_HW`，`reason=none` 无回退）/ 硬编产物 FFmpeg 软解复验 / 硬件能力查询 / P2 音频解码重采样 seek 音量静音全通过，详见下节 |
-| FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；滤镜词汇所需的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；`.so` 被 strip，符号表不可读，以 configure 记录为准）；shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
-| FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；滤镜词汇的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`）；构建回执见 `FFMPEG_BUILD.txt` |
+| FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；滤镜词汇所需的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；构建树中的 `libavfilter.so.10` 经 `llvm-nm -a` 验证五个 `ff_vf_*` 描述符均为已定义符号、无 UND，`filter_list.c` 同步引用）；shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
+| FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；滤镜词汇的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；`dist` 中的 `libavfilter.so.10.4.100` 经 `llvm-nm -a` 验证五个 `ff_vf_*` 描述符均为已定义符号、无 UND）；构建回执见 `FFMPEG_BUILD.txt` |
 
-鸿蒙自检同时覆盖原生库加载、30 个 C 函数、整数时间轴、预览状态机和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。17 项结果：
+鸿蒙自检同时覆盖原生库加载、31 个 C 函数、整数时间轴、预览状态机、滤镜 v1 和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。18 项结果：
 
 ```
 PASS 原生库加载与 N-API 绑定 | libcaptrim CapTrim 0.1.0
@@ -433,6 +433,7 @@ PASS 预览时钟与丢帧统计 | 呈现 45 次 / 等待 45 次 / 位置 1500ms
 PASS 编辑后自动重绘 | 同帧不重复，改动后立即重绘
 PASS 音频主导时钟校正 | 漂移 50000us 已被校正
 PASS 错误码可读 | 0 → "ok"，未知片段正确报错
+PASS 滤镜 v1（effect 位 + filter_desc 翻译） | desc="hflip,negate,boxblur=2:1"，plan 携带 effects
 PASS FFmpeg 探测（软后端 probe） | format=mov,mp4,m4a,3gp,3g2,mj2 dur=22.73s streams=1[video]
 PASS FFmpeg 重封装（软后端 remux） | 写回 21.34MB，复探 1 路流
 PASS FFmpeg 复杂剪辑（滤镜+libx264重编码） | 1260x2720→320x180 codec=h264 fps≈15 0.06MB 进度 22 次
@@ -481,9 +482,9 @@ PASS Audio silence with no items            | rc=0 peak=0.0000
 
 Android 侧踩过三个坑：① NDK 不导出 `COLOR_FormatYUV420SemiPlanar` 这些颜色格式常量，按 AOSP 数值硬编码（NV12=21）；`AMediaCodec_getInputFormat` 是 API 28+，minSdk 26 下 stride 只能从输入 buffer 容量反推，slice 高度也不能按 16 对齐（`input layout invalid (cap=86400 stride=0 slice=0)` 就是对齐多了）。② x265 静态 archive 在本机 Windows/NDK 工具链下会给 `libavcodec.so` 留下 `x265_api_get_198` 未定义符号，Android 加载器直接拒绝加载；早期用 5 KB 装载桩加 `LD_PRELOAD` 绕过，后来换成真实交叉编译的 7.45 MB `libx265.so`，`libavcodec.so` 通过 `DT_NEEDED` 正常依赖它，自检脚本只需要 `LD_LIBRARY_PATH=.`。③ x265 的 CMakeLists 把 shared 库和 `.pc` 的 install 规则包在 `if(X265_LATEST_TAG)` 里，浅克隆没有 tag 时 `make install` 静默不装；构建脚本改为手动把产物装进 prefix，再用 `NEEDED libx265.so` 加文件大小大于 1 MB 双重校验。详见第十节坑 38–43。
 
-### Android 真机自检（Kotlin/JNI 层，16/16）
+### Android 真机自检（Kotlin/JNI 层，17/17）
 
-native 自检验的是 C ABI，这一层验的是宿主 App 实际走的路：`CapTrim.kt` → JNI → Rust → FFmpeg。`platforms/android/app` 是个最小 Activity，把 16 项检查跑在后台线程，结果打到 logcat（tag `CapTrimSelfCheck`）、屏幕和 `files/selfcheck.txt`。检查项和鸿蒙 `SelfCheck.ets` 同构：时间线、分割撤销重做、29.97fps 栅格、预览时钟、probe、remux、x264 复杂剪辑、真实 x265（复探 `codec=hevc`）、三段式管线软件基线与硬解硬编优先、硬编产物软解复验。
+native 自检验的是 C ABI，这一层验的是宿主 App 实际走的路：`CapTrim.kt` → JNI → Rust → FFmpeg。`platforms/android/app` 是个最小 Activity，把 17 项检查跑在后台线程，结果打到 logcat（tag `CapTrimSelfCheck`）、屏幕和 `files/selfcheck.txt`。检查项和鸿蒙 `SelfCheck.ets` 同构：时间线、分割撤销重做、29.97fps 栅格、预览时钟、滤镜 v1（filter_desc 翻译）、probe、remux、x264 复杂剪辑、真实 x265（复探 `codec=hevc`）、三段式管线软件基线与硬解硬编优先、硬编产物软解复验。
 
 ```bash
 bash scripts/run-android-app-selftest.sh
@@ -491,7 +492,7 @@ bash scripts/run-android-app-selftest.sh
 # 把 sample.mp4 推进 App 沙箱 → 拉起 → 轮询 logcat 里的 == selfcheck N/M passed ==
 ```
 
-小米 2211133C（Android 16 / API 36）实测 16/16：
+小米 2211133C（Android 16 / API 36）实测 17/17：
 
 ```
 PASS 原生库加载与 JNI 绑定 | libcaptrim CapTrim 0.1.0
@@ -503,6 +504,7 @@ PASS 预览时钟与丢帧统计 | 呈现 45 次 / 等待 45 次 / 位置 1499ms
 PASS 编辑后自动重绘 | 同帧不重复，改动后立即重绘
 PASS 音频主导时钟校正 | 漂移 50000us 已被校正
 PASS 错误码可读 | 0 → "ok"，未知片段正确报错
+PASS 滤镜 v1（effect 位 + filter_desc 翻译） | blur/invert/hflip → hflip,negate,boxblur=2:1；空数组 → 空串
 PASS FFmpeg 探测（软后端 probe） | format=mov,mp4,m4a,3gp,3g2,mj2 dur=22.73s streams=1[video]
 PASS FFmpeg 重封装（软后端 remux） | 写回 21.34MB，复探 1 路流
 PASS FFmpeg 复杂剪辑（滤镜+libx264重编码） | 1260x2720→320x180 codec=h264 fps≈15 0.06MB 进度 22 次
@@ -510,7 +512,7 @@ PASS FFmpeg 复杂剪辑（libx265 HEVC） | x265 真实编码 0.04MB codec=hevc
 PASS 三段式管线（软件基线 / 回退链路） | decode→filter→encode 0.06MB codec=h264 进度 29 次
 PASS 三段式管线（硬解/硬编优先，失败自动回退） | decode→filter→encode 0.06MB codec=h264 进度 29 次
 PASS 硬编产物可被 FFmpeg 软解（pipeline_hw.mp4） | FFmpeg 软解→重编码成功，进度 26 次
-== selfcheck 16/16 passed ==
+== selfcheck 17/17 passed ==
 ```
 
 推 sample 进 App 沙箱不能把 `adb shell` 当管道用：多参数会被设备 shell 重新解析，`>` 会落在错误的目录，stdin 转发 21 MB 还会被截断到几百字节。可靠做法是 `adb push` 到 `/data/local/tmp`，再在设备内 `cat ... | run-as ... sh -c 'cat > files/a.mp4'`，`scripts/run-android-app-selftest.sh` 里就是这么做的。

@@ -15,7 +15,11 @@ pub mod time;
 pub mod timeline;
 
 pub use clock::PlaybackClock;
-pub use effects::{effects_to_filter_desc, is_known_effect};
+pub use effects::{
+    effects_mask, effects_to_filter_desc, is_known_effect, CANONICAL_ORDER, EFFECT_BLUR,
+    EFFECT_BRIGHTNESS, EFFECT_CONTRAST, EFFECT_GRAYSCALE, EFFECT_HFLIP, EFFECT_INVERT,
+    EFFECT_SATURATION, EFFECT_VFLIP,
+};
 pub use error::{code_message, Error, Result};
 pub use export::{
     frame_index_ceil, plan_export, ExportAudioItem, ExportPlan, ExportSegment, ExportVideoItem,

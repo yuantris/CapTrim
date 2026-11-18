@@ -52,15 +52,68 @@ void main() {
 
 // samplerExternalOES because the decoder writes into a buffer the GPU samples
 // directly; there is no copy into a 2D texture anywhere in this path.
+//
+// The eight v1 effects mirror the FFmpeg chain in effects.rs. Bit values match
+// CAPTRIM_EFFECT_* / the core's EFFECT_* constants; application order matches
+// CANONICAL_ORDER: flips (UV) first, colour ops in the middle, blur last.
+// FFmpeg works in YUV and this shader in RGB, so the colour maths is an
+// *approximation* of the CPU side, not bit-identical — the contract is which
+// effects run and in what order, not the exact pixel values.
 constexpr const char *kFragmentShader = R"(#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
+precision highp int;
 uniform samplerExternalOES uTex;
 uniform float uOpacity;
+uniform uint uEffects;
+uniform vec2 uTexel; // 1 / source pixel size, for the blur taps
 in vec2 vUV;
 out vec4 fragColor;
+
+const uint EFFECT_HFLIP      = 1u << 0;
+const uint EFFECT_VFLIP      = 1u << 1;
+const uint EFFECT_BRIGHTNESS = 1u << 2;
+const uint EFFECT_CONTRAST   = 1u << 3;
+const uint EFFECT_SATURATION = 1u << 4;
+const uint EFFECT_GRAYSCALE  = 1u << 5;
+const uint EFFECT_INVERT     = 1u << 6;
+const uint EFFECT_BLUR       = 1u << 7;
+
+vec4 sampleTex(vec2 uv) {
+    return texture(uTex, clamp(uv, 0.0, 1.0));
+}
+
 void main() {
-    vec4 c = texture(uTex, vUV);
+    vec2 uv = vUV;
+    if ((uEffects & EFFECT_HFLIP) != 0u) uv.x = 1.0 - uv.x;
+    if ((uEffects & EFFECT_VFLIP) != 0u) uv.y = 1.0 - uv.y;
+
+    vec4 c;
+    if ((uEffects & EFFECT_BLUR) != 0u) {
+        // 5x5 box, separable into two 1-D passes of 5 taps (boxblur=2:1).
+        // tex_matrix may rotate, so blur along the sampled UV axes.
+        vec4 sum = vec4(0.0);
+        for (int j = -2; j <= 2; j++) {
+            for (int i = -2; i <= 2; i++) {
+                sum += sampleTex(uv + vec2(float(i), float(j)) * uTexel);
+            }
+        }
+        c = sum / 25.0;
+    } else {
+        c = sampleTex(uv);
+    }
+
+    if ((uEffects & EFFECT_BRIGHTNESS) != 0u) c.rgb += 0.15;
+    if ((uEffects & EFFECT_CONTRAST) != 0u)   c.rgb = (c.rgb - 0.5) * 1.30 + 0.5;
+    if ((uEffects & EFFECT_SATURATION) != 0u) {
+        float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+        c.rgb = mix(vec3(luma), c.rgb, 1.30);
+    }
+    if ((uEffects & EFFECT_GRAYSCALE) != 0u) {
+        c.rgb = vec3(dot(c.rgb, vec3(0.299, 0.587, 0.114)));
+    }
+    if ((uEffects & EFFECT_INVERT) != 0u) c.rgb = 1.0 - c.rgb;
+
     fragColor = vec4(c.rgb, c.a * uOpacity);
 }
 )";
@@ -155,6 +208,8 @@ struct GlCompositor {
     GLint uTexMatrix;
     GLint uOpacity;
     GLint uTex;
+    GLint uEffects;
+    GLint uTexel;
 };
 
 int32_t CompositorMakeCurrent(GlCompositor *c) {
@@ -254,6 +309,8 @@ GlCompositor *CompositorCreate(OHNativeWindow *window, int32_t width, int32_t he
     c->uTexMatrix = glGetUniformLocation(c->program, "uTexMatrix");
     c->uOpacity = glGetUniformLocation(c->program, "uOpacity");
     c->uTex = glGetUniformLocation(c->program, "uTex");
+    c->uEffects = glGetUniformLocation(c->program, "uEffects");
+    c->uTexel = glGetUniformLocation(c->program, "uTexel");
 
     glGenBuffers(1, &c->vbo);
     glBindBuffer(GL_ARRAY_BUFFER, c->vbo);
@@ -527,6 +584,15 @@ int32_t CompositorDraw(GlCompositor *c, const CompLayer *layers, int32_t count) 
             glUniformMatrix4fv(c->uTexMatrix, 1, GL_FALSE,
                                layer.tex_matrix != nullptr ? layer.tex_matrix : kIdentity);
             glUniform1f(c->uOpacity, layer.opacity);
+
+            // v1 effects: the bit mask comes straight from the core's frame
+            // plan (CAPTRIM_EFFECT_*), applied in the shader's canonical order.
+            glUniform1ui(c->uEffects, layer.effects);
+            // uTexel is in sampled-UV units; source pixels map through the fit
+            // scale, but a 1/src tap is a stable approximation for the box blur.
+            glUniform2f(c->uTexel,
+                        layer.src_w > 0 ? 1.0f / static_cast<float>(layer.src_w) : 0.0f,
+                        layer.src_h > 0 ? 1.0f / static_cast<float>(layer.src_h) : 0.0f);
 
             glBindTexture(GL_TEXTURE_EXTERNAL_OES, layer.texture);
             glDrawArrays(GL_TRIANGLES, 0, 6);

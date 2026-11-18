@@ -1134,6 +1134,7 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
         out.dy = layer->dy;
         out.rotation_deg = layer->rotation_deg;
         out.opacity = layer->opacity;
+        out.effects = layer->effects;
         if (fresh[which] != 0) {
             any_new = 1;
         }

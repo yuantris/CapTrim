@@ -379,6 +379,29 @@ export class SelfCheck {
       return `0 → "${ok}"，未知片段正确报错`;
     });
 
+    SelfCheck.check(results, '滤镜 v1（effect 位 + filter_desc 翻译）', (): string => {
+      // The translation ABI is the single source of the FFmpeg chain: the
+      // platform never duplicates the vocabulary or its constants.
+      const desc = CapTrim.effectsToFilterDesc(['blur', 'invert', 'hflip']);
+      expect(desc === 'hflip,negate,boxblur=2:1',
+        `effects 翻译应为 hflip,negate,boxblur=2:1，实际 "${desc}"`);
+      expect(CapTrim.effectsToFilterDesc([]) === '', '空 effects 应翻成空链');
+
+      // set_effects survives into the export plan as the per-segment effects
+      // list, which is exactly what the exporter feeds back to the translation.
+      const fx = new Fixture();
+      try {
+        fx.editor.apply(`{"type":"set_effects","clip_id":${fx.firstClip},` +
+          '"effects":["hflip","invert"]}');
+        const plan = JSON.stringify(fx.editor.exportPlan());
+        expect(plan.includes('"hflip"'), `exportPlan 未携带 effects: ${plan}`);
+        expect(plan.includes('"invert"'), `exportPlan 未携带 invert: ${plan}`);
+        return `desc="${desc}"，plan 携带 effects`;
+      } finally {
+        fx.close();
+      }
+    });
+
     // ---- FFmpeg 软件后端（probe / remux） ---------------------------------
     // These exercise the real FFmpeg C shim (libcaptrim_ffmpeg.so + the FFmpeg
     // shared libraries) through the same N-API the Rust FfmpegBackend uses, so a

@@ -114,6 +114,15 @@ int32_t captrim_engine_plan_audio(captrim_engine_t *engine, int64_t t_us,
  * captrim_string_free(). */
 int32_t captrim_engine_export_plan(captrim_engine_t *engine, char **out_json);
 
+/* Translate an `ExportVideoItem.effects` list into the FFmpeg filter_desc for
+ * captrim_engine_export_transcode(). `effects_json` is a JSON array of effect
+ * names (e.g. ["hflip","invert"]), the exact shape found in the export plan.
+ * The core owns the vocabulary and constants, so the platform never duplicates
+ * them. `out_desc` is an empty string when there is nothing to apply; release
+ * it with captrim_string_free(). Invalid JSON or an unknown name is an error. */
+int32_t captrim_effects_to_filter_desc(const char *effects_json,
+                                       char **out_desc);
+
 /* Timeline length. Either out pointer may be NULL. */
 int32_t captrim_engine_duration(captrim_engine_t *engine,
                                 int64_t *out_duration_us,
@@ -192,6 +201,20 @@ int32_t captrim_preview_stats(captrim_preview_t *preview,
 
 #define CAPTRIM_MAX_LAYERS 8
 
+/* Effect bits in captrim_layer_desc_t.effects. The bit index is the effect's
+ * position in the v1 canonical order (hflip, vflip, brightness, contrast,
+ * saturation, grayscale, invert, blur) — the same order the GLSL compositor
+ * applies them and effects_to_filter_desc() emits them. The Rust core's
+ * EFFECT_* constants and effects_mask() are the single source of truth. */
+#define CAPTRIM_EFFECT_HFLIP      (1u << 0)
+#define CAPTRIM_EFFECT_VFLIP      (1u << 1)
+#define CAPTRIM_EFFECT_BRIGHTNESS (1u << 2)
+#define CAPTRIM_EFFECT_CONTRAST   (1u << 3)
+#define CAPTRIM_EFFECT_SATURATION (1u << 4)
+#define CAPTRIM_EFFECT_GRAYSCALE  (1u << 5)
+#define CAPTRIM_EFFECT_INVERT     (1u << 6)
+#define CAPTRIM_EFFECT_BLUR       (1u << 7)
+
 /* Same values as the JSON "kind" field of a layer. */
 typedef enum {
     CAPTRIM_LAYER_VIDEO = 0,
@@ -212,6 +235,8 @@ typedef struct {
     float dy;
     float rotation_deg;
     float opacity;
+    /* Bit mask of CAPTRIM_EFFECT_* applied to this layer by the renderer. */
+    uint32_t effects;
 } captrim_layer_desc_t;
 
 typedef struct {

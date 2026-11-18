@@ -16,6 +16,7 @@ import {
   planFrameAt as nativePlanFrameAt,
   planFrame as nativePlanFrame,
   exportPlan as nativeExportPlan,
+  effectsToFilterDesc as nativeEffectsToFilterDesc,
   duration as nativeDuration,
   previewNew,
   previewFree,
@@ -212,6 +213,19 @@ export class CapTrim {
 
   static codeMessage(code: number): string {
     return nativeCodeMessage(code).value;
+  }
+
+  /**
+   * Translate an ExportVideoItem.effects list into the FFmpeg filter_desc for
+   * exportTranscode(). The vocabulary and constants live in the Rust core, so
+   * the export path never duplicates them: read `effects` from a cached export
+   * plan, pass it here, and feed the result to exportTranscode(). An empty list
+   * yields an empty string (passthrough).
+   */
+  static effectsToFilterDesc(effects: string[]): string {
+    const result: StringResult = nativeEffectsToFilterDesc(JSON.stringify(effects));
+    CapTrim.checkStatus(result.code);
+    return result.value;
   }
 
   private static checkStatus(code: number): void {

@@ -11,7 +11,7 @@
 
 use crate::preview::{captrim_preview_t, preview_from, state};
 use crate::{ffi_guard, Error};
-use captrim_core::{LayerKind, Step};
+use captrim_core::{effects_mask, LayerKind, Step};
 use std::os::raw::c_int;
 
 /// Must match `CAPTRIM_MAX_LAYERS` in captrim.h.
@@ -32,6 +32,10 @@ pub struct CaptrimLayerDesc {
     pub dy: f32,
     pub rotation_deg: f32,
     pub opacity: f32,
+    /// Bit mask of the v1 effects (CAPTRIM_EFFECT_* in captrim.h), packed from
+    /// `Layer.effects` by the core so the renderer needs no vocabulary of its
+    /// own. Kept last so every existing field keeps its offset.
+    pub effects: u32,
 }
 
 /// Must match `captrim_frame_desc_t`.
@@ -99,6 +103,7 @@ fn fill(out: &mut CaptrimFrameDesc, plan: &captrim_core::FramePlan) -> Result<()
             dy: layer.transform.dy,
             rotation_deg: layer.transform.rotation_deg,
             opacity: layer.opacity,
+            effects: effects_mask(&layer.effects),
         };
         written += 1;
     }
@@ -220,6 +225,25 @@ mod tests {
         assert_eq!(layer_kind_code(LayerKind::Video), 0);
         assert_eq!(layer_kind_code(LayerKind::Subtitle), 1);
         assert_eq!(layer_kind_code(LayerKind::Overlay), 2);
+    }
+
+    #[test]
+    fn effects_are_packed_into_the_layer_bit_mask() {
+        let mut l = layer(0, LayerKind::Video, 0);
+        l.effects = vec!["blur".into(), "hflip".into(), "invert".into()];
+        let mut out = CaptrimFrameDesc::default();
+        fill(&mut out, &plan(vec![l])).unwrap();
+
+        // Bits match CAPTRIM_EFFECT_* in captrim.h (hflip=1<<0, invert=1<<6,
+        // blur=1<<7); insertion order does not matter.
+        assert_eq!(out.layers[0].effects, (1 << 0) | (1 << 6) | (1 << 7));
+    }
+
+    #[test]
+    fn effects_mask_is_zero_when_no_effects_are_set() {
+        let mut out = CaptrimFrameDesc::default();
+        fill(&mut out, &plan(vec![layer(0, LayerKind::Video, 0)])).unwrap();
+        assert_eq!(out.layers[0].effects, 0);
     }
 
     #[test]

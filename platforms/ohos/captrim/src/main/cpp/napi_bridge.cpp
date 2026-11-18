@@ -374,6 +374,20 @@ napi_value ExportPlan(napi_env env, napi_callback_info info) {
     return StringResult(env, code, json);
 }
 
+// Translate an ExportVideoItem.effects JSON array into the FFmpeg filter_desc
+// used by exportTranscode. The vocabulary and constants live in the Rust core,
+// so this bridge never duplicates them.
+napi_value EffectsToFilterDesc(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return StringResult(env, CAPTRIM_ERR_INVALID, nullptr);
+    JsString effects = JsString::From(env, args[0]);
+    char *desc = nullptr;
+    int32_t code = captrim_effects_to_filter_desc(effects.c_str(), &desc);
+    return StringResult(env, code, desc);
+}
+
 napi_value Duration(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1] = {nullptr};
@@ -629,6 +643,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"planFrameAt", nullptr, PlanFrameAt, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"planFrame", nullptr, PlanFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportPlan", nullptr, ExportPlan, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"effectsToFilterDesc", nullptr, EffectsToFilterDesc, nullptr, nullptr, nullptr,
+         napi_default, nullptr},
         {"duration", nullptr, Duration, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"previewNew", nullptr, PreviewNew, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"previewFree", nullptr, PreviewFree, nullptr, nullptr, nullptr, napi_default, nullptr},

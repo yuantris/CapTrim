@@ -57,6 +57,7 @@ object CapTrimNative {
     external fun nativePlanFrameAt(handle: Long, frameIndex: Long): String
     external fun nativePlanFrame(handle: Long, tUs: Long): String
     external fun nativeExportPlan(handle: Long): String
+    external fun nativeEffectsToFilterDesc(effectsJson: String): String
     external fun nativeDuration(handle: Long, out: LongArray): Int
 
     external fun nativePreviewNew(engine: Long): Long
@@ -97,6 +98,19 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
 
         @JvmStatic
         fun lastError(): String = CapTrimNative.nativeLastError()
+
+        /**
+         * Translate an ExportVideoItem.effects list into the FFmpeg filter_desc
+         * for exportTranscode(). The vocabulary and constants live in the Rust
+         * core, so the AAR never duplicates them (and stays dependency-free).
+         * Effect names are lowercase identifiers from the fixed v1 vocabulary,
+         * so a JSON array needs no general-purpose escaping.
+         */
+        @JvmStatic
+        fun effectsToFilterDesc(vararg effects: String): String {
+            val json = effects.joinToString(",", "[", "]") { "\"$it\"" }
+            return CapTrimNative.nativeEffectsToFilterDesc(json)
+        }
     }
 
     private fun requireOpen(): Long = handle.also {

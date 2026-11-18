@@ -256,6 +256,19 @@ jstring nativeExportPlan(JNIEnv *env, jobject, jlong handle) {
     return planResult(env, code, json);
 }
 
+// Translate an ExportVideoItem.effects JSON array into the FFmpeg filter_desc
+// used by exportTranscode. The core owns the vocabulary and its constants.
+jstring nativeEffectsToFilterDesc(JNIEnv *env, jobject, jstring effectsJson) {
+    Utf8 effects(env, effectsJson);
+    if (!effects.get()) {
+        throwError(env, CAPTRIM_ERR_INVALID);
+        return nullptr;
+    }
+    char *desc = nullptr;
+    int32_t code = captrim_effects_to_filter_desc(effects.get(), &desc);
+    return planResult(env, code, desc);
+}
+
 jint nativeDuration(JNIEnv *env, jobject, jlong handle, jlongArray out) {
     int64_t duration_us = 0;
     uint64_t frames = 0;
@@ -348,6 +361,8 @@ JNINativeMethod kMethods[] = {
     {"nativePlanFrameAt", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrameAt)},
     {"nativePlanFrame", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrame)},
     {"nativeExportPlan", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeExportPlan)},
+    {"nativeEffectsToFilterDesc", "(Ljava/lang/String;)Ljava/lang/String;",
+     reinterpret_cast<void *>(nativeEffectsToFilterDesc)},
     {"nativeDuration", "(J[J)I", reinterpret_cast<void *>(nativeDuration)},
     {"nativePreviewNew", "(J)J", reinterpret_cast<void *>(nativePreviewNew)},
     {"nativePreviewFree", "(J)V", reinterpret_cast<void *>(nativePreviewFree)},

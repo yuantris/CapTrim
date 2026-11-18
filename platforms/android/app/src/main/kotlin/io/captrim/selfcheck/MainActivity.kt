@@ -329,6 +329,15 @@ private class Runner(private val filesDir: String) {
             """0 → "$ok"，未知片段正确报错"""
         }
 
+        check("滤镜 v1（effect 位 + filter_desc 翻译）") {
+            val desc = CapTrim.effectsToFilterDesc("blur", "invert", "hflip")
+            expect(desc == "hflip,negate,boxblur=2:1",
+                "canonical order 翻译错误：$desc")
+            val empty = CapTrim.effectsToFilterDesc()
+            expect(empty.isEmpty(), "空 effects 应翻译为空串，实际 \"$empty\"")
+            "blur/invert/hflip → $desc；空数组 → 空串"
+        }
+
         // ---- FFmpeg 软件后端 ------------------------------------------------
         check("FFmpeg 探测（软后端 probe）") {
             CapTrim.create().use { engine ->

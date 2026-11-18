@@ -56,6 +56,9 @@ struct CompSource;
 ///     width / height, and +dy moves down (screen convention, not NDC).
 ///   * `rotation_deg` rotates around the layer's centre, clockwise on screen.
 ///   * `opacity` multiplies the layer's alpha, 0..1.
+///   * `effects` is the CAPTRIM_EFFECT_* bit mask from the frame plan; the
+///     compositor applies the set bits in the canonical order shared with the
+///     FFmpeg export chain.
 struct CompLayer {
     /// GL_TEXTURE_EXTERNAL_OES owned by the caller, from CompositorNewTexture.
     uint32_t texture;
@@ -69,6 +72,7 @@ struct CompLayer {
     float dy;
     float rotation_deg;
     float opacity;
+    uint32_t effects;
 };
 
 /// Creates the EGL context and binds it to `window`.

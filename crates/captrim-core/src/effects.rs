@@ -30,6 +30,44 @@ pub const CANONICAL_ORDER: [&str; 8] = [
     "blur",
 ];
 
+/// Bit for each effect in the binary frame plan. The bit index is the effect's
+/// position in [`CANONICAL_ORDER`]; the C header (`CAPTRIM_EFFECT_*`) and the
+/// GLSL compositor must agree with these exactly. A `u32` is enough for the
+/// eight v1 names and keeps `captrim_layer_desc_t` a scalar-only POD.
+pub const EFFECT_HFLIP: u32 = 1 << 0;
+pub const EFFECT_VFLIP: u32 = 1 << 1;
+pub const EFFECT_BRIGHTNESS: u32 = 1 << 2;
+pub const EFFECT_CONTRAST: u32 = 1 << 3;
+pub const EFFECT_SATURATION: u32 = 1 << 4;
+pub const EFFECT_GRAYSCALE: u32 = 1 << 5;
+pub const EFFECT_INVERT: u32 = 1 << 6;
+pub const EFFECT_BLUR: u32 = 1 << 7;
+
+const EFFECT_BITS: [u32; 8] = [
+    EFFECT_HFLIP,
+    EFFECT_VFLIP,
+    EFFECT_BRIGHTNESS,
+    EFFECT_CONTRAST,
+    EFFECT_SATURATION,
+    EFFECT_GRAYSCALE,
+    EFFECT_INVERT,
+    EFFECT_BLUR,
+];
+
+/// Pack a clip's effect list into the bit mask carried by
+/// `captrim_layer_desc_t.effects`. Duplicates naturally collapse, matching the
+/// set semantics of the vocabulary. Unknown names are ignored here (the model
+/// rejects them at edit time); the mask is a rendering hint, not a validator.
+pub fn effects_mask(effects: &[String]) -> u32 {
+    let mut mask = 0u32;
+    for (i, name) in CANONICAL_ORDER.iter().enumerate() {
+        if effects.iter().any(|effect| effect == name) {
+            mask |= EFFECT_BITS[i];
+        }
+    }
+    mask
+}
+
 /// Is `name` part of the v1 vocabulary? [`crate::model::Clip::validate`]
 /// rejects anything else, so a draft can never carry an effect that no
 /// backend renders.
@@ -137,5 +175,26 @@ mod tests {
         let err = effects_to_filter_desc(&names(&["sepia"])).unwrap_err();
         assert!(err.to_string().contains("sepia"), "{err}");
         assert_eq!(err.code(), -1);
+    }
+
+    #[test]
+    fn mask_bit_matches_canonical_position() {
+        // The C header and GLSL use these exact bit values; pin them here so a
+        // reorder of CANONICAL_ORDER cannot silently desync the backends.
+        assert_eq!(effects_mask(&names(&["hflip"])), 1 << 0);
+        assert_eq!(effects_mask(&names(&["vflip"])), 1 << 1);
+        assert_eq!(effects_mask(&names(&["brightness"])), 1 << 2);
+        assert_eq!(effects_mask(&names(&["contrast"])), 1 << 3);
+        assert_eq!(effects_mask(&names(&["saturation"])), 1 << 4);
+        assert_eq!(effects_mask(&names(&["grayscale"])), 1 << 5);
+        assert_eq!(effects_mask(&names(&["invert"])), 1 << 6);
+        assert_eq!(effects_mask(&names(&["blur"])), 1 << 7);
+    }
+
+    #[test]
+    fn mask_collapses_duplicates_and_ignores_order() {
+        let mask = effects_mask(&names(&["blur", "hflip", "blur", "invert"]));
+        assert_eq!(mask, EFFECT_HFLIP | EFFECT_INVERT | EFFECT_BLUR);
+        assert_eq!(effects_mask(&[]), 0);
     }
 }
