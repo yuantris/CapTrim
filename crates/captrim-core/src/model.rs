@@ -102,6 +102,11 @@ pub struct Clip {
     /// cut. Serialised away when absent so older drafts still parse.
     #[serde(default)]
     pub transition_in: Option<Transition>,
+    /// UTF-8 text carried by a subtitle clip. `None` for media clips. A clip on
+    /// a `Subtitle` track must have text; a media clip must not. Older drafts
+    /// parse with `None` because the field defaults away.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 impl Clip {
@@ -117,6 +122,7 @@ impl Clip {
             transform: Transform::default(),
             effects: Vec::new(),
             transition_in: None,
+            text: None,
         }
     }
 
@@ -189,6 +195,11 @@ impl Clip {
         for effect in &self.effects {
             if !crate::effects::is_known_effect(effect) {
                 return Err(Error::invalid(format!("unknown effect: {effect}")));
+            }
+        }
+        if let Some(text) = &self.text {
+            if text.trim().is_empty() {
+                return Err(Error::invalid("subtitle text must not be blank"));
             }
         }
         Ok(())
@@ -315,11 +326,29 @@ impl Timeline {
                 if !ids.insert(c.id) {
                     return Err(Error::invalid(format!("duplicate clip id {}", c.id)));
                 }
-                if !self.media.iter().any(|m| m.id == c.source) {
-                    return Err(Error::invalid(format!(
-                        "clip {} references unknown media {}",
-                        c.id, c.source
-                    )));
+                if t.kind == TrackKind::Subtitle {
+                    // Subtitle clips carry their pixels as text; they have no
+                    // media source to look up. `source` is unused and kept at
+                    // 0 so the frame plan can still address them uniformly.
+                    if c.text.is_none() {
+                        return Err(Error::invalid(format!(
+                            "subtitle clip {} has no text",
+                            c.id
+                        )));
+                    }
+                } else {
+                    if c.text.is_some() {
+                        return Err(Error::invalid(format!(
+                            "clip {} carries text but is not on a subtitle track",
+                            c.id
+                        )));
+                    }
+                    if !self.media.iter().any(|m| m.id == c.source) {
+                        return Err(Error::invalid(format!(
+                            "clip {} references unknown media {}",
+                            c.id, c.source
+                        )));
+                    }
                 }
             }
         }
@@ -426,5 +455,65 @@ mod tests {
         let err = c.validate().expect_err("unknown effects are rejected");
         assert!(err.to_string().contains("sepia"), "{err}");
         assert_eq!(err.code(), -1);
+    }
+
+    #[test]
+    fn subtitle_clip_needs_text_and_media_clip_must_not_carry_it() {
+        let mut t = Timeline::default();
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::Subtitle,
+            clips: vec![Clip {
+                id: 2,
+                ..Clip::new(0, 0, 1_000_000, 0)
+            }],
+        });
+        let err = t
+            .validate()
+            .expect_err("a subtitle clip without text is invalid");
+        assert!(err.to_string().contains("no text"), "{err}");
+
+        t.tracks[0].clips[0].text = Some("  Hello  ".into());
+        t.validate()
+            .expect("text with content is valid with no media source");
+
+        // Blank text is rejected even though it is `Some`.
+        t.tracks[0].clips[0].text = Some("   ".into());
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn subtitle_text_survives_draft_json_round_trip() {
+        let mut t = Timeline::default();
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::Subtitle,
+            clips: vec![Clip {
+                id: 2,
+                text: Some("你好，世界 🌍".into()),
+                ..Clip::new(0, 0, 2_000_000, 1_000_000)
+            }],
+        });
+        let json = t.to_draft_json().unwrap();
+        let back = Timeline::from_draft_json(&json).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(
+            back.tracks[0].clips[0].text.as_deref(),
+            Some("你好，世界 🌍")
+        );
+    }
+
+    #[test]
+    fn older_draft_json_without_text_still_parses_for_media_clips() {
+        let json = r#"{"version":1,"width":1920,"height":1080,
+            "frame_rate":{"num":30,"den":1},
+            "media":[{"id":1,"uri":"file:///v.mp4","info":null}],
+            "tracks":[{"id":1,"kind":"main_video","clips":[
+              {"id":2,"source":1,"in_us":0,"out_us":1000000,"start_us":0,
+               "speed":{"num":1,"den":1},"volume":1.0,
+               "transform":{"scale":1.0,"dx":0.0,"dy":0.0,"rotation_deg":0.0},
+               "effects":[]}]}]}"#;
+        let t = Timeline::from_draft_json(json).unwrap();
+        assert_eq!(t.tracks[0].clips[0].text, None);
     }
 }

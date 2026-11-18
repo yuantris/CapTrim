@@ -41,6 +41,10 @@ pub struct Layer {
     pub transform: Transform,
     pub opacity: f32,
     pub effects: Vec<String>,
+    /// Text to draw, populated only for `LayerKind::Subtitle`. Empty on every
+    /// other layer kind so a compositor can switch on kind alone.
+    #[serde(default)]
+    pub text: String,
 }
 
 /// One audio contributor of one output instant.
@@ -295,7 +299,17 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
                 .unwrap_or_default();
 
             let source_is_video = source_may_have(timeline, clip.source, true);
-            if track.kind != TrackKind::Audio && source_is_video && clip.transform.scale > 0.0 {
+            // Subtitle clips have no media source, so the video-detection gate
+            // must not apply to them: an unprobed (or source-less) text clip is
+            // still a layer the compositor has to draw. Audio tracks contribute
+            // no pixels at all.
+            let is_subtitle = track.kind == TrackKind::Subtitle;
+            let visible = if is_subtitle {
+                clip.transform.scale > 0.0
+            } else {
+                track.kind != TrackKind::Audio && source_is_video && clip.transform.scale > 0.0
+            };
+            if visible {
                 layers.push((
                     clip.start_us,
                     Layer {
@@ -308,6 +322,11 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
                         transform: clip.transform.clone(),
                         opacity: transition_opacity(clip, snapped_us),
                         effects: clip.effects.clone(),
+                        text: if is_subtitle {
+                            clip.text.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
                     },
                 ));
             }
@@ -734,5 +753,54 @@ mod tests {
         assert_eq!(mid.layers[0].clip_id, 20, "outgoing stays on the bottom");
         assert_eq!(mid.layers[1].clip_id, 11, "incoming ramps on top");
         assert_eq!(mid.layers[1].opacity, 0.5);
+    }
+
+    #[test]
+    fn subtitle_layer_is_planned_without_a_media_source() {
+        let mut t = Timeline {
+            frame_rate: Rational::new(30, 1).unwrap(),
+            ..Timeline::default()
+        };
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![Clip::new(1, 0, 2_000_000, 0)],
+        });
+        let mut subtitle = Clip::new(0, 0, 2_000_000, 1_000_000);
+        subtitle.id = 99;
+        subtitle.text = Some("字幕在此".into());
+        t.tracks.push(Track {
+            id: 2,
+            kind: TrackKind::Subtitle,
+            clips: vec![subtitle],
+        });
+        // No media entry for source 0 -- a video-sourced clip with this source
+        // would still be included (unprobed defaults to "may have video"), but
+        // the subtitle path must be independent of probing altogether.
+        t.media.push(MediaSource {
+            id: 1,
+            uri: "file:///v.mp4".into(),
+            info: None,
+        });
+
+        let before = plan_frame_at_index(&t, 0); // frame 0: 0 us, subtitle not started
+        assert_eq!(before.layers.len(), 1);
+        assert_eq!(before.layers[0].kind, LayerKind::Video);
+        assert!(before.layers[0].text.is_empty());
+
+        let during = plan_frame_at_index(&t, 45); // 1.5 s, inside subtitle
+        assert_eq!(during.layers.len(), 2);
+        let sub = during
+            .layers
+            .iter()
+            .find(|l| l.kind == LayerKind::Subtitle)
+            .unwrap();
+        assert_eq!(sub.clip_id, 99);
+        assert_eq!(sub.text, "字幕在此");
+        assert_eq!(sub.z, 1, "subtitle track sits above the main video");
+        assert_eq!(sub.uri, "", "text layers carry no media URI");
+
+        let after = plan_frame_at_index(&t, 90); // 3 s, past both clips
+        assert!(after.layers.is_empty());
     }
 }

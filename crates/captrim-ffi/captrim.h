@@ -283,6 +283,12 @@ int32_t captrim_preview_step_frame(captrim_preview_t *preview,
 int32_t captrim_engine_source_uri(captrim_engine_t *engine, uint64_t source_id,
                                   char *buf, int32_t buf_len, int32_t *out_len);
 
+/* UTF-8 text of a subtitle clip, addressed by the clip_id from a frame plan.
+ * Same buffer protocol as captrim_engine_source_uri: a short buffer fails with
+ * CAPTRIM_ERR_OUT_OF_RANGE and still writes the required length to *out_len. */
+int32_t captrim_engine_clip_text(captrim_engine_t *engine, uint64_t clip_id,
+                                 char *buf, int32_t buf_len, int32_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

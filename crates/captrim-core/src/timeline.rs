@@ -71,6 +71,22 @@ pub enum Command {
         clip_id: Id,
         effects: Vec<String>,
     },
+    /// Insert a text clip on a subtitle track. Text clips have no media source
+    /// (`source` stays 0); their timeline length is carried by `duration_us`
+    /// via `in_us = 0, out_us = duration_us`, so all the existing duration and
+    /// overlap arithmetic applies unchanged. Placement uses the ordinary
+    /// `SetTransform` command rather than a second, text-specific one.
+    InsertTextClip {
+        track_id: Id,
+        text: String,
+        start_us: i64,
+        duration_us: i64,
+    },
+    /// Replace the text of an existing subtitle clip in place.
+    SetText {
+        clip_id: Id,
+        text: String,
+    },
     RemoveTrack {
         track_id: Id,
     },
@@ -259,6 +275,55 @@ impl Timeline {
             Command::SetEffects { clip_id, effects } => {
                 let clip = find_clip_mut(self, *clip_id)?;
                 clip.effects = effects.clone();
+                clip.validate()?;
+                Ok(None)
+            }
+
+            Command::InsertTextClip {
+                track_id,
+                text,
+                start_us,
+                duration_us,
+            } => {
+                if text.trim().is_empty() {
+                    return Err(Error::invalid("subtitle text must not be blank"));
+                }
+                if *duration_us <= 0 {
+                    return Err(Error::invalid("subtitle duration must be positive"));
+                }
+                let id = self.next_id();
+                let track = self
+                    .find_track_mut(*track_id)
+                    .ok_or_else(|| Error::not_found(format!("track {track_id}")))?;
+                if track.kind != TrackKind::Subtitle {
+                    return Err(Error::invalid("InsertTextClip requires a subtitle track"));
+                }
+                let mut clip = Clip::new(0, 0, *duration_us, *start_us);
+                clip.id = id;
+                clip.text = Some(text.clone());
+                clip.validate()?;
+                if track.clips.iter().any(|c| overlaps(c, &clip)) {
+                    return Err(Error::OutOfRange(
+                        "subtitle overlaps an existing clip on this track".into(),
+                    ));
+                }
+                track.clips.push(clip);
+                track.clips.sort_by_key(|c| c.start_us);
+                Ok(Some(id))
+            }
+
+            Command::SetText { clip_id, text } => {
+                if text.trim().is_empty() {
+                    return Err(Error::invalid("subtitle text must not be blank"));
+                }
+                let (_, clip) = self
+                    .find_clip(*clip_id)
+                    .ok_or_else(|| Error::not_found(format!("clip {clip_id}")))?;
+                if clip.text.is_none() {
+                    return Err(Error::invalid("SetText requires a subtitle clip"));
+                }
+                let clip = find_clip_mut(self, *clip_id)?;
+                clip.text = Some(text.clone());
                 clip.validate()?;
                 Ok(None)
             }
@@ -736,5 +801,149 @@ mod tests {
         });
         assert!(err.is_err());
         assert_eq!(*e.timeline(), before);
+    }
+
+    #[test]
+    fn insert_text_clip_needs_a_subtitle_track_and_is_undoable() {
+        let mut e = Editor::new();
+        let video_track = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::MainVideo,
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            e.apply(&Command::InsertTextClip {
+                track_id: video_track,
+                text: "wrong track".into(),
+                start_us: 0,
+                duration_us: 1_000_000,
+            })
+            .is_err(),
+            "text clips belong on a subtitle track"
+        );
+
+        let track = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::Subtitle,
+            })
+            .unwrap()
+            .unwrap();
+        let id = e
+            .apply(&Command::InsertTextClip {
+                track_id: track,
+                text: "第一行".into(),
+                start_us: 1_000_000,
+                duration_us: 2_000_000,
+            })
+            .unwrap()
+            .unwrap();
+        let clip = e.timeline().find_clip(id).unwrap().1;
+        assert_eq!(clip.text.as_deref(), Some("第一行"));
+        assert_eq!(clip.source, 0, "text clips have no media source");
+        assert_eq!(clip.duration_us(), 2_000_000);
+        assert_eq!(e.timeline().duration_us(), 3_000_000);
+
+        assert!(e.undo());
+        assert!(e.timeline().find_clip(id).is_none());
+        assert!(e.redo());
+        assert!(e.timeline().find_clip(id).is_some());
+    }
+
+    #[test]
+    fn set_text_updates_only_subtitle_clips_and_rejects_blank() {
+        let mut e = Editor::new();
+        let track = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::Subtitle,
+            })
+            .unwrap()
+            .unwrap();
+        let id = e
+            .apply(&Command::InsertTextClip {
+                track_id: track,
+                text: "old".into(),
+                start_us: 0,
+                duration_us: 1_000_000,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(e
+            .apply(&Command::SetText {
+                clip_id: id,
+                text: "   ".into(),
+            })
+            .is_err());
+        e.apply(&Command::SetText {
+            clip_id: id,
+            text: "new".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            e.timeline().find_clip(id).unwrap().1.text.as_deref(),
+            Some("new")
+        );
+
+        let media_id = e
+            .apply(&Command::AddMedia {
+                uri: "file:///v.mp4".into(),
+            })
+            .unwrap()
+            .unwrap();
+        let video_track = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::MainVideo,
+            })
+            .unwrap()
+            .unwrap();
+        let media_clip = e
+            .apply(&Command::InsertClip {
+                track_id: video_track,
+                clip: Clip::new(media_id, 0, 1_000_000, 0),
+            })
+            .unwrap()
+            .unwrap();
+        assert!(e
+            .apply(&Command::SetText {
+                clip_id: media_clip,
+                text: "not allowed".into(),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn text_clips_overlap_check_uses_the_same_rules_as_media_clips() {
+        let mut e = Editor::new();
+        let track = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::Subtitle,
+            })
+            .unwrap()
+            .unwrap();
+        e.apply(&Command::InsertTextClip {
+            track_id: track,
+            text: "a".into(),
+            start_us: 1_000_000,
+            duration_us: 2_000_000,
+        })
+        .unwrap();
+        assert!(
+            e.apply(&Command::InsertTextClip {
+                track_id: track,
+                text: "b".into(),
+                start_us: 2_000_000,
+                duration_us: 2_000_000,
+            })
+            .is_err(),
+            "overlapping subtitles are rejected"
+        );
+        e.apply(&Command::InsertTextClip {
+            track_id: track,
+            text: "b".into(),
+            start_us: 3_000_000,
+            duration_us: 2_000_000,
+        })
+        .unwrap();
     }
 }

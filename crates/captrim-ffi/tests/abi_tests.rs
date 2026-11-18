@@ -221,3 +221,92 @@ fn host_build_reports_missing_native_backend_explicitly() {
         -4
     );
 }
+
+#[test]
+fn subtitle_clip_text_is_readable_by_clip_id_with_buffer_retry() {
+    let e = TestEngine::new();
+    let mut created: u64 = 0;
+
+    let track = c(r#"{"type":"add_track","kind":"subtitle"}"#);
+    assert_eq!(
+        captrim_engine_apply(e.handle(), track.as_ptr(), &mut created),
+        0
+    );
+    let subtitle_track = created;
+
+    let insert = c(
+        r#"{"type":"insert_text_clip","track_id":1,"text":"你好 CapTrim",
+                     "start_us":1000000,"duration_us":2000000}"#,
+    );
+    assert_eq!(
+        captrim_engine_apply(e.handle(), insert.as_ptr(), &mut created),
+        0
+    );
+    assert_ne!(created, 0);
+    let clip_id = created;
+    assert_ne!(clip_id, subtitle_track);
+
+    // A one-byte buffer cannot hold the text, but must still report the needed
+    // length so the caller can retry without guessing.
+    let mut buf = [0i8; 1];
+    let mut needed: i32 = 0;
+    let code = captrim_engine_clip_text(
+        e.handle(),
+        clip_id,
+        buf.as_mut_ptr(),
+        buf.len() as i32,
+        &mut needed,
+    );
+    assert_eq!(code, -3, "{}", unsafe { last_error() });
+    assert!(needed > 1);
+
+    let mut big = vec![0i8; (needed + 1) as usize];
+    assert_eq!(
+        captrim_engine_clip_text(
+            e.handle(),
+            clip_id,
+            big.as_mut_ptr(),
+            big.len() as i32,
+            &mut needed,
+        ),
+        0
+    );
+    assert_eq!(
+        unsafe { CStr::from_ptr(big.as_ptr()) }.to_string_lossy(),
+        "你好 CapTrim"
+    );
+
+    // Unknown ids are a not-found error, not an empty string.
+    let code = captrim_engine_clip_text(
+        e.handle(),
+        9999,
+        big.as_mut_ptr(),
+        big.len() as i32,
+        &mut needed,
+    );
+    assert_eq!(code, -2, "{}", unsafe { last_error() });
+}
+
+#[test]
+fn draft_json_with_subtitle_text_round_trips_through_abi() {
+    let e = TestEngine::new();
+    let mut created: u64 = 0;
+    let track = c(r#"{"type":"add_track","kind":"subtitle"}"#);
+    captrim_engine_apply(e.handle(), track.as_ptr(), &mut created);
+    let insert = c(r#"{"type":"insert_text_clip","track_id":1,"text":"第二行",
+                     "start_us":0,"duration_us":1000000}"#);
+    captrim_engine_apply(e.handle(), insert.as_ptr(), &mut created);
+
+    let mut draft: *mut c_char = ptr::null_mut();
+    assert_eq!(captrim_engine_draft(e.handle(), &mut draft), 0);
+    let json = unsafe { take_string(draft) };
+    assert!(json.contains("第二行"), "{json}");
+
+    // A draft is loaded by opening a new engine on it, not by `apply` (which
+    // takes a single command object).
+    let json_c = c(&json);
+    let mut h2: *mut captrim_engine_t = ptr::null_mut();
+    assert_eq!(captrim_engine_new(json_c.as_ptr(), &mut h2), 0);
+    assert!(!h2.is_null());
+    captrim_engine_free(h2);
+}

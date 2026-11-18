@@ -181,6 +181,7 @@ mod tests {
             },
             opacity: 0.75,
             effects: Vec::new(),
+            text: String::new(),
         }
     }
 

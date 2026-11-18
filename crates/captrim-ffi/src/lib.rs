@@ -410,6 +410,59 @@ pub extern "C" fn captrim_engine_export_transcode(
     })
 }
 
+/// Copy a subtitle clip's text into a caller buffer.
+///
+/// The frame plan hands a renderer a `clip_id` for a subtitle layer; this is
+/// the lookup for the UTF-8 text to draw. The buffer protocol is identical to
+/// [`captrim_engine_source_uri`]: too small a buffer fails with
+/// `CAPTRIM_ERR_OUT_OF_RANGE` but still reports the required length.
+#[no_mangle]
+pub extern "C" fn captrim_engine_clip_text(
+    engine: *mut captrim_engine_t,
+    clip_id: u64,
+    buf: *mut c_char,
+    buf_len: i32,
+    out_len: *mut i32,
+) -> i32 {
+    ffi_guard(|| {
+        if buf.is_null() || out_len.is_null() {
+            return Err(Error::invalid("buf and out_len must not be null"));
+        }
+        if buf_len <= 0 {
+            return Err(Error::invalid("buf_len must be positive"));
+        }
+        let e = engine_from(engine)?;
+        let text = {
+            let editor = lock(&e.editor)?;
+            editor
+                .timeline()
+                .find_clip(clip_id)
+                .and_then(|(_, c)| c.text.clone())
+                .ok_or_else(|| Error::not_found(format!("subtitle clip {clip_id}")))?
+        };
+
+        let bytes = text.as_bytes();
+        let needed = i32::try_from(bytes.len())
+            .map_err(|_| Error::OutOfRange("text is too long for an i32 length".into()))?;
+        // SAFETY: out_len is non-null and points at caller-owned storage.
+        unsafe { *out_len = needed };
+        if needed + 1 > buf_len {
+            return Err(Error::OutOfRange(format!(
+                "buffer holds {} bytes, text needs {}",
+                buf_len,
+                needed + 1
+            )));
+        }
+        // SAFETY: the caller promised buf_len writable bytes and we just proved
+        // needed + 1 <= buf_len; source and destination cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+            *buf.add(bytes.len()) = 0;
+        }
+        Ok(0)
+    })
+}
+
 /// Copy a media source's URI into a caller buffer.
 ///
 /// A renderer has a `source_id` from the frame plan and needs the file to open
