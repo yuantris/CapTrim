@@ -148,6 +148,14 @@ for ABI in $ABIS; do
     BUILD="${ROOT_DIR}/build/ffmpeg-ohos/${ABI}"
     PREFIX="${BUILD}/prefix"
     OUT="${ROOT_DIR}/dist/ohos/${ABI}"
+    # Always start the FFmpeg build tree from scratch. Enabling new filters in
+    # a reconfigure updates config.mak + filter_list.c and compiles the new
+    # vf_*.o, but make's incremental rule can judge an existing libavfilter.so
+    # newer than those objects and skip the relink — shipping a .so with the
+    # new filter descriptors left UND (device crash: MUSL-LDSO "ff_vf_boxblur
+    # symbol not found" -> captrim_napi load fails). x264/x265 live outside
+    # this tree and stay cached; only FFmpeg itself is rebuilt (~6 min).
+    rm -rf "$BUILD"
     mkdir -p "$BUILD" "$OUT"
 
     # FFmpeg has no dedicated OHOS target; --target-os=linux plus the NDK

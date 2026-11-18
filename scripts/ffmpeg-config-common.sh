@@ -512,28 +512,69 @@ build_env_preflight() {
     fi
 }
 
+# FFmpeg's patched ffbuild/library.mak uses GNU make's $(file >...) function to
+# write the linker response file. GNU make 3.81 (shipped with NDK 20 on this
+# host) treats it as an unknown variable: no .rsp is written, but the recipe
+# still invokes clang with @<target>.rsp, which then fails with
+#   clang: error: no such file or directory: '@libavutil/libavutil.so.59.rsp'
+# The file function was introduced in GNU make 4.0, so reject 3.x explicitly.
+make_has_file_func() {
+    local m="${1:-}"
+    [ -n "$m" ] || return 1
+    local ver major
+    ver="$("$m" --version 2>/dev/null | head -1)" || return 1
+    major="$(printf '%s\n' "$ver" | sed -n 's/.*GNU Make \([0-9][0-9]*\).*/\1/p')"
+    [ -n "$major" ] && [ "$major" -ge 4 ]
+}
+
 # Ensure make + cmake are reachable. NDK ships make; cmake is usually alongside
-# an Android SDK. Override CMAKE_BIN if your cmake lives elsewhere.
+# an Android SDK. Override CMAKE_BIN if your cmake lives elsewhere; MAKE_BIN
+# can pin a known-good GNU Make 4+ binary.
 ensure_build_tools() {
     local ndk_prebuilt="${1:-}"
     local extra_cmake="${CMAKE_BIN:-}"
-    if ! command -v make >/dev/null 2>&1; then
-        # HarmonyOS NDK has no make, but its codec builds still need one. Look
-        # beyond the explicitly passed NDK dir: on this host the Android SDK is
-        # installed even when only OHOS_NDK_HOME is exported, and requiring a
-        # second env var just to find make broke an otherwise valid build.
+    local current_make candidate dir
+    current_make="$(command -v make 2>/dev/null || true)"
+
+    if [ -n "$current_make" ] && make_has_file_func "$current_make"; then
+        log "using $(printf '%s' "$("$current_make" --version | head -1)") from PATH: $current_make"
+    else
+        if [ -n "$current_make" ]; then
+            log "WARNING: $(printf '%s' "$("$current_make" --version 2>/dev/null | head -1)") lacks \$(file); FFmpeg @rsp linking needs GNU Make 4+"
+        fi
         local candidates=()
-        [ -n "$ndk_prebuilt" ] && candidates+=("$ndk_prebuilt")
-        candidates+=(/d/Android/Sdk/ndk/*/prebuilt/*/bin)
-        [ -n "${ANDROID_HOME:-}" ] && candidates+=("$ANDROID_HOME"/ndk/*/prebuilt/*/bin)
-        for dir in "${candidates[@]}"; do
-            if [ -x "$dir/make.exe" ] || [ -x "$dir/make" ]; then
-                export PATH="$dir:$PATH"
-                break
-            fi
+        [ -n "${MAKE_BIN:-}" ] && candidates+=("${MAKE_BIN}")
+        [ -n "$ndk_prebuilt" ] && candidates+=("$ndk_prebuilt/make.exe" "$ndk_prebuilt/make")
+        # Prefer the newest NDK make: older NDKs in this SDK root still ship 3.81.
+        for dir in $(ls -d /d/Android/Sdk/ndk/*/prebuilt/*/bin 2>/dev/null | sort -Vr); do
+            candidates+=("$dir/make.exe")
         done
-        command -v make >/dev/null 2>&1 || \
-            log "WARNING: make not on PATH and no NDK prebuilt dir; build may fail"
+        if [ -n "${ANDROID_HOME:-}" ]; then
+            for dir in $(ls -d "$ANDROID_HOME"/ndk/*/prebuilt/*/bin 2>/dev/null | sort -Vr); do
+                candidates+=("$dir/make.exe")
+            done
+        fi
+        local found_make=""
+        if [ "${#candidates[@]}" -gt 0 ]; then
+            for candidate in "${candidates[@]}"; do
+                # Native tools may be supplied as D:/...; Git Bash's test -x
+                # and PATH both need the /d/... form.
+                local tool_path="$candidate"
+                if command -v cygpath >/dev/null 2>&1; then
+                    tool_path="$(cygpath -u "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+                fi
+                if [ -x "$tool_path" ] && make_has_file_func "$tool_path"; then
+                    export PATH="$(dirname "$tool_path"):$PATH"
+                    found_make="$tool_path"
+                    break
+                fi
+            done
+        fi
+        if [ -n "$found_make" ]; then
+            log "selected $(printf '%s' "$("$found_make" --version | head -1)"): $found_make"
+        else
+            log "WARNING: no GNU Make 4+ found; FFmpeg @rsp linking will fail (set MAKE_BIN)"
+        fi
     fi
     if [ -n "$extra_cmake" ]; then
         export PATH="$(dirname "$extra_cmake"):$PATH"
