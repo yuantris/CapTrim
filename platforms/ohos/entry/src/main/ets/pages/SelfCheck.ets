@@ -89,10 +89,24 @@ interface InsertTextClipCmd {
   duration_us: number;
 }
 
+interface SetTransformCmd {
+  type: string;
+  clip_id: number;
+  transform: TransformJson;
+}
+
 interface SetVolumeCmd {
   type: string;
   clip_id: number;
   volume: number;
+}
+
+interface InsertImageClipCmd {
+  type: string;
+  track_id: number;
+  uri: string;
+  start_us: number;
+  duration_us: number;
 }
 
 interface TrackJson {
@@ -103,10 +117,14 @@ interface DraftJson {
   tracks: TrackJson[];
 }
 
-/** Ink statistics of one rendered subtitle PAM. */
+/** Ink statistics of one PAM written by the core (caption or still). */
 interface InkCount {
+  /** Pixels with any alpha at all. */
   total: number;
+  /** The subset bright enough to be white caption fill, not the outline. */
   bright: number;
+  /** Edges: `0 < alpha < 255`, i.e. anti-aliased rather than hard cut. */
+  partial: number;
 }
 
 const NTSC: RationalJson = { num: 30000, den: 1001 };
@@ -585,7 +603,7 @@ export class SelfCheck {
         SelfCheck.verifyDecodable(results, filesDir, name);
       });
     } else if (which === 4) {
-      SelfCheck.check(results, '字幕烧录（core 栅格化 + FFmpeg overlay）', (): string => {
+      SelfCheck.check(results, '字幕与贴图烧录（core 栅格化 + FFmpeg overlay）', (): string => {
         const engine = CapTrim.create();
         const src = `file://${filesDir}/a.mp4`;
         const dst = `${filesDir}/burn.mp4`;
@@ -598,6 +616,13 @@ export class SelfCheck {
             } catch (e) {
               // 首次运行产物不存在，忽略
             }
+          }
+          // The PAM count below must describe this run only, so the previous
+          // run's renders (different clip ids) cannot inflate it.
+          try {
+            fs.rmdirSync(workDir);
+          } catch (e) {
+            // 目录不存在或非空？plan_burn 会重建；旧文件在下面按名字过滤。
           }
           // 540x960 keeps the overlay at 1:1 with the canvas (subtitle geometry
           // is canvas-relative) and the encode short enough for the UI thread.
@@ -615,6 +640,25 @@ export class SelfCheck {
             text: '字幕烧录 · Overlay', start_us: 400_000, duration_us: 1_200_000
           };
           engine.apply(JSON.stringify(subtitle));
+
+          // The sticker is the second half of this check: its pixels come from
+          // a PNG decoded in Rust (no libz on this device, so FFmpeg could not
+          // decode it), then fitted, scaled and rotated by the same core code
+          // the GL preview uploads. 0.25 scale in the top-right corner keeps it
+          // clear of the caption so both layers stay readable.
+          const imageTrack: AddTrackCmd = { type: 'add_track', kind: 'image' };
+          const imageTrackId = engine.apply(JSON.stringify(imageTrack));
+          const stickerCmd: InsertImageClipCmd = {
+            type: 'insert_image_clip', track_id: imageTrackId,
+            uri: `file://${filesDir}/sticker.png`,
+            start_us: 400_000, duration_us: 1_200_000
+          };
+          const stickerId = engine.apply(JSON.stringify(stickerCmd));
+          expect(stickerId > 0, '贴图没有插入，sticker.png 可能不存在');
+          engine.apply(JSON.stringify({
+            type: 'set_transform', clip_id: stickerId,
+            transform: { scale: 0.25, dx: 0.3, dy: -0.35, rotation_deg: 0 }
+          } as SetTransformCmd));
           const prefix = 'trim=duration=2,setpts=PTS-STARTPTS,' +
             'scale=540:960:force_original_aspect_ratio=decrease,' +
             'pad=540:960:(ow-iw)/2:(oh-ih)/2';
@@ -642,17 +686,31 @@ export class SelfCheck {
 
           const entries = fs.listFileSync(workDir);
           const pams = entries.filter((name: string): boolean => name.endsWith('.pam'));
-          expect(pams.length >= 1, `${workDir} 里没有渲染出的 PAM`);
-          // The overlay consumes exactly this file, so prove it carries real
-          // glyph ink on device (white text pixels with alpha) rather than an
-          // empty canvas — this is the half FFmpeg cannot tell us about.
-          const ink = SelfCheck.pamInk(`${workDir}/${pams[0]}`);
-          expect(ink.total > 500, `PAM 里只有 ${ink.total} 个墨迹像素`);
-          expect(ink.bright > 300, `PAM 里只有 ${ink.bright} 个白色像素`);
+          const captions = pams.filter((name: string): boolean => name.startsWith('sub_'));
+          const stills = pams.filter((name: string): boolean => name.startsWith('img_'));
+          expect(captions.length === 1, `应渲染 1 张字幕 PAM，实际 ${captions.length}`);
+          expect(stills.length === 1, `应渲染 1 张贴图 PAM，实际 ${stills.length}`);
+          // The overlay consumes exactly these files, so prove they carry real
+          // pixels on device rather than an empty canvas — this is the half
+          // FFmpeg cannot tell us about.
+          const ink = SelfCheck.pamInk(`${workDir}/${captions[0]}`);
+          expect(ink.total > 500, `字幕 PAM 里只有 ${ink.total} 个墨迹像素`);
+          expect(ink.bright > 300, `字幕 PAM 里只有 ${ink.bright} 个白色像素`);
+
+          // The sticker is 256x256 fitted into 540x960 (scale 2.1) and then
+          // drawn at 0.25, i.e. 135x135; the ring covers ~47% of that square.
+          const stickerInk = SelfCheck.pamInk(`${workDir}/${stills[0]}`);
+          expect(stickerInk.total > 3000, `贴图 PAM 里只有 ${stickerInk.total} 个墨迹像素`);
+          // A ring on a transparent background: partial alpha at its edge is
+          // what proves the PNG's alpha channel survived the decode and the
+          // resample. Flattened alpha would leave a solid square instead.
+          expect(stickerInk.partial > 200,
+            `贴图 PAM 只有 ${stickerInk.partial} 个半透明边缘像素，alpha 可能被压平`);
 
           return `540x960 burn ${(burned / 1_000).toFixed(0)}KB vs base ` +
             `${(plain / 1_000).toFixed(0)}KB，PAM ${pams.length} 张 ` +
-            `(${ink.bright} 白色 / ${ink.total} 墨迹像素)，进度 ${ticks.length} 次`;
+            `(字幕 ${ink.bright} 白 / ${ink.total} 墨迹，贴图 ${stickerInk.total} 墨迹 / ` +
+            `${stickerInk.partial} 半透明)，进度 ${ticks.length} 次`;
         } finally {
           engine.close();
         }
@@ -757,12 +815,15 @@ export class SelfCheck {
       }
     }
     expect(headerEnd > 0, `${path} 没有 PAM 头`);
-    const result: InkCount = { total: 0, bright: 0 };
+    const result: InkCount = { total: 0, bright: 0, partial: 0 };
     for (let p = headerEnd; p + 3 < bytes.length; p += 4) {
       if (bytes[p + 3] === 0) {
         continue;
       }
       result.total++;
+      if (bytes[p + 3] < 255) {
+        result.partial++;
+      }
       if (bytes[p] > 200 && bytes[p + 1] > 200 && bytes[p + 2] > 200) {
         result.bright++;
       }
