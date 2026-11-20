@@ -310,3 +310,222 @@ fn draft_json_with_subtitle_text_round_trips_through_abi() {
     assert!(!h2.is_null());
     captrim_engine_free(h2);
 }
+
+/// Build an engine with one subtitle clip and return `(engine, clip_id)`.
+fn engine_with_subtitle(text: &str) -> (TestEngine, u64) {
+    let e = TestEngine::new();
+    let mut created: u64 = 0;
+    let track = c(r#"{"type":"add_track","kind":"subtitle"}"#);
+    assert_eq!(
+        captrim_engine_apply(e.handle(), track.as_ptr(), &mut created),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    let insert = c(&format!(
+        r#"{{"type":"insert_text_clip","track_id":1,"text":{text},"start_us":0,"duration_us":2000000}}"#,
+        text = serde_json::to_string(text).unwrap()
+    ));
+    assert_eq!(
+        captrim_engine_apply(e.handle(), insert.as_ptr(), &mut created),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    (e, created)
+}
+
+#[test]
+fn subtitle_bitmap_reports_size_then_copies_rgba8() {
+    let (e, clip_id) = engine_with_subtitle("你好 CapTrim");
+    let mut len: i32 = 0;
+    let mut w: i32 = 0;
+    let mut h: i32 = 0;
+    let mut rev: u64 = 0;
+
+    // Size query: no buffer, no copy, sizes still written.
+    let code = captrim_engine_clip_text_bitmap(
+        e.handle(),
+        clip_id,
+        1080,
+        1920,
+        ptr::null_mut(),
+        0,
+        &mut len,
+        &mut w,
+        &mut h,
+        &mut rev,
+    );
+    if code != 0 {
+        // No system font (CI images often have none): the ABI must report that
+        // as a plain error, never as a bitmap of garbage.
+        assert!(
+            matches!(code, -2 | -5 | -6),
+            "unexpected code {code}: {}",
+            unsafe { last_error() }
+        );
+        return;
+    }
+    assert!(w > 0 && h > 0, "{w}x{h}");
+    assert_eq!(len, w * h * 4, "len must be w*h*4");
+    assert_ne!(rev, 0);
+
+    let mut pixels = vec![0u8; len as usize];
+    assert_eq!(
+        captrim_engine_clip_text_bitmap(
+            e.handle(),
+            clip_id,
+            1080,
+            1920,
+            pixels.as_mut_ptr(),
+            len,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        0
+    );
+
+    let opaque = pixels.chunks(4).filter(|p| p[3] > 0).count();
+    assert!(opaque > 0, "bitmap has no ink");
+    // Every byte is 0..=255 by definition, but the buffer must not be all one
+    // value: an empty or black bitmap would look like a rendering bug.
+    assert!(pixels.iter().any(|b| *b > 0));
+
+    // A too-small buffer is the retry protocol, not a crash.
+    let mut small = vec![0u8; 8];
+    assert_eq!(
+        captrim_engine_clip_text_bitmap(
+            e.handle(),
+            clip_id,
+            1080,
+            1920,
+            small.as_mut_ptr(),
+            small.len() as i32,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        -3,
+        "{}",
+        unsafe { last_error() }
+    );
+    assert_eq!(len, w * h * 4);
+}
+
+#[test]
+fn subtitle_bitmap_revision_tracks_the_text() {
+    let (e, clip_id) = engine_with_subtitle("第一句");
+    let mut len: i32 = 0;
+    let (mut w, mut h) = (0i32, 0i32);
+    let mut rev1: u64 = 0;
+    let code = captrim_engine_clip_text_bitmap(
+        e.handle(),
+        clip_id,
+        1080,
+        1920,
+        ptr::null_mut(),
+        0,
+        &mut len,
+        &mut w,
+        &mut h,
+        &mut rev1,
+    );
+    if code != 0 {
+        return; // no font on this host
+    }
+
+    let set = c(&format!(
+        r#"{{"type":"set_text","clip_id":{clip_id},"text":{}}}"#,
+        serde_json::to_string("第二句更长一些").unwrap()
+    ));
+    let mut created: u64 = 0;
+    assert_eq!(
+        captrim_engine_apply(e.handle(), set.as_ptr(), &mut created),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+
+    let mut rev2: u64 = 0;
+    assert_eq!(
+        captrim_engine_clip_text_bitmap(
+            e.handle(),
+            clip_id,
+            1080,
+            1920,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev2,
+        ),
+        0
+    );
+    assert_ne!(
+        rev1, rev2,
+        "editing the text must change the bitmap revision"
+    );
+}
+
+#[test]
+fn subtitle_bitmap_rejects_unknown_clips_and_empty_canvas() {
+    let e = TestEngine::new();
+    let mut len: i32 = 0;
+    let (mut w, mut h) = (0i32, 0i32);
+    let mut rev: u64 = 0;
+    assert_eq!(
+        captrim_engine_clip_text_bitmap(
+            e.handle(),
+            999,
+            1080,
+            1920,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        -2
+    );
+
+    let (e, clip_id) = engine_with_subtitle("画布为空");
+    // Font availability is not the point here: a zero canvas must be rejected
+    // before any font work happens.
+    assert_eq!(
+        captrim_engine_clip_text_bitmap(
+            e.handle(),
+            clip_id,
+            0,
+            0,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        -1,
+        "{}",
+        unsafe { last_error() }
+    );
+}
+
+#[test]
+fn text_font_override_reports_bad_paths_and_resets() {
+    let e = TestEngine::new();
+    let missing = c("/definitely/not/a/font.ttf");
+    assert_eq!(
+        captrim_engine_set_text_font(e.handle(), missing.as_ptr(), 0),
+        -5,
+        "{}",
+        unsafe { last_error() }
+    );
+    // NULL resets to the system font; that must always succeed even when the
+    // platform has no fonts at all, it only clears the override.
+    assert_eq!(captrim_engine_set_text_font(e.handle(), ptr::null(), 0), 0);
+}

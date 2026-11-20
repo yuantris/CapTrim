@@ -61,6 +61,16 @@ interface SetTransformCmd {
   transform: TransformJson;
 }
 
+/// A caption is a command of its own: it has no media source, only text, and
+/// the core places it in the lower third by default (SUBTITLE_DEFAULT_DY).
+interface InsertTextClipCmd {
+  type: string;
+  track_id: number;
+  text: string;
+  start_us: number;
+  duration_us: number;
+}
+
 function clipSpec(source: number, inUs: number, outUs: number, startUs: number,
                   transform?: TransformJson): ClipSpec {
   const clip: ClipSpec = {
@@ -106,6 +116,8 @@ struct Index {
   private clipIds: number[] = [];
   /** The picture-in-picture clip: second decoder, second NativeImage. */
   private pipClipId: number = 0;
+  /// The demo caption's clip id, kept so a test hook can retitle it.
+  private subtitleClipId: number = 0;
   /** Surface size in physical pixels, kept in step with onAreaChange. */
   private canvasWidth: number = 0;
   private canvasHeight: number = 0;
@@ -206,6 +218,21 @@ struct Index {
     this.clipIds.push(editor.apply(JSON.stringify(first)));
     this.clipIds.push(editor.apply(JSON.stringify(second)));
     this.pipClipId = editor.apply(JSON.stringify(pip));
+
+    // A caption across the whole demo timeline. It proves the part that has no
+    // decoder at all: text is rasterised by the Rust core, uploaded as a plain
+    // 2D texture and blended by the same compositor that draws the video.
+    const subtitleTrack: AddTrackCmd = { type: 'add_track', kind: 'subtitle' };
+    const subtitleId = editor.apply(JSON.stringify(subtitleTrack));
+    const caption: InsertTextClipCmd = {
+      type: 'insert_text_clip',
+      track_id: subtitleId,
+      text: 'CapTrim 字幕预览：中文字形、换行与描边',
+      start_us: 0,
+      duration_us: CLIP_US * 2
+    };
+    this.subtitleClipId = editor.apply(JSON.stringify(caption));
+
     this.demo = editor;
     hilog.info(DOMAIN, TAG, 'demo timeline %{public}dus / %{public}d frames, pip clip %{public}d',
       editor.duration(), editor.frameCount(), this.pipClipId);

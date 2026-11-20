@@ -88,7 +88,26 @@ constexpr const char *kKeyPixelFormat = "pixel_format";
 /// this evicts the least recently used slot instead.
 constexpr int32_t kMaxSources = 4;
 
+/// Captions on screen at once. One subtitle track can stack a couple of blocks
+/// (an original and a translation); four is generous and still tiny.
+constexpr int32_t kMaxTexts = 4;
+
 struct PresenterState;
+
+/// One rasterised caption: a 2D texture the compositor draws like any other
+/// layer, plus the revision it was uploaded from.
+///
+/// Text does not get a decoder slot: there is no file to demux, only pixels the
+/// core rasterises. Caching by `revision` (a hash of text + style + canvas) is
+/// what keeps a 60 Hz preview from re-rasterising and re-uploading a caption
+/// that has not changed.
+struct TextSlot {
+    uint64_t clip_id;
+    uint32_t texture;
+    int32_t width;
+    int32_t height;
+    uint64_t revision;
+};
 
 /// One decoder's worth of state: a demuxer, a codec, and the NativeImage its
 /// frames land in.
@@ -199,6 +218,8 @@ struct PresenterState {
     /// Live decoders. A plan with more layers than this evicts the slot that
     /// has gone unused longest.
     SourceSlot slots[kMaxSources];
+    /// Cached caption textures, one per visible subtitle clip.
+    TextSlot text_slots[kMaxTexts];
     /// Slots that could not be opened this session (no decoder instance left,
     /// missing file). Reported, never fatal while another layer still draws.
     int32_t slot_failures;
@@ -972,6 +993,105 @@ int32_t RequestSlotFrame(SourceSlot *slot, int64_t target_us) {
     return 1;
 }
 
+/// The caption cache entry for `clip_id`, allocating one (with its texture) if
+/// this clip has never been drawn before.
+///
+/// Eviction is by "slot not used by the current plan, then lowest clip id": a
+/// caption edit produces a new clip, and an old entry has to make room. The
+/// texture is reused for the new clip, so a timeline of many short captions
+/// allocates at most `kMaxTexts` textures.
+TextSlot *TextSlotFor(PresenterState *p, uint64_t clip_id) {
+    if (clip_id == 0) {
+        return nullptr;
+    }
+    for (int32_t i = 0; i < kMaxTexts; i++) {
+        if (p->text_slots[i].clip_id == clip_id && p->text_slots[i].texture != 0) {
+            return &p->text_slots[i];
+        }
+    }
+    for (int32_t i = 0; i < kMaxTexts; i++) {
+        if (p->text_slots[i].texture == 0) {
+            p->text_slots[i].texture = CompositorNewBitmapTexture(p->compositor);
+            if (p->text_slots[i].texture == 0) {
+                return nullptr;
+            }
+            p->text_slots[i].clip_id = clip_id;
+            p->text_slots[i].revision = 0;
+            p->text_slots[i].width = 0;
+            p->text_slots[i].height = 0;
+            return &p->text_slots[i];
+        }
+    }
+
+    // Every slot is live: reuse the one whose clip has the lowest id, which is
+    // the oldest insert and the least likely to be the caption still on screen.
+    int32_t victim = 0;
+    for (int32_t i = 1; i < kMaxTexts; i++) {
+        if (p->text_slots[i].clip_id < p->text_slots[victim].clip_id) {
+            victim = i;
+        }
+    }
+    TextSlot &slot = p->text_slots[victim];
+    slot.clip_id = clip_id;
+    slot.revision = 0;
+    slot.width = 0;
+    slot.height = 0;
+    return &slot;
+}
+
+/// Make sure the slot's texture holds the current pixels of `clip_id`.
+///
+/// Returns the slot, or null when the caption cannot be rasterised (no system
+/// font, or a clip that is not a subtitle). Errors are logged once per frame at
+/// most; a missing font is a deployment error, not something to spam about.
+TextSlot *RefreshTextSlot(PresenterState *p, uint64_t clip_id, int32_t canvas_w,
+                          int32_t canvas_h, int32_t *out_uploaded) {
+    TextSlot *slot = TextSlotFor(p, clip_id);
+    if (slot == nullptr) {
+        return nullptr;
+    }
+    int32_t len = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+    uint64_t revision = 0;
+    // Query first: a revision hit means the uploaded texture is still right,
+    // and a per-frame memcpy of a caption is exactly the kind of cost this
+    // cache exists to avoid.
+    int32_t rc = captrim_engine_clip_text_bitmap(p->engine, clip_id, (uint32_t)canvas_w,
+                                                 (uint32_t)canvas_h, nullptr, 0, &len, &width,
+                                                 &height, &revision);
+    if (rc != 0 || len <= 0 || width <= 0 || height <= 0) {
+        CAPTRIM_LOGE("caption %llu has no bitmap: rc=%{public}d", (unsigned long long)clip_id,
+                     rc);
+        return nullptr;
+    }
+    if (revision == slot->revision && width == slot->width && height == slot->height) {
+        return slot;
+    }
+
+    uint8_t *pixels = static_cast<uint8_t *>(malloc((size_t)len));
+    if (pixels == nullptr) {
+        return nullptr;
+    }
+    rc = captrim_engine_clip_text_bitmap(p->engine, clip_id, (uint32_t)canvas_w,
+                                         (uint32_t)canvas_h, pixels, len, &len, &width, &height,
+                                         &revision);
+    if (rc == 0 && CompositorUploadBitmap(p->compositor, slot->texture, width, height, pixels) == 0) {
+        slot->revision = revision;
+        slot->width = width;
+        slot->height = height;
+        if (out_uploaded != nullptr) {
+            *out_uploaded = 1;
+        }
+    } else {
+        CAPTRIM_LOGE("caption %llu upload failed: rc=%{public}d", (unsigned long long)clip_id, rc);
+        free(pixels);
+        return nullptr;
+    }
+    free(pixels);
+    return slot;
+}
+
 /// The slot decoding `clip_id`, or null when this layer has no decoder yet.
 SourceSlot *SlotForClip(PresenterState *p, uint64_t clip_id) {
     if (clip_id == 0) {
@@ -1109,7 +1229,40 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
     int32_t any_new = 0;
     for (int32_t i = 0; i < plan->layer_count && count < CAPTRIM_MAX_LAYERS; i++) {
         const captrim_layer_desc_t *layer = &plan->layers[i];
+
+        // Subtitles are pixels the core rasterises, not a file to decode: the
+        // text module produces the exact RGBA the exporter will also burn in,
+        // and this side only uploads it as a texture.
+        if (layer->kind == CAPTRIM_LAYER_SUBTITLE) {
+            int32_t uploaded = 0;
+            TextSlot *text = RefreshTextSlot(p, layer->clip_id, (int32_t)plan->width,
+                                             (int32_t)plan->height, &uploaded);
+            if (text == nullptr) {
+                continue;
+            }
+            CompLayer &out = layers[count++];
+            memset(&out, 0, sizeof(out));
+            out.texture = text->texture;
+            out.external = 0;
+            out.fit = 0;
+            out.design_w = (int32_t)plan->width;
+            out.design_h = (int32_t)plan->height;
+            out.src_w = text->width;
+            out.src_h = text->height;
+            out.scale = layer->scale;
+            out.dx = layer->dx;
+            out.dy = layer->dy;
+            out.rotation_deg = layer->rotation_deg;
+            out.opacity = layer->opacity;
+            out.effects = 0;
+            if (uploaded != 0) {
+                any_new = 1;
+            }
+            continue;
+        }
+
         if (layer->kind != CAPTRIM_LAYER_VIDEO) {
+            // Images and stickers need a loader; nothing to draw yet.
             continue;
         }
         int32_t which = -1;
@@ -1126,6 +1279,8 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
         CompLayer &out = layers[count++];
         memset(&out, 0, sizeof(out));
         out.texture = CompositorSourceTexture(slot.comp_source);
+        out.external = 1;
+        out.fit = 1;
         out.tex_matrix = CompositorSourceMatrix(slot.comp_source);
         out.src_w = slot.width;
         out.src_h = slot.height;

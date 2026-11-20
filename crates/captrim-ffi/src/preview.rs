@@ -34,6 +34,12 @@ pub struct Preview {
 }
 
 impl Preview {
+    /// The engine this preview renders from. Subtitle bitmaps are rasterised
+    /// against the engine's timeline and font, so the compositor needs it.
+    pub(crate) fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
     /// Pull the engine's timeline if it changed since the last frame.
     ///
     /// This is what makes an edit show up without the platform having to know

@@ -10,3 +10,9 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+fontdue = { workspace = true }
+
+[dev-dependencies]
+# The `text_preview` example writes the rasterised block to a PNG so the
+# glyph placement and outline can be eyeballed without a device.
+png = { workspace = true }

@@ -118,6 +118,23 @@ void main() {
 }
 )";
 
+/// Fragment shader for layers that are plain 2D textures: subtitle bitmaps
+/// produced by the core's text rasteriser. Effects are not applied here -- text
+/// has no v1 effects vocabulary, and the exporter overlays the identical bitmap
+/// without touching it, so anything done here would break that promise.
+constexpr const char *kFragmentShaderBitmap = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uTex;
+uniform float uOpacity;
+in vec2 vUV;
+out vec4 fragColor;
+void main() {
+    vec4 c = texture(uTex, vUV);
+    fragColor = vec4(c.rgb, c.a * uOpacity);
+}
+)";
+
+
 /// Unit quad, two triangles, interleaved position + texture coordinate.
 constexpr float kQuad[] = {
     -0.5f, -0.5f, 0.0f, 0.0f,
@@ -126,6 +143,16 @@ constexpr float kQuad[] = {
     -0.5f, -0.5f, 0.0f, 0.0f,
     0.5f,  0.5f,  1.0f, 1.0f,
     -0.5f, 0.5f,  0.0f, 1.0f,
+};
+
+/// Identity with the Y axis negated and shifted by one: v' = 1 - v, which
+/// turns GL's "first uploaded row is v = 0" into "top row is v = 0", matching
+/// every CPU rasteriser's row order (the text module writes top-first).
+constexpr float kFlipV[16] = {
+    1.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, -1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+    0.0f, 1.0f, 0.0f, 1.0f,
 };
 
 constexpr float kIdentity[16] = {
@@ -155,12 +182,12 @@ GLuint CompileShader(GLenum type, const char *source) {
     return shader;
 }
 
-GLuint LinkProgram() {
+GLuint LinkProgram(const char *fragment_source) {
     GLuint vs = CompileShader(GL_VERTEX_SHADER, kVertexShader);
     if (vs == 0) {
         return 0;
     }
-    GLuint fs = CompileShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    GLuint fs = CompileShader(GL_FRAGMENT_SHADER, fragment_source);
     if (fs == 0) {
         glDeleteShader(vs);
         return 0;
@@ -201,6 +228,9 @@ struct GlCompositor {
     int32_t height;
 
     GLuint program;
+    /// Second program for plain 2D textures (subtitle bitmaps). It shares the
+    /// vertex shader and differs only in the sampler type.
+    GLuint program2d;
     GLuint vbo;
     GLint uHalfSize;
     GLint uOffset;
@@ -210,6 +240,14 @@ struct GlCompositor {
     GLint uTex;
     GLint uEffects;
     GLint uTexel;
+
+    // The 2D program references the same uniform names minus the effect ones.
+    GLint p2dHalfSize;
+    GLint p2dOffset;
+    GLint p2dRot;
+    GLint p2dTexMatrix;
+    GLint p2dOpacity;
+    GLint p2dTex;
 };
 
 int32_t CompositorMakeCurrent(GlCompositor *c) {
@@ -298,8 +336,13 @@ GlCompositor *CompositorCreate(OHNativeWindow *window, int32_t width, int32_t he
     // preview -- the frame is replaced at most once per timeline frame.
     eglSwapInterval(c->display, 0);
 
-    c->program = LinkProgram();
+    c->program = LinkProgram(kFragmentShader);
     if (c->program == 0) {
+        CompositorDestroy(c);
+        return nullptr;
+    }
+    c->program2d = LinkProgram(kFragmentShaderBitmap);
+    if (c->program2d == 0) {
         CompositorDestroy(c);
         return nullptr;
     }
@@ -311,6 +354,13 @@ GlCompositor *CompositorCreate(OHNativeWindow *window, int32_t width, int32_t he
     c->uTex = glGetUniformLocation(c->program, "uTex");
     c->uEffects = glGetUniformLocation(c->program, "uEffects");
     c->uTexel = glGetUniformLocation(c->program, "uTexel");
+
+    c->p2dHalfSize = glGetUniformLocation(c->program2d, "uHalfSize");
+    c->p2dOffset = glGetUniformLocation(c->program2d, "uOffset");
+    c->p2dRot = glGetUniformLocation(c->program2d, "uRot");
+    c->p2dTexMatrix = glGetUniformLocation(c->program2d, "uTexMatrix");
+    c->p2dOpacity = glGetUniformLocation(c->program2d, "uOpacity");
+    c->p2dTex = glGetUniformLocation(c->program2d, "uTex");
 
     glGenBuffers(1, &c->vbo);
     glBindBuffer(GL_ARRAY_BUFFER, c->vbo);
@@ -340,6 +390,9 @@ void CompositorDestroy(GlCompositor *c) {
         }
         if (c->program != 0) {
             glDeleteProgram(c->program);
+        }
+        if (c->program2d != 0) {
+            glDeleteProgram(c->program2d);
         }
         eglMakeCurrent(c->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (c->context != EGL_NO_CONTEXT) {
@@ -404,6 +457,43 @@ void CompositorDeleteTexture(GlCompositor *c, uint32_t texture) {
     }
     GLuint name = texture;
     glDeleteTextures(1, &name);
+}
+
+uint32_t CompositorNewBitmapTexture(GlCompositor *c) {
+    if (c == nullptr || CompositorMakeCurrent(c) != 0) {
+        return 0;
+    }
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    if (texture == 0) {
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D, texture);
+    // Clamp + linear: a caption is drawn at its own size most of the time and
+    // scaled by the layer transform occasionally; linear keeps a scaled caption
+    // readable instead of blocky.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return texture;
+}
+
+int32_t CompositorUploadBitmap(GlCompositor *c, uint32_t texture, int32_t width,
+                               int32_t height, const uint8_t *rgba) {
+    if (c == nullptr || texture == 0 || rgba == nullptr || width <= 0 || height <= 0) {
+        return -1;
+    }
+    if (CompositorMakeCurrent(c) != 0) {
+        return -1;
+    }
+    // RGBA8 rows are tightly packed; the default unpack alignment of 4 happens
+    // to match, but state it so a future caller with odd widths is not surprised.
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, rgba);
+    return 0;
 }
 
 struct CompSource {
@@ -539,7 +629,6 @@ int32_t CompositorDraw(GlCompositor *c, const CompLayer *layers, int32_t count) 
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (layers != nullptr && count > 0) {
-        glUseProgram(c->program);
         glBindBuffer(GL_ARRAY_BUFFER, c->vbo);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
@@ -547,7 +636,6 @@ int32_t CompositorDraw(GlCompositor *c, const CompLayer *layers, int32_t count) 
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
                               reinterpret_cast<const void *>(2 * sizeof(float)));
-        glUniform1i(c->uTex, 0);
         glActiveTexture(GL_TEXTURE0);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -559,42 +647,76 @@ int32_t CompositorDraw(GlCompositor *c, const CompLayer *layers, int32_t count) 
                 continue;
             }
 
-            // Fit inside the canvas without cropping, then apply the layer's
-            // own scale. A portrait clip on a landscape canvas ends up pillarboxed
-            // rather than stretched, which is what "scale = 1" has to mean for
-            // the timeline's framing to be predictable.
-            float fit_w = static_cast<float>(c->width) / static_cast<float>(layer.src_w);
-            float fit_h = static_cast<float>(c->height) / static_cast<float>(layer.src_h);
-            float fit = fit_w < fit_h ? fit_w : fit_h;
+            // Two programs, one vertex shader: the video path samples a
+            // GL_TEXTURE_EXTERNAL_OES (decoder output) and applies the v1
+            // effects; the bitmap path samples a plain GL_TEXTURE_2D (a
+            // subtitle rasterised by the core) and applies nothing.
+            bool bitmap = layer.external == 0;
+            glUseProgram(bitmap ? c->program2d : c->program);
+            glUniform1i(bitmap ? c->p2dTex : c->uTex, 0);
+
+            // Size on screen.
+            //
+            // Video: fit inside the canvas without cropping, then apply the
+            // layer's own scale. A portrait clip on a landscape canvas ends up
+            // pillarboxed rather than stretched, which is what "scale = 1" has
+            // to mean for the timeline's framing to be predictable.
+            //
+            // Bitmap: the pixels were rasterised for a timeline canvas, so the
+            // mapping is view/timeline, not fit; a 1080p caption has to occupy
+            // the same fraction of a 1260 px view as of a 1080 px one.
             float scale = layer.scale > 0.0f ? layer.scale : 1.0f;
+            float fit;
+            if (bitmap) {
+                fit = (layer.design_w > 0 && layer.design_h > 0)
+                          ? static_cast<float>(c->width) / static_cast<float>(layer.design_w)
+                          : 1.0f;
+            } else {
+                float fit_w = static_cast<float>(c->width) / static_cast<float>(layer.src_w);
+                float fit_h = static_cast<float>(c->height) / static_cast<float>(layer.src_h);
+                fit = fit_w < fit_h ? fit_w : fit_h;
+            }
             float w_px = static_cast<float>(layer.src_w) * fit * scale;
             float h_px = static_cast<float>(layer.src_h) * fit * scale;
 
-            glUniform2f(c->uHalfSize, w_px / static_cast<float>(c->width),
-                        h_px / static_cast<float>(c->height));
             // dx/dy are canvas-normalised and +dy is down; NDC is 2 units wide
             // and its y points up, hence the scale and the sign.
-            glUniform2f(c->uOffset, layer.dx * 2.0f, -layer.dy * 2.0f);
+            const GLint half = bitmap ? c->p2dHalfSize : c->uHalfSize;
+            const GLint offset = bitmap ? c->p2dOffset : c->uOffset;
+            const GLint rot = bitmap ? c->p2dRot : c->uRot;
+            const GLint matrix = bitmap ? c->p2dTexMatrix : c->uTexMatrix;
+            const GLint opacity = bitmap ? c->p2dOpacity : c->uOpacity;
+
+            glUniform2f(half, w_px / static_cast<float>(c->width),
+                        h_px / static_cast<float>(c->height));
+            glUniform2f(offset, layer.dx * 2.0f, -layer.dy * 2.0f);
 
             // A clockwise turn on screen is a counter-clockwise one in NDC,
             // because NDC flips y.
             float radians = layer.rotation_deg * 3.14159265358979f / 180.0f;
-            glUniform2f(c->uRot, cosf(radians), -sinf(radians));
+            glUniform2f(rot, cosf(radians), -sinf(radians));
 
-            glUniformMatrix4fv(c->uTexMatrix, 1, GL_FALSE,
-                               layer.tex_matrix != nullptr ? layer.tex_matrix : kIdentity);
-            glUniform1f(c->uOpacity, layer.opacity);
+            // Decoder output carries its own matrix; a bitmap needs the v flip
+            // that turns top-first rows into GL's bottom-first texture space.
+            glUniformMatrix4fv(matrix, 1, GL_FALSE,
+                               bitmap ? kFlipV
+                                      : (layer.tex_matrix != nullptr ? layer.tex_matrix
+                                                                     : kIdentity));
+            glUniform1f(opacity, layer.opacity);
 
-            // v1 effects: the bit mask comes straight from the core's frame
-            // plan (CAPTRIM_EFFECT_*), applied in the shader's canonical order.
-            glUniform1ui(c->uEffects, layer.effects);
-            // uTexel is in sampled-UV units; source pixels map through the fit
-            // scale, but a 1/src tap is a stable approximation for the box blur.
-            glUniform2f(c->uTexel,
-                        layer.src_w > 0 ? 1.0f / static_cast<float>(layer.src_w) : 0.0f,
-                        layer.src_h > 0 ? 1.0f / static_cast<float>(layer.src_h) : 0.0f);
-
-            glBindTexture(GL_TEXTURE_EXTERNAL_OES, layer.texture);
+            if (!bitmap) {
+                // v1 effects: the bit mask comes straight from the core's frame
+                // plan (CAPTRIM_EFFECT_*), applied in the shader's canonical
+                // order. uTexel is in sampled-UV units; a 1/src tap is a stable
+                // approximation for the box blur.
+                glUniform1ui(c->uEffects, layer.effects);
+                glUniform2f(c->uTexel,
+                            layer.src_w > 0 ? 1.0f / static_cast<float>(layer.src_w) : 0.0f,
+                            layer.src_h > 0 ? 1.0f / static_cast<float>(layer.src_h) : 0.0f);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, layer.texture);
+            } else {
+                glBindTexture(GL_TEXTURE_2D, layer.texture);
+            }
             glDrawArrays(GL_TRIANGLES, 0, 6);
         }
 

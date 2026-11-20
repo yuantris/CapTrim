@@ -6,6 +6,11 @@ use crate::model::{Clip, Id, Timeline, Track, TrackKind, Transition};
 use crate::time::Rational;
 use serde::{Deserialize, Serialize};
 
+/// Where a freshly inserted subtitle sits: `dy = 0.36` puts the block's centre
+/// just below the middle, i.e. in the lower third of the canvas. `dy` is in
+/// canvas-normalised units, 1.0 being a full canvas height down from the centre.
+pub const SUBTITLE_DEFAULT_DY: f32 = 0.36;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
@@ -301,6 +306,11 @@ impl Timeline {
                 let mut clip = Clip::new(0, 0, *duration_us, *start_us);
                 clip.id = id;
                 clip.text = Some(text.clone());
+                // Subtitles land in the lower third, not dead centre: a new
+                // caption covering the subject's face is the one placement
+                // nobody wants. `dx` stays 0, so it is centred horizontally.
+                // The editor moves it with the ordinary SetTransform command.
+                clip.transform.dy = SUBTITLE_DEFAULT_DY;
                 clip.validate()?;
                 if track.clips.iter().any(|c| overlaps(c, &clip)) {
                     return Err(Error::OutOfRange(

@@ -60,10 +60,23 @@ struct CompSource;
 ///     compositor applies the set bits in the canonical order shared with the
 ///     FFmpeg export chain.
 struct CompLayer {
-    /// GL_TEXTURE_EXTERNAL_OES owned by the caller, from CompositorNewTexture.
+    /// GL_TEXTURE_EXTERNAL_OES (decoder) or GL_TEXTURE_2D (bitmap), depending
+    /// on `external`.
     uint32_t texture;
+    /// 1 when `texture` is a decoder's external texture, 0 when it is a plain
+    /// 2D texture uploaded by CompositorUploadBitmap (subtitles, images).
+    int32_t external;
+    /// 1: scale the layer to fit the canvas, then apply `scale` (video, the
+    /// historical behaviour). 0: draw it at its own pixel size times `scale`,
+    /// with design_w/design_h mapping timeline pixels to view pixels (text).
+    int32_t fit;
+    /// Canvas size the layer's pixel size was designed for, used by `fit == 0`
+    /// layers so a 1080p text bitmap fills the same fraction of a 1260 px view.
+    int32_t design_w;
+    int32_t design_h;
     /// 4x4 column-major matrix from OH_NativeImage_GetTransformMatrix, or null
-    /// for an identity transform.
+    /// for an identity transform (bitmaps use the identity plus a v flip, which
+    /// the compositor applies itself).
     const float *tex_matrix;
     int32_t src_w;
     int32_t src_h;
@@ -104,6 +117,20 @@ int32_t CompositorHeight(GlCompositor *c);
 /// on the current unit. Pair with CompositorDeleteTexture.
 uint32_t CompositorNewTexture(GlCompositor *c);
 void CompositorDeleteTexture(GlCompositor *c, uint32_t texture);
+
+/// Allocates a GL_TEXTURE_2D and leaves it bound on the current unit. Use for
+/// pixels this side owns (subtitle bitmaps, logos), not for decoder output.
+uint32_t CompositorNewBitmapTexture(GlCompositor *c);
+
+/// Uploads (or replaces) RGBA8 pixels, straight alpha, top row first.
+///
+/// The compositor samples the texture with v flipped so the caller never has to
+/// reverse its rows: GL's v=0 is the first uploaded row, and every CPU
+/// rasteriser (including CapTrim's text module) writes top-first.
+/// Returns non-zero when the texture name is not a 2D texture this compositor
+/// created.
+int32_t CompositorUploadBitmap(GlCompositor *c, uint32_t texture, int32_t width,
+                               int32_t height, const uint8_t *rgba);
 
 /// Creates a texture and the NativeImage that fills it.
 ///

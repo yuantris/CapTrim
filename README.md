@@ -121,7 +121,7 @@ bash scripts/check.sh           # 本地把 CI 的每一关（除需要 NDK/Grad
 
 ```bash
 cargo fmt --all --check            # CI 的第一关；漏跑它会让后面四关在 CI 上被跳过
-cargo test --workspace             # 136 个测试
+cargo test --workspace             # 148 个测试
 cargo clippy --workspace --all-targets --features captrim-ffi/ffmpeg -- -D warnings
 bash scripts/check-native-abi.sh   # 头文件 == Rust 导出 == NAPI == d.ts
 ```
@@ -369,12 +369,13 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 - `Rational` 精确时间运算（含 NTSC 30000/1001 帧边界、无浮点比较）
 - Timeline / Track / Clip 模型、重叠校验、分割（含变速片段的源时间映射）
 - Command 栈 + 撤销重做 + 草稿 JSON 往返
-- 稳定 C ABI（32 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
+- 稳定 C ABI（35 个函数）：句柄注册表、错误码、`catch_unwind`、UTF-8 校验、二进制帧描述
 - FFmpeg 后端（`libavformat` 探测/remux、`libavfilter`+`libswscale` 复杂剪辑、`libavcodec`/`libx264`/`libx265` 软编解兜底）+ 特征门控（无 `ffmpeg` feature 时返回 `NO_BACKEND` 而非崩溃）
 - `ExportPlan` / `Segment`：帧对齐导出分段、段内稳定源集合、有理数速度与精确源时间换算，双端已暴露
 - 转场 Fade 交叉溶解：`set_transition` 命令 + 切入片起始的窗口，前驱视频派生延长（冻结帧）、切入片 opacity ramp、绘制序 `(z, start_us, clip_id)`；导出翻译成段边界 + `opacity_start/opacity_end`，与预览逐帧同源；音频 v1 硬切
 - 滤镜 v1 全链路：`effects.rs` 单一词汇表（8 个名字，集合语义 + canonical order），`Clip::validate` 拒绝词汇外名字，`set_effects` 命令走撤销栈；双端 FFmpeg 白名单含 `eq/hue/lut/negate/boxblur`；`captrim_layer_desc_t.effects` 位掩码把词汇透传给 OHOS GLSL 片元着色器（八效果分支，共享常数）；`captrim_effects_to_filter_desc()` 供导出把 effects 翻成 FFmpeg 链，双端平台已接线
-- 字幕数据层：`Clip.text`（可选 UTF-8，老草稿默认无）、`TrackKind::Subtitle` / `LayerKind::Subtitle` 已预埋的类型正式接通；`insert_text_clip` / `set_text` 命令走既有撤销栈，`Timeline::validate` 要求字幕轨片段有文本、普通媒体片段不得带文本；字幕层不再依赖媒体探测，帧计划稳定产出 `LayerKind::Subtitle` 并携带文本；`captrim_engine_clip_text(clip_id, …)` 按帧计划给的 clip_id 取回文本（缓冲重试协议同 `source_uri`）。预览上屏与导出烧录尚未接入，见未完成清单
+- 字幕数据层：`Clip.text`（可选 UTF-8，老草稿默认无）、`TrackKind::Subtitle` / `LayerKind::Subtitle` 已预埋的类型正式接通；`insert_text_clip` / `set_text` 命令走既有撤销栈，`Timeline::validate` 要求字幕轨片段有文本、普通媒体片段不得带文本；字幕层不再依赖媒体探测，帧计划稳定产出 `LayerKind::Subtitle` 并携带文本；`captrim_engine_clip_text(clip_id, …)` 按帧计划给的 clip_id 取回文本（缓冲重试协议同 `source_uri`）
+- 字幕预览上屏：`text.rs` 用 `fontdue` 把文本在 Rust core 里光栅化一次（按画布宽 4.8% 定字号、86% 宽换行、CJK 行首禁则、白字黑描边、居中、行距 1.12），产出直通 alpha 的 RGBA8 位图；`captrim_engine_clip_text_bitmap` / `captrim_preview_clip_text_bitmap` 走「NULL 查询尺寸、缓冲不足返回 -3 并回填尺寸」的同一套缓冲协议，`captrim_engine_set_text_font` 可换字体（NULL 复位系统字体，坏路径 -5）；字体不打包，直接读平台系统字体（鸿蒙 `HarmonyOS_Sans_SC.ttf`、Android `NotoSansCJK-Regular.ttc` 简体面 index 2）；鸿蒙 `gl_compositor` 增加 `GL_TEXTURE_2D` 位图管线（第二套 program，`fit=0` 表示按自身像素 × scale 绘制，`design_w/design_h` 把时间线像素映射到视图），`presenter` 用 revision 轮询避免每帧重传，字幕层不施加 `effects`；真机已验证中文字幕上屏
 - P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - P2 音频预览：`plan_audio_at` 按原始时间规划音频（不吸附帧栅格）、native 混音器统一 48kHz/立体声/f32、鸿蒙 `OH_AudioRenderer` 输出并把真实播放位置回灌主时钟、播放态 hold-and-present 压住超前解码帧
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
@@ -386,7 +387,7 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 
 **未完成（按优先级）**
 
-- 字幕数据层已通（模型/命令/帧计划/C ABI 取文本）；仍缺预览侧的 GLSL 文字上屏（文本→纹理，含字体与换行）与导出烧录（FFmpeg `drawtext`/`libass` + 白名单），以及图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment`、滤镜 v1 全链路已完成）
+- 字幕预览上屏已通（`fontdue` 光栅化 + 位图纹理 + GL 图层）；仍缺导出烧录（字幕位图写 PNG 交给 FFmpeg `overlay`，白名单需补 `png` 解码与 `movie`/`loop` 滤镜），以及图片与贴纸图层（转场 Fade 交叉溶解、P2 音频与 hold-and-present、`ExportPlan`/`Segment`、滤镜 v1 全链路已完成）
 - 转场后续：转场期音频交叉渐变（v1 刻意硬切）、更多转场类型（擦除/推拉等，复用同一窗口模型）、前驱素材越出裁剪点时用 handle material 代替冻结帧
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
@@ -399,14 +400,14 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `cargo test --workspace` | ✅ 136 通过 | core 单元 95（含 P2 音频规划 2、ExportPlan 10、转场 11、滤镜词汇/位掩码 7、字幕数据层 6）+ P0 集成 1 + P1 预览/导出一致性 5 + FFI 单元 9 + ABI 10（含 effects→filter_desc 端到端、字幕文本读取+草稿往返）+ P1 ABI 契约 16 |
+| `cargo test --workspace` | ✅ 148 通过 | core 单元 103（含 P2 音频规划 2、ExportPlan 10、转场 11、滤镜词汇/位掩码 7、字幕数据层 6、字幕栅格化 9）+ P0 集成 1 + P1 预览/导出一致性 5 + FFI 单元 9 + ABI 14（含 effects→filter_desc 端到端、字幕文本读取+草稿往返、字幕位图缓冲协议/字体覆盖）+ P1 ABI 契约 16 |
 | 预览与导出一致性 | ✅ 有测试 | 同一草稿分别走「播放循环」与「逐帧导出」，逐帧比对 `FramePlan` 必须完全相同 |
 | `ExportPlan` / `Segment` | ✅ 10 项通过 | 帧对齐边界、相邻片段/空洞/NTSC、变速源时间映射、与 `FramePlan` 活跃源集合一致、JSON 序列化（含转场窗边界与 `opacity_start/opacity_end` ramp、缺字段兼容）；C ABI/NAPI/JNI 均已暴露 |
 | `cargo clippy --workspace --all-targets` | ✅ 零告警 | 与 CI 同一组参数（`--features captrim-ffi/ffmpeg`），`-D warnings` 可用 |
-| `check-native-abi.sh` | ✅ 通过 | 32 个 C 函数、34 个 NAPI 函数、27 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
+| `check-native-abi.sh` | ✅ 通过 | 35 个 C 函数、34 个 NAPI 函数、27 个 JNI 方法，头文件 == Rust 导出 == bridge == d.ts == ArkTS 导入，平台头文件副本一致 |
 | `captrim-core` → 鸿蒙 arm64 | ✅ 编译通过 | `aarch64-unknown-linux-ohos`（Rust 官方 Tier 2 + Host Tools） |
 | `captrim-ffi/ffmpeg` → Android arm64 | ✅ 类型检查通过 | `cargo check -p captrim-ffi --features ffmpeg --target aarch64-linux-android`，CI 独立 job 与 `check.sh` 同一命令；不链接（dist/ 不入仓库），真实链接由真机 native 自检覆盖 |
-| `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，32 个符号（含 9 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
+| `libcaptrim.so` 交叉链接（stub） | ✅ 通过 | 无 FFmpeg 时：ELF64 / AArch64 / DYN，35 个符号（含 10 个 `captrim_preview_*`），SONAME 已设，仅依赖 `libc.so`（host / CI 默认） |
 | `libcaptrim.so`（ffmpeg feature）双端链接 | ✅ 通过 | OHOS + Android 双端：`libcaptrim.so` → NEEDED `libcaptrim_ffmpeg.so`（OHOS 另 NEEDED `libc.so`；Android 另 NEEDED `libdl.so`+`libc.so`）；FFI 符号 `ct_ff_probe`/`ct_ff_remux`/`ct_ff_transcode`/`ct_ff_string_free` 由 shim 导出并被 cdylib 引用；`platforms/<os>/captrim/{libs,jniLibs}/arm64-v8a` 已暂存全部动态库 |
 | NAPI 桥接编译 | ✅ 通过 | 真实 DevEco NDK；依赖包含 `libcaptrim.so` / `libcaptrim_ffmpeg.so` / `libohaudio.so` / `libace_napi.z.so` / `libhilog_ndk.z.so` / 媒体与窗口系统库 |
 | ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 3 条「.so 未校验」告警（预期） |
@@ -422,7 +423,7 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 | FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；滤镜词汇所需的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；构建树中的 `libavfilter.so.10` 经 `llvm-nm -a` 验证五个 `ff_vf_*` 描述符均为已定义符号、无 UND，`filter_list.c` 同步引用）；shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
 | FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；滤镜词汇的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；`dist` 中的 `libavfilter.so.10.4.100` 经 `llvm-nm -a` 验证五个 `ff_vf_*` 描述符均为已定义符号、无 UND）；构建回执见 `FFMPEG_BUILD.txt` |
 
-鸿蒙自检同时覆盖原生库加载、32 个 C 函数、整数时间轴、预览状态机、滤镜 v1 和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。18 项结果：
+鸿蒙自检同时覆盖原生库加载、35 个 C 函数、整数时间轴、预览状态机、滤镜 v1 和 FFmpeg 软后端（probe、remux、复杂剪辑 decode → libavfilter → libx264 → mp4）。FFmpeg 那部分要求 HAP 里随附 NDK 的 `libc++_shared.so`：`libavcodec.so.61` 的 NEEDED 指向它，而设备系统镜像里没有，缺了 `captrim_napi` 模块直接加载失败，ArkTS 报 `does not provide an export name 'version'`。`build-ffmpeg-ohos.sh` 会自动拷，已在真机验证。HAP 内带了真实 mp4（`CAPTRIM_SAMPLE_MP4`），页面拷进沙箱给 probe/remux/transcode 用。18 项结果：
 
 ```
 PASS 原生库加载与 N-API 绑定 | libcaptrim CapTrim 0.1.0

@@ -289,6 +289,42 @@ int32_t captrim_engine_source_uri(captrim_engine_t *engine, uint64_t source_id,
 int32_t captrim_engine_clip_text(captrim_engine_t *engine, uint64_t clip_id,
                                  char *buf, int32_t buf_len, int32_t *out_len);
 
+/* ---------------------------------------------------------------------------
+ * Subtitle bitmaps.
+ *
+ * A renderer that switch-cases on captrim_layer_desc_t.kind needs pixels for a
+ * CAPTRIM_LAYER_SUBTITLE layer, not text: font choice, wrapping, line spacing
+ * and the outline all live in the core, so the preview and the exporter draw
+ * the same block. The result is RGBA8, straight alpha, row-major, top row first.
+ *
+ * Protocol: the outputs are always written; `buf == NULL` is a size query and
+ * succeeds; a buffer smaller than *out_len fails with
+ * CAPTRIM_ERR_OUT_OF_RANGE. *out_revision is a hash of the rasterised block --
+ * a renderer that caches its texture compares it and skips the upload when the
+ * subtitle has not changed.
+ * ------------------------------------------------------------------------- */
+
+int32_t captrim_engine_clip_text_bitmap(captrim_engine_t *engine, uint64_t clip_id,
+                                        uint32_t canvas_w, uint32_t canvas_h,
+                                        uint8_t *buf, int32_t buf_len,
+                                        int32_t *out_len, int32_t *out_width,
+                                        int32_t *out_height, uint64_t *out_revision);
+
+/* The same bitmap, addressed through a preview: a compositor holds a preview
+ * handle, not an engine handle. */
+int32_t captrim_preview_clip_text_bitmap(captrim_preview_t *preview, uint64_t clip_id,
+                                         uint32_t canvas_w, uint32_t canvas_h,
+                                         uint8_t *buf, int32_t buf_len,
+                                         int32_t *out_len, int32_t *out_width,
+                                         int32_t *out_height, uint64_t *out_revision);
+
+/* Replace the font used for subtitles. NULL or an empty path resets to the
+ * platform's system font. collection_index selects a face inside a .ttc (0 for
+ * a plain .ttf). The font is parsed on the spot, so a bad path fails here
+ * instead of leaving the preview with blank captions. */
+int32_t captrim_engine_set_text_font(captrim_engine_t *engine, const char *path,
+                                     uint32_t collection_index);
+
 #ifdef __cplusplus
 }
 #endif

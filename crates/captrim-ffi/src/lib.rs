@@ -19,6 +19,7 @@ pub mod backend;
 pub mod export;
 pub mod frame_desc;
 pub mod preview;
+pub mod text;
 
 pub use backend::{default_backend, MediaBackend, StubBackend};
 pub use export::*;
@@ -26,9 +27,10 @@ pub use export::*;
 // this crate expect to find them alongside the engine ones.
 pub use frame_desc::*;
 pub use preview::*;
+pub use text::*;
 
 use captrim_core::{
-    code_message, Command, Editor, Error, MediaInfo, MediaSource, Result as CoreResult,
+    code_message, Command, Editor, Error, MediaInfo, MediaSource, Result as CoreResult, TextBitmap,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -49,6 +51,19 @@ pub type CaptrimProgressCb = Option<unsafe extern "C" fn(c_float, *mut c_void) -
 pub struct Engine {
     pub(crate) editor: Mutex<Editor>,
     backend: Arc<dyn MediaBackend>,
+    /// Font override for subtitle rasterisation. `None` means "probe the
+    /// platform's system fonts once, then remember what was found".
+    pub(crate) text_font: Mutex<Option<captrim_core::FontSpec>>,
+    /// Rasterised subtitle bitmaps, so a 60 Hz compositor reuses the pixels it
+    /// already uploaded instead of re-rasterising every frame.
+    pub(crate) text_cache: Mutex<Vec<TextCacheEntry>>,
+}
+
+/// One cached bitmap plus the inputs that produced it.
+pub(crate) struct TextCacheEntry {
+    /// `(clip_id, text/style revision, canvas width, canvas height)`.
+    pub key: text::TextCacheKey,
+    pub bitmap: Arc<TextBitmap>,
 }
 
 impl Engine {
@@ -56,6 +71,8 @@ impl Engine {
         Self {
             editor: Mutex::new(editor),
             backend,
+            text_font: Mutex::new(None),
+            text_cache: Mutex::new(Vec::new()),
         }
     }
 

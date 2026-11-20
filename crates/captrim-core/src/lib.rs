@@ -11,6 +11,7 @@ pub mod media;
 pub mod model;
 pub mod preview;
 pub mod render;
+pub mod text;
 pub mod time;
 pub mod timeline;
 
@@ -30,5 +31,9 @@ pub use preview::{PreviewSession, Step};
 pub use render::{
     plan_audio_at, plan_frame, plan_frame_at_index, AudioMix, FramePlan, Layer, LayerKind,
 };
+pub use text::{
+    default_font_specs, load_font, render_text, resolve_default_font, text_revision, FontSpec,
+    TextAlign, TextBitmap, TextStyle,
+};
 pub use time::Rational;
-pub use timeline::{Command, Editor};
+pub use timeline::{Command, Editor, SUBTITLE_DEFAULT_DY};
