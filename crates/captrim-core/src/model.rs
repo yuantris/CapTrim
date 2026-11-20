@@ -20,6 +20,11 @@ pub enum TrackKind {
     Overlay,
     Audio,
     Subtitle,
+    /// Still images and stickers. A clip on this track carries its own file
+    /// ([`ImageAsset`]) instead of a probed media source: an image has no
+    /// stream to probe, and probing it through FFmpeg would need a PNG/JPEG
+    /// decoder on the device, which HarmonyOS cannot provide (no `libz.so`).
+    Image,
 }
 
 /// Visual transition used at a cut. v1 ships `Fade` only; the enum is open so
@@ -84,6 +89,40 @@ impl Default for Transform {
     }
 }
 
+/// The file behind an image or sticker clip, plus the intrinsic pixel size read
+/// from it when the clip was inserted.
+///
+/// The size is stored in the draft on purpose: without it every consumer would
+/// have to decode the header again (preview thread, export, both platforms),
+/// and a draft shared between devices would lay the same sticker out differently
+/// only because one of them failed to open the file.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImageAsset {
+    pub uri: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ImageAsset {
+    pub fn new(uri: impl Into<String>, width: u32, height: u32) -> Self {
+        Self {
+            uri: uri.into(),
+            width,
+            height,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.uri.trim().is_empty() {
+            return Err(Error::invalid("image uri must not be empty"));
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::invalid("image intrinsic size must be non-zero"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Clip {
     pub id: Id,
@@ -107,6 +146,10 @@ pub struct Clip {
     /// parse with `None` because the field defaults away.
     #[serde(default)]
     pub text: Option<String>,
+    /// File and intrinsic size of an image or sticker clip. `None` for every
+    /// other kind of clip; a clip on an `Image` track must have it.
+    #[serde(default)]
+    pub image: Option<ImageAsset>,
 }
 
 impl Clip {
@@ -123,6 +166,7 @@ impl Clip {
             effects: Vec::new(),
             transition_in: None,
             text: None,
+            image: None,
         }
     }
 
@@ -201,6 +245,9 @@ impl Clip {
             if text.trim().is_empty() {
                 return Err(Error::invalid("subtitle text must not be blank"));
             }
+        }
+        if let Some(image) = &self.image {
+            image.validate()?;
         }
         Ok(())
     }
@@ -336,10 +383,38 @@ impl Timeline {
                             c.id
                         )));
                     }
+                    if c.image.is_some() {
+                        return Err(Error::invalid(format!(
+                            "clip {} carries both text and an image",
+                            c.id
+                        )));
+                    }
+                } else if t.kind == TrackKind::Image {
+                    // Same shape as subtitles: the clip owns its file, so there
+                    // is no media source to find. The intrinsic size was read
+                    // when the clip was inserted (see `ImageAsset`).
+                    if c.image.is_none() {
+                        return Err(Error::invalid(format!(
+                            "image clip {} has no image asset",
+                            c.id
+                        )));
+                    }
+                    if c.text.is_some() {
+                        return Err(Error::invalid(format!(
+                            "clip {} carries both text and an image",
+                            c.id
+                        )));
+                    }
                 } else {
                     if c.text.is_some() {
                         return Err(Error::invalid(format!(
                             "clip {} carries text but is not on a subtitle track",
+                            c.id
+                        )));
+                    }
+                    if c.image.is_some() {
+                        return Err(Error::invalid(format!(
+                            "clip {} carries an image but is not on an image track",
                             c.id
                         )));
                     }
@@ -455,6 +530,65 @@ mod tests {
         let err = c.validate().expect_err("unknown effects are rejected");
         assert!(err.to_string().contains("sepia"), "{err}");
         assert_eq!(err.code(), -1);
+    }
+
+    #[test]
+    fn image_clip_needs_an_asset_and_media_clips_must_not_carry_one() {
+        let mut t = Timeline::default();
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::Image,
+            clips: vec![Clip {
+                id: 2,
+                ..Clip::new(0, 0, 1_000_000, 0)
+            }],
+        });
+        t.validate().expect_err("an image clip needs a file");
+
+        t.tracks[0].clips[0].image = Some(ImageAsset::new("file:///data/s.png", 8, 8));
+        t.validate().expect("a still with a size is valid");
+
+        // Zero intrinsic size would make every consumer divide by zero.
+        t.tracks[0].clips[0].image = Some(ImageAsset::new("file:///data/s.png", 8, 0));
+        assert!(t.validate().is_err());
+
+        // A video clip cannot smuggle a still in, and an image clip cannot
+        // carry caption text: each track kind owns one payload.
+        let mut media = Timeline::default();
+        media.media.push(MediaSource {
+            id: 3,
+            uri: "file:///v.mp4".into(),
+            info: None,
+        });
+        media.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![Clip {
+                id: 4,
+                image: Some(ImageAsset::new("file:///data/s.png", 8, 8)),
+                ..Clip::new(3, 0, 1_000_000, 0)
+            }],
+        });
+        assert!(media.validate().is_err());
+    }
+
+    #[test]
+    fn image_asset_survives_draft_json_round_trip() {
+        let mut t = Timeline::default();
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::Image,
+            clips: vec![Clip {
+                id: 2,
+                image: Some(ImageAsset::new("file:///data/sticker.png", 1080, 1920)),
+                start_us: 500_000,
+                ..Clip::new(0, 0, 2_000_000, 0)
+            }],
+        });
+        let json = t.to_draft_json().unwrap();
+        assert!(json.contains("\"image\""));
+        let back = Timeline::from_draft_json(&json).unwrap();
+        assert_eq!(back, t);
     }
 
     #[test]

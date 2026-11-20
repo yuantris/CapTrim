@@ -21,6 +21,10 @@ pub enum LayerKind {
     Video,
     Subtitle,
     Overlay,
+    /// A still image or sticker, decoded and resampled by the core. It has no
+    /// media source and no decoder slot: the compositor uploads the bitmap the
+    /// same way it uploads a caption.
+    Image,
 }
 
 /// One composited layer of one output frame.
@@ -155,6 +159,7 @@ fn layer_kind(track_kind: TrackKind, source_is_video: bool) -> LayerKind {
     match track_kind {
         TrackKind::MainVideo => LayerKind::Video,
         TrackKind::Subtitle => LayerKind::Subtitle,
+        TrackKind::Image => LayerKind::Image,
         TrackKind::Overlay => {
             if source_is_video {
                 LayerKind::Video
@@ -239,6 +244,13 @@ fn transition_opacity(clip: &Clip, t_us: i64) -> f32 {
 pub fn plan_audio_at(timeline: &Timeline, t_us: i64) -> Vec<AudioMix> {
     let mut audio = Vec::new();
     for track in &timeline.tracks {
+        // Captions and stills own their pixels and have no file to decode, so
+        // they can never contribute sound. Skipping them here also keeps them
+        // out of the audio plan's `uri`, which would otherwise be an empty
+        // string the platform would try to open.
+        if matches!(track.kind, TrackKind::Subtitle | TrackKind::Image) {
+            continue;
+        }
         for clip in &track.clips {
             if !clip.contains(t_us)
                 || clip.volume <= 0.0
@@ -291,23 +303,29 @@ pub fn plan_frame_at_index(timeline: &Timeline, frame_index: u64) -> FramePlan {
                 continue;
             }
             let source_us = clamp_source_us(clip, clip.to_source_us(snapped_us));
-            let uri = timeline
-                .media
-                .iter()
-                .find(|m| m.id == clip.source)
-                .map(|m| m.uri.clone())
-                .unwrap_or_default();
+            // A still carries its own file; everything else points at a media
+            // source. Both end up in `uri`, which is all a renderer needs to
+            // know where the pixels come from.
+            let uri = match &clip.image {
+                Some(asset) => asset.uri.clone(),
+                None => timeline
+                    .media
+                    .iter()
+                    .find(|m| m.id == clip.source)
+                    .map(|m| m.uri.clone())
+                    .unwrap_or_default(),
+            };
 
             let source_is_video = source_may_have(timeline, clip.source, true);
-            // Subtitle clips have no media source, so the video-detection gate
-            // must not apply to them: an unprobed (or source-less) text clip is
-            // still a layer the compositor has to draw. Audio tracks contribute
-            // no pixels at all.
+            // Subtitle and image clips have no media source, so the
+            // video-detection gate must not apply to them: an unprobed (or
+            // source-less) clip is still a layer the compositor has to draw.
+            // Audio tracks contribute no pixels at all.
             let is_subtitle = track.kind == TrackKind::Subtitle;
-            let visible = if is_subtitle {
-                clip.transform.scale > 0.0
-            } else {
-                track.kind != TrackKind::Audio && source_is_video && clip.transform.scale > 0.0
+            let visible = match track.kind {
+                TrackKind::Subtitle | TrackKind::Image => clip.transform.scale > 0.0,
+                TrackKind::Audio => false,
+                _ => source_is_video && clip.transform.scale > 0.0,
             };
             if visible {
                 layers.push((

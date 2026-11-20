@@ -11,6 +11,7 @@ rust-version.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 fontdue = { workspace = true }
+image = { workspace = true }
 
 [dev-dependencies]
 # The `text_preview` example writes the rasterised block to a PNG so the

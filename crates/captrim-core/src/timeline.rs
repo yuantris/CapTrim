@@ -92,6 +92,17 @@ pub enum Command {
         clip_id: Id,
         text: String,
     },
+    /// Insert a still (image or sticker) on an image track.
+    ///
+    /// The file is read once, here, to learn its intrinsic size and store it in
+    /// the draft (`ImageAsset`), so no other consumer has to open the file just
+    /// to lay it out. Placement uses `SetTransform` like every other layer.
+    InsertImageClip {
+        track_id: Id,
+        uri: String,
+        start_us: i64,
+        duration_us: i64,
+    },
     RemoveTrack {
         track_id: Id,
     },
@@ -336,6 +347,40 @@ impl Timeline {
                 clip.text = Some(text.clone());
                 clip.validate()?;
                 Ok(None)
+            }
+
+            Command::InsertImageClip {
+                track_id,
+                uri,
+                start_us,
+                duration_us,
+            } => {
+                if uri.trim().is_empty() {
+                    return Err(Error::invalid("image uri must not be empty"));
+                }
+                if *duration_us <= 0 {
+                    return Err(Error::invalid("image duration must be positive"));
+                }
+                let (width, height) = crate::images::source_dimensions(uri)?;
+                let id = self.next_id();
+                let track = self
+                    .find_track_mut(*track_id)
+                    .ok_or_else(|| Error::not_found(format!("track {track_id}")))?;
+                if track.kind != TrackKind::Image {
+                    return Err(Error::invalid("InsertImageClip requires an image track"));
+                }
+                let mut clip = Clip::new(0, 0, *duration_us, *start_us);
+                clip.id = id;
+                clip.image = Some(crate::model::ImageAsset::new(uri.clone(), width, height));
+                clip.validate()?;
+                if track.clips.iter().any(|c| overlaps(c, &clip)) {
+                    return Err(Error::OutOfRange(
+                        "image overlaps an existing clip on this track".into(),
+                    ));
+                }
+                track.clips.push(clip);
+                track.clips.sort_by_key(|c| c.start_us);
+                Ok(Some(id))
             }
 
             Command::SetCanvas {
@@ -853,6 +898,72 @@ mod tests {
         assert_eq!(clip.source, 0, "text clips have no media source");
         assert_eq!(clip.duration_us(), 2_000_000);
         assert_eq!(e.timeline().duration_us(), 3_000_000);
+
+        assert!(e.undo());
+        assert!(e.timeline().find_clip(id).is_none());
+        assert!(e.redo());
+        assert!(e.timeline().find_clip(id).is_some());
+    }
+
+    #[test]
+    fn insert_image_clip_reads_the_size_and_needs_an_image_track() {
+        let dir = std::path::PathBuf::from("target/image-tests/timeline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sticker.png");
+        image::RgbaImage::from_pixel(16, 9, image::Rgba([10, 120, 200, 255]))
+            .save_with_format(&file, image::ImageFormat::Png)
+            .unwrap();
+        let uri = file.to_str().unwrap().to_string();
+
+        let mut e = Editor::new();
+        let video = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::MainVideo,
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            e.apply(&Command::InsertImageClip {
+                track_id: video,
+                uri: uri.clone(),
+                start_us: 0,
+                duration_us: 1_000_000,
+            })
+            .is_err(),
+            "stills belong on an image track"
+        );
+        // A missing file fails at insert time: the draft would otherwise carry
+        // a size nobody ever read.
+        assert!(e
+            .apply(&Command::InsertImageClip {
+                track_id: video,
+                uri: "target/image-tests/timeline/nope.png".into(),
+                start_us: 0,
+                duration_us: 1_000_000,
+            })
+            .is_err());
+
+        let track = e
+            .apply(&Command::AddTrack {
+                kind: TrackKind::Image,
+            })
+            .unwrap()
+            .unwrap();
+        let id = e
+            .apply(&Command::InsertImageClip {
+                track_id: track,
+                uri,
+                start_us: 0,
+                duration_us: 2_000_000,
+            })
+            .unwrap()
+            .unwrap();
+        let clip = e.timeline().find_clip(id).unwrap().1;
+        let asset = clip.image.as_ref().expect("image asset");
+        assert_eq!((asset.width, asset.height), (16, 9));
+        assert_eq!(clip.source, 0, "stills have no media source");
+        assert_eq!(clip.duration_us(), 2_000_000);
+        assert!(e.timeline().validate().is_ok());
 
         assert!(e.undo());
         assert!(e.timeline().find_clip(id).is_none());

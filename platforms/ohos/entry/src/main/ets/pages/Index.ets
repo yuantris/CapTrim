@@ -61,8 +61,18 @@ interface SetTransformCmd {
   transform: TransformJson;
 }
 
-/// A caption is a command of its own: it has no media source, only text, and
-/// the core places it in the lower third by default (SUBTITLE_DEFAULT_DY).
+interface InsertImageClipCmd {
+  type: string;
+  track_id: number;
+  uri: string;
+  start_us: number;
+  duration_us: number;
+}
+
+/**
+ * A caption is a command of its own: it has no media source, only text, and
+ * the core places it in the lower third by default (SUBTITLE_DEFAULT_DY).
+ */
 interface InsertTextClipCmd {
   type: string;
   track_id: number;
@@ -118,6 +128,8 @@ struct Index {
   private pipClipId: number = 0;
   /// The demo caption's clip id, kept so a test hook can retitle it.
   private subtitleClipId: number = 0;
+  /** The demo sticker's clip id: a still layer, no decoder involved. */
+  private stickerClipId: number = 0;
   /** Surface size in physical pixels, kept in step with onAreaChange. */
   private canvasWidth: number = 0;
   private canvasHeight: number = 0;
@@ -166,6 +178,15 @@ struct Index {
       }
       if (!fs.accessSync(second)) {
         fs.copyFileSync(first, second);
+      }
+      // The sticker, like the video, has to live in the sandbox: the image
+      // layer reads a real file path, and `hdc` cannot write one.
+      const sticker = `${this.filesDir}/sticker.png`;
+      if (!fs.accessSync(sticker)) {
+        const png = ctx.resourceManager.getRawFileContentSync('sticker.png');
+        const file = fs.openSync(sticker, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+        fs.writeSync(file.fd, png.buffer);
+        fs.closeSync(file);
       }
       this.mediaReady = true;
       this.mediaState = '样片就绪';
@@ -232,6 +253,28 @@ struct Index {
       duration_us: CLIP_US * 2
     };
     this.subtitleClipId = editor.apply(JSON.stringify(caption));
+
+    // A sticker in the top-right corner. Its PNG has a transparent background,
+    // so a decoder that dropped alpha would paint an orange square around the
+    // ring and be obvious at a glance; the core bakes the scale into the bitmap,
+    // so the preview and the burned file cannot disagree about its size.
+    const imageTrack: AddTrackCmd = { type: 'add_track', kind: 'image' };
+    const imageTrackId = editor.apply(JSON.stringify(imageTrack));
+    const sticker: InsertImageClipCmd = {
+      type: 'insert_image_clip',
+      track_id: imageTrackId,
+      uri: `file://${this.filesDir}/sticker.png`,
+      start_us: 0,
+      duration_us: CLIP_US * 2
+    };
+    const stickerClipId = editor.apply(JSON.stringify(sticker));
+    const stickerTransform: SetTransformCmd = {
+      type: 'set_transform',
+      clip_id: stickerClipId,
+      transform: { scale: 0.3, dx: 0.34, dy: -0.34, rotation_deg: 0 }
+    };
+    editor.apply(JSON.stringify(stickerTransform));
+    this.stickerClipId = stickerClipId;
 
     this.demo = editor;
     hilog.info(DOMAIN, TAG, 'demo timeline %{public}dus / %{public}d frames, pip clip %{public}d',

@@ -311,6 +311,62 @@ fn draft_json_with_subtitle_text_round_trips_through_abi() {
     captrim_engine_free(h2);
 }
 
+/// Build an engine with one still on an image track and return
+/// `(engine, clip_id)`.
+///
+/// The fixture is written under `target/` (cargo runs the test binary with the
+/// package root as CWD) so it never lands in a read-only or shared directory.
+fn engine_with_image(width: u32, height: u32, scale: f32) -> (TestEngine, u64) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // Tests run in parallel and two of them use the same pixel size, so the
+    // fixture name must not collide: a half-written PNG surfaces as "unexpected
+    // end of file" in the *other* test.
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::path::PathBuf::from("target/abi-image");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join(format!("sticker-{width}x{height}-{seq}.png"));
+    let rgba = image::Rgba([40, 200, 70, 255]);
+    image::RgbaImage::from_pixel(width, height, rgba)
+        .save_with_format(&file, image::ImageFormat::Png)
+        .expect("fixture");
+    let uri = file.to_str().expect("utf-8 path").to_string();
+
+    let e = TestEngine::new();
+    let mut created: u64 = 0;
+    let track = c(r#"{"type":"add_track","kind":"image"}"#);
+    assert_eq!(
+        captrim_engine_apply(e.handle(), track.as_ptr(), &mut created),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    let insert = c(&format!(
+        r#"{{"type":"insert_image_clip","track_id":1,"uri":{uri},"start_us":0,"duration_us":2000000}}"#,
+        uri = serde_json::to_string(&uri).unwrap()
+    ));
+    assert_eq!(
+        captrim_engine_apply(e.handle(), insert.as_ptr(), &mut created),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    let clip_id = created;
+    if (scale - 1.0).abs() > 1e-6 {
+        let set = c(&format!(
+            r#"{{"type":"set_transform","clip_id":{clip_id},"transform":{{"scale":{scale},"dx":0.0,"dy":0.0,"rotation_deg":0}}}}"#,
+        ));
+        let mut scratch: u64 = 0;
+        assert_eq!(
+            captrim_engine_apply(e.handle(), set.as_ptr(), &mut scratch),
+            0,
+            "{}",
+            unsafe { last_error() }
+        );
+    }
+    (e, clip_id)
+}
+
 /// Build an engine with one subtitle clip and return `(engine, clip_id)`.
 fn engine_with_subtitle(text: &str) -> (TestEngine, u64) {
     let e = TestEngine::new();
@@ -333,6 +389,167 @@ fn engine_with_subtitle(text: &str) -> (TestEngine, u64) {
         unsafe { last_error() }
     );
     (e, created)
+}
+
+#[test]
+fn image_bitmap_reports_size_then_copies_rgba8() {
+    let (e, clip_id) = engine_with_image(100, 50, 1.0);
+    let mut len: i32 = 0;
+    let mut w: i32 = 0;
+    let mut h: i32 = 0;
+    let mut rev: u64 = 0;
+
+    // 100x50 into a 540x960 canvas: fit = 540/100 = 5.4 -> 540x270.
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            e.handle(),
+            clip_id,
+            540,
+            960,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    assert_eq!((w, h), (540, 270));
+    assert_eq!(len, w * h * 4, "len must be w*h*4");
+    assert_ne!(rev, 0);
+
+    let mut pixels = vec![0u8; len as usize];
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            e.handle(),
+            clip_id,
+            540,
+            960,
+            pixels.as_mut_ptr(),
+            len,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    // The fixture is fully opaque, so every alpha byte must be 255: a decode
+    // that silently produced an empty bitmap would fail here instead of showing
+    // a blank sticker on the device.
+    assert!(pixels.chunks(4).all(|p| p[3] == 255));
+    assert_eq!(pixels[0], 40, "red corner pixel, not a blank bitmap");
+
+    // Retry protocol: a short buffer reports the size and fails without copying.
+    let mut small = vec![0u8; 8];
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            e.handle(),
+            clip_id,
+            540,
+            960,
+            small.as_mut_ptr(),
+            small.len() as i32,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev,
+        ),
+        -3
+    );
+    assert_eq!(len, w * h * 4);
+}
+
+#[test]
+fn image_bitmap_revision_tracks_scale_and_rejects_non_images() {
+    let (e, clip_id) = engine_with_image(100, 50, 1.0);
+    let mut len: i32 = 0;
+    let (mut w, mut h) = (0i32, 0i32);
+    let mut rev1: u64 = 0;
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            e.handle(),
+            clip_id,
+            540,
+            960,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev1,
+        ),
+        0
+    );
+    assert_eq!((w, h), (540, 270));
+
+    let set = c(&format!(
+        r#"{{"type":"set_transform","clip_id":{clip_id},"transform":{{"scale":0.5,"dx":0.0,"dy":0.0,"rotation_deg":0}}}}"#,
+    ));
+    let mut created: u64 = 0;
+    assert_eq!(
+        captrim_engine_apply(e.handle(), set.as_ptr(), &mut created),
+        0,
+        "{}",
+        unsafe { last_error() }
+    );
+    let mut rev2: u64 = 0;
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            e.handle(),
+            clip_id,
+            540,
+            960,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev2,
+        ),
+        0
+    );
+    assert_eq!((w, h), (270, 135), "scale multiplies the fitted size");
+    assert_ne!(rev1, rev2, "a resized sticker must invalidate the texture");
+
+    // A caption clip has no still: asking for its image bitmap is a plain
+    // not-found, never a best-effort blank texture.
+    let (text_engine, text_clip) = engine_with_subtitle("不是图片");
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            text_engine.handle(),
+            text_clip,
+            540,
+            960,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev2,
+        ),
+        -2
+    );
+    assert_eq!(
+        captrim_engine_clip_image_bitmap(
+            e.handle(),
+            clip_id,
+            0,
+            960,
+            ptr::null_mut(),
+            0,
+            &mut len,
+            &mut w,
+            &mut h,
+            &mut rev2,
+        ),
+        -1
+    );
 }
 
 #[test]

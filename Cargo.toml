@@ -20,6 +20,11 @@ serde_json = "1"
 fontdue = "0.9"
 # Only the exporter writes PNGs; the decoder side stays FFmpeg's business.
 png = "0.18"
+# Image and sticker layers decode in Rust, not through FFmpeg: the decoder is
+# pure Rust (`png` + `zune-jpeg` behind these features), so it needs no zlib and
+# runs on HarmonyOS as-is. FFmpeg's own PNG decoder is unusable there because
+# the device ships no `libz.so`.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # NOTE: keep panic = "unwind". The FFI layer wraps every extern "C" entry
 # point in catch_unwind; panic = "abort" would bypass that guard.

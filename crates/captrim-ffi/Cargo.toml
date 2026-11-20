@@ -19,3 +19,8 @@ ffmpeg = []
 [dependencies]
 captrim-core = { path = "../captrim-core" }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Only the ABI tests need a real still to decode; the library itself never
+# encodes images, it hands decoded pixels out.
+image = { workspace = true }

@@ -19,6 +19,7 @@ pub mod backend;
 pub mod burn;
 pub mod export;
 pub mod frame_desc;
+pub mod images;
 pub mod preview;
 pub mod text;
 
@@ -28,6 +29,7 @@ pub use export::*;
 // The preview entry points are `#[no_mangle] extern "C"`, and Rust callers of
 // this crate expect to find them alongside the engine ones.
 pub use frame_desc::*;
+pub use images::*;
 pub use preview::*;
 pub use text::*;
 
@@ -59,6 +61,10 @@ pub struct Engine {
     /// Rasterised subtitle bitmaps, so a 60 Hz compositor reuses the pixels it
     /// already uploaded instead of re-rasterising every frame.
     pub(crate) text_cache: Mutex<Vec<TextCacheEntry>>,
+    /// Decoded, resampled still bitmaps. Separate from the caption cache
+    /// because a sticker costs a file read plus a resample, and evicting one
+    /// must not throw away a caption that is still on screen.
+    pub(crate) image_cache: Mutex<Vec<ImageCacheEntry>>,
 }
 
 /// One cached bitmap plus the inputs that produced it.
@@ -68,6 +74,13 @@ pub(crate) struct TextCacheEntry {
     pub bitmap: Arc<TextBitmap>,
 }
 
+/// One cached still plus the inputs that produced it.
+pub(crate) struct ImageCacheEntry {
+    /// `(clip_id, image revision, canvas width, canvas height)`.
+    pub key: images::ImageCacheKey,
+    pub bitmap: Arc<captrim_core::ImageBitmap>,
+}
+
 impl Engine {
     pub fn with_backend(editor: Editor, backend: Arc<dyn MediaBackend>) -> Self {
         Self {
@@ -75,6 +88,7 @@ impl Engine {
             backend,
             text_font: Mutex::new(None),
             text_cache: Mutex::new(Vec::new()),
+            image_cache: Mutex::new(Vec::new()),
         }
     }
 

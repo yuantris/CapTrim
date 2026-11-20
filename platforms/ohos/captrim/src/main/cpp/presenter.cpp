@@ -90,7 +90,7 @@ constexpr int32_t kMaxSources = 4;
 
 /// Captions on screen at once. One subtitle track can stack a couple of blocks
 /// (an original and a translation); four is generous and still tiny.
-constexpr int32_t kMaxTexts = 4;
+constexpr int32_t kMaxBitmaps = 4;
 
 struct PresenterState;
 
@@ -101,7 +101,7 @@ struct PresenterState;
 /// core rasterises. Caching by `revision` (a hash of text + style + canvas) is
 /// what keeps a 60 Hz preview from re-rasterising and re-uploading a caption
 /// that has not changed.
-struct TextSlot {
+struct BitmapSlot {
     uint64_t clip_id;
     uint32_t texture;
     int32_t width;
@@ -219,7 +219,7 @@ struct PresenterState {
     /// has gone unused longest.
     SourceSlot slots[kMaxSources];
     /// Cached caption textures, one per visible subtitle clip.
-    TextSlot text_slots[kMaxTexts];
+    BitmapSlot bitmap_slots[kMaxBitmaps];
     /// Slots that could not be opened this session (no decoder instance left,
     /// missing file). Reported, never fatal while another layer still draws.
     int32_t slot_failures;
@@ -993,45 +993,49 @@ int32_t RequestSlotFrame(SourceSlot *slot, int64_t target_us) {
     return 1;
 }
 
-/// The caption cache entry for `clip_id`, allocating one (with its texture) if
+/// The bitmap cache entry for `clip_id`, allocating one (with its texture) if
 /// this clip has never been drawn before.
+///
+/// Captions and stills share the pool: both are RGBA8 blocks the core produced,
+/// both are drawn as plain 2D textures, and the only difference is which ABI
+/// fills the slot.
 ///
 /// Eviction is by "slot not used by the current plan, then lowest clip id": a
 /// caption edit produces a new clip, and an old entry has to make room. The
 /// texture is reused for the new clip, so a timeline of many short captions
-/// allocates at most `kMaxTexts` textures.
-TextSlot *TextSlotFor(PresenterState *p, uint64_t clip_id) {
+/// allocates at most `kMaxBitmaps` textures.
+BitmapSlot *BitmapSlotFor(PresenterState *p, uint64_t clip_id) {
     if (clip_id == 0) {
         return nullptr;
     }
-    for (int32_t i = 0; i < kMaxTexts; i++) {
-        if (p->text_slots[i].clip_id == clip_id && p->text_slots[i].texture != 0) {
-            return &p->text_slots[i];
+    for (int32_t i = 0; i < kMaxBitmaps; i++) {
+        if (p->bitmap_slots[i].clip_id == clip_id && p->bitmap_slots[i].texture != 0) {
+            return &p->bitmap_slots[i];
         }
     }
-    for (int32_t i = 0; i < kMaxTexts; i++) {
-        if (p->text_slots[i].texture == 0) {
-            p->text_slots[i].texture = CompositorNewBitmapTexture(p->compositor);
-            if (p->text_slots[i].texture == 0) {
+    for (int32_t i = 0; i < kMaxBitmaps; i++) {
+        if (p->bitmap_slots[i].texture == 0) {
+            p->bitmap_slots[i].texture = CompositorNewBitmapTexture(p->compositor);
+            if (p->bitmap_slots[i].texture == 0) {
                 return nullptr;
             }
-            p->text_slots[i].clip_id = clip_id;
-            p->text_slots[i].revision = 0;
-            p->text_slots[i].width = 0;
-            p->text_slots[i].height = 0;
-            return &p->text_slots[i];
+            p->bitmap_slots[i].clip_id = clip_id;
+            p->bitmap_slots[i].revision = 0;
+            p->bitmap_slots[i].width = 0;
+            p->bitmap_slots[i].height = 0;
+            return &p->bitmap_slots[i];
         }
     }
 
     // Every slot is live: reuse the one whose clip has the lowest id, which is
     // the oldest insert and the least likely to be the caption still on screen.
     int32_t victim = 0;
-    for (int32_t i = 1; i < kMaxTexts; i++) {
-        if (p->text_slots[i].clip_id < p->text_slots[victim].clip_id) {
+    for (int32_t i = 1; i < kMaxBitmaps; i++) {
+        if (p->bitmap_slots[i].clip_id < p->bitmap_slots[victim].clip_id) {
             victim = i;
         }
     }
-    TextSlot &slot = p->text_slots[victim];
+    BitmapSlot &slot = p->bitmap_slots[victim];
     slot.clip_id = clip_id;
     slot.revision = 0;
     slot.width = 0;
@@ -1041,12 +1045,17 @@ TextSlot *TextSlotFor(PresenterState *p, uint64_t clip_id) {
 
 /// Make sure the slot's texture holds the current pixels of `clip_id`.
 ///
-/// Returns the slot, or null when the caption cannot be rasterised (no system
-/// font, or a clip that is not a subtitle). Errors are logged once per frame at
-/// most; a missing font is a deployment error, not something to spam about.
-TextSlot *RefreshTextSlot(PresenterState *p, uint64_t clip_id, int32_t canvas_w,
-                          int32_t canvas_h, int32_t *out_uploaded) {
-    TextSlot *slot = TextSlotFor(p, clip_id);
+/// `is_image` selects the ABI: a caption is rasterised from text, a still is
+/// decoded and resampled from its file. Both return the same RGBA8 contract, so
+/// everything below the call is shared.
+///
+/// Returns the slot, or null when the pixels cannot be produced (no system font,
+/// an unreadable file, or a clip that is neither). Errors are logged once per
+/// frame at most; a missing font is a deployment error, not something to spam
+/// about.
+BitmapSlot *RefreshBitmapSlot(PresenterState *p, uint64_t clip_id, int32_t canvas_w,
+                              int32_t canvas_h, int32_t is_image, int32_t *out_uploaded) {
+    BitmapSlot *slot = BitmapSlotFor(p, clip_id);
     if (slot == nullptr) {
         return nullptr;
     }
@@ -1055,14 +1064,16 @@ TextSlot *RefreshTextSlot(PresenterState *p, uint64_t clip_id, int32_t canvas_w,
     int32_t height = 0;
     uint64_t revision = 0;
     // Query first: a revision hit means the uploaded texture is still right,
-    // and a per-frame memcpy of a caption is exactly the kind of cost this
-    // cache exists to avoid.
-    int32_t rc = captrim_engine_clip_text_bitmap(p->engine, clip_id, (uint32_t)canvas_w,
-                                                 (uint32_t)canvas_h, nullptr, 0, &len, &width,
-                                                 &height, &revision);
+    // and a per-frame memcpy of a caption (or a re-decode of a sticker) is
+    // exactly the kind of cost this cache exists to avoid.
+    int32_t (*fetch)(captrim_engine_t *, uint64_t, uint32_t, uint32_t, uint8_t *, int32_t,
+                     int32_t *, int32_t *, int32_t *, uint64_t *) =
+        is_image != 0 ? captrim_engine_clip_image_bitmap : captrim_engine_clip_text_bitmap;
+    int32_t rc = fetch(p->engine, clip_id, (uint32_t)canvas_w, (uint32_t)canvas_h, nullptr, 0,
+                       &len, &width, &height, &revision);
     if (rc != 0 || len <= 0 || width <= 0 || height <= 0) {
-        CAPTRIM_LOGE("caption %llu has no bitmap: rc=%{public}d", (unsigned long long)clip_id,
-                     rc);
+        CAPTRIM_LOGE("%{public}s %llu has no bitmap: rc=%{public}d",
+                     is_image != 0 ? "image" : "caption", (unsigned long long)clip_id, rc);
         return nullptr;
     }
     if (revision == slot->revision && width == slot->width && height == slot->height) {
@@ -1073,9 +1084,8 @@ TextSlot *RefreshTextSlot(PresenterState *p, uint64_t clip_id, int32_t canvas_w,
     if (pixels == nullptr) {
         return nullptr;
     }
-    rc = captrim_engine_clip_text_bitmap(p->engine, clip_id, (uint32_t)canvas_w,
-                                         (uint32_t)canvas_h, pixels, len, &len, &width, &height,
-                                         &revision);
+    rc = fetch(p->engine, clip_id, (uint32_t)canvas_w, (uint32_t)canvas_h, pixels, len, &len,
+               &width, &height, &revision);
     if (rc == 0 && CompositorUploadBitmap(p->compositor, slot->texture, width, height, pixels) == 0) {
         slot->revision = revision;
         slot->width = width;
@@ -1084,7 +1094,8 @@ TextSlot *RefreshTextSlot(PresenterState *p, uint64_t clip_id, int32_t canvas_w,
             *out_uploaded = 1;
         }
     } else {
-        CAPTRIM_LOGE("caption %llu upload failed: rc=%{public}d", (unsigned long long)clip_id, rc);
+        CAPTRIM_LOGE("%{public}s %llu upload failed: rc=%{public}d",
+                     is_image != 0 ? "image" : "caption", (unsigned long long)clip_id, rc);
         free(pixels);
         return nullptr;
     }
@@ -1230,29 +1241,38 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
     for (int32_t i = 0; i < plan->layer_count && count < CAPTRIM_MAX_LAYERS; i++) {
         const captrim_layer_desc_t *layer = &plan->layers[i];
 
-        // Subtitles are pixels the core rasterises, not a file to decode: the
-        // text module produces the exact RGBA the exporter will also burn in,
-        // and this side only uploads it as a texture.
-        if (layer->kind == CAPTRIM_LAYER_SUBTITLE) {
+        // Subtitles and stills are pixels the core produces, not a file to
+        // decode: the text/image modules hand over exactly the RGBA the
+        // exporter will also burn in, and this side only uploads it as a
+        // texture.
+        //
+        // The two differ in what the bitmap already contains. A caption is
+        // rasterised at the style's size, so the layer transform still applies
+        // (scale and rotation are the compositor's). A still is already fitted,
+        // scaled and rotated by the core -- `overlay` cannot rotate, so baking
+        // it there is the only way preview and export agree -- which means this
+        // side must draw it 1:1 (scale 1, rotation 0), moving only its centre.
+        if (layer->kind == CAPTRIM_LAYER_SUBTITLE || layer->kind == CAPTRIM_LAYER_IMAGE) {
+            int32_t is_image = layer->kind == CAPTRIM_LAYER_IMAGE ? 1 : 0;
             int32_t uploaded = 0;
-            TextSlot *text = RefreshTextSlot(p, layer->clip_id, (int32_t)plan->width,
-                                             (int32_t)plan->height, &uploaded);
-            if (text == nullptr) {
+            BitmapSlot *bitmap = RefreshBitmapSlot(p, layer->clip_id, (int32_t)plan->width,
+                                                  (int32_t)plan->height, is_image, &uploaded);
+            if (bitmap == nullptr) {
                 continue;
             }
             CompLayer &out = layers[count++];
             memset(&out, 0, sizeof(out));
-            out.texture = text->texture;
+            out.texture = bitmap->texture;
             out.external = 0;
             out.fit = 0;
             out.design_w = (int32_t)plan->width;
             out.design_h = (int32_t)plan->height;
-            out.src_w = text->width;
-            out.src_h = text->height;
-            out.scale = layer->scale;
+            out.src_w = bitmap->width;
+            out.src_h = bitmap->height;
+            out.scale = is_image != 0 ? 1.0f : layer->scale;
             out.dx = layer->dx;
             out.dy = layer->dy;
-            out.rotation_deg = layer->rotation_deg;
+            out.rotation_deg = is_image != 0 ? 0.0f : layer->rotation_deg;
             out.opacity = layer->opacity;
             out.effects = 0;
             if (uploaded != 0) {
@@ -1262,7 +1282,8 @@ int32_t ComposePlan(PresenterState *p, const captrim_frame_desc_t *desc, int32_t
         }
 
         if (layer->kind != CAPTRIM_LAYER_VIDEO) {
-            // Images and stickers need a loader; nothing to draw yet.
+            // A still overlay that was never probed as video, or an empty
+            // overlay slot: there is no decoder to draw from.
             continue;
         }
         int32_t which = -1;

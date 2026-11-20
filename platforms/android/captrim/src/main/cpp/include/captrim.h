@@ -219,7 +219,10 @@ int32_t captrim_preview_stats(captrim_preview_t *preview,
 typedef enum {
     CAPTRIM_LAYER_VIDEO = 0,
     CAPTRIM_LAYER_SUBTITLE = 1,
-    CAPTRIM_LAYER_OVERLAY = 2
+    CAPTRIM_LAYER_OVERLAY = 2,
+    /* A still image or sticker. Pixels come from captrim_*_clip_image_bitmap, */
+    /* not from a decoder slot, and the bitmap is already scaled and rotated.  */
+    CAPTRIM_LAYER_IMAGE = 3
 } captrim_layer_kind_t;
 
 typedef struct {
@@ -324,6 +327,34 @@ int32_t captrim_preview_clip_text_bitmap(captrim_preview_t *preview, uint64_t cl
  * instead of leaving the preview with blank captions. */
 int32_t captrim_engine_set_text_font(captrim_engine_t *engine, const char *path,
                                      uint32_t collection_index);
+
+/* ---------------------------------------------------------------------------
+ * Image and sticker bitmaps.
+ *
+ * A CAPTRIM_LAYER_IMAGE layer has no decoder slot; its pixels are decoded from
+ * the still file by the core and already carry the layer's size (fit inside the
+ * canvas, then Transform.scale) and rotation. The renderer only translates the
+ * bitmap's centre by dx/dy, which is the same formula the exporter uses, so a
+ * sticker lands on the same pixels in the preview and in the file.
+ *
+ * Same protocol as the subtitle bitmap above: RGBA8 straight alpha, top row
+ * first, `buf == NULL` is a size query, a short buffer fails with
+ * CAPTRIM_ERR_OUT_OF_RANGE after the sizes are written. Decoding happens once
+ * per (clip, revision, canvas) and is cached; a swapped file changes the
+ * revision because the source URI is part of the hash.
+ * ------------------------------------------------------------------------- */
+
+int32_t captrim_engine_clip_image_bitmap(captrim_engine_t *engine, uint64_t clip_id,
+                                         uint32_t canvas_w, uint32_t canvas_h,
+                                         uint8_t *buf, int32_t buf_len,
+                                         int32_t *out_len, int32_t *out_width,
+                                         int32_t *out_height, uint64_t *out_revision);
+
+int32_t captrim_preview_clip_image_bitmap(captrim_preview_t *preview, uint64_t clip_id,
+                                          uint32_t canvas_w, uint32_t canvas_h,
+                                          uint8_t *buf, int32_t buf_len,
+                                          int32_t *out_len, int32_t *out_width,
+                                          int32_t *out_height, uint64_t *out_revision);
 
 /* ---------------------------------------------------------------------------
  * Subtitle burn-in export.

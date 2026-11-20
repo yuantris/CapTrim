@@ -7,6 +7,7 @@ pub mod clock;
 pub mod effects;
 pub mod error;
 pub mod export;
+pub mod images;
 pub mod media;
 pub mod model;
 pub mod preview;
@@ -26,8 +27,14 @@ pub use error::{code_message, Error, Result};
 pub use export::{
     frame_index_ceil, plan_export, ExportAudioItem, ExportPlan, ExportSegment, ExportVideoItem,
 };
+pub use images::{
+    fitted_size, image_revision, load_image, local_path, render_image, source_dimensions,
+    ImageBitmap, SourceImage,
+};
 pub use media::{MediaInfo, StreamInfo, StreamKind};
-pub use model::{Clip, Id, MediaSource, Timeline, Track, TrackKind, Transform, DRAFT_VERSION};
+pub use model::{
+    Clip, Id, ImageAsset, MediaSource, Timeline, Track, TrackKind, Transform, DRAFT_VERSION,
+};
 pub use preview::{PreviewSession, Step};
 pub use render::{
     plan_audio_at, plan_frame, plan_frame_at_index, AudioMix, FramePlan, Layer, LayerKind,

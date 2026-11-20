@@ -92,15 +92,21 @@ fn bitmap_for(
     Ok(bitmap)
 }
 
-/// Write the bitmap into a caller buffer following the shared retry protocol.
+/// Write a bitmap into a caller buffer following the shared retry protocol.
 ///
 /// `out_len` is the byte count of the RGBA8 pixels; the renderer multiplies
 /// `out_width * out_height * 4` and must match it. A buffer that is too small
 /// fails with `CAPTRIM_ERR_OUT_OF_RANGE` *after* the sizes are written, so a
 /// caller can allocate exactly once and retry.
+///
+/// Shared with the image bitmap entry points (`crate::images`): a caption and a
+/// sticker reach the renderer through exactly the same contract.
 #[allow(clippy::too_many_arguments)]
-fn copy_bitmap(
-    bitmap: &TextBitmap,
+pub(crate) fn copy_bitmap(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    revision: u64,
     buf: *mut u8,
     buf_len: i32,
     out_len: *mut i32,
@@ -108,19 +114,19 @@ fn copy_bitmap(
     out_height: *mut i32,
     out_revision: *mut u64,
 ) -> Result<()> {
-    let needed = i32::try_from(bitmap.pixels.len())
+    let needed = i32::try_from(pixels.len())
         .map_err(|_| Error::OutOfRange("bitmap is too large for an i32 length".into()))?;
     if !out_len.is_null() {
         unsafe { *out_len = needed };
     }
     if !out_width.is_null() {
-        unsafe { *out_width = bitmap.width as i32 };
+        unsafe { *out_width = width as i32 };
     }
     if !out_height.is_null() {
-        unsafe { *out_height = bitmap.height as i32 };
+        unsafe { *out_height = height as i32 };
     }
     if !out_revision.is_null() {
-        unsafe { *out_revision = bitmap.revision() };
+        unsafe { *out_revision = revision };
     }
     if out_len.is_null() || out_width.is_null() || out_height.is_null() {
         return Err(Error::invalid(
@@ -140,7 +146,7 @@ fn copy_bitmap(
     // SAFETY: the caller promised buf_len writable bytes and we just checked the
     // bitmap fits; the source is a Rust slice that cannot overlap it.
     unsafe {
-        std::ptr::copy_nonoverlapping(bitmap.pixels.as_ptr(), buf, bitmap.pixels.len());
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), buf, pixels.len());
     }
     Ok(())
 }
@@ -168,7 +174,10 @@ pub extern "C" fn captrim_engine_clip_text_bitmap(
         let e = engine_from(engine)?;
         let bitmap = bitmap_for(&e, clip_id, canvas_w, canvas_h)?;
         copy_bitmap(
-            &bitmap,
+            bitmap.width,
+            bitmap.height,
+            &bitmap.pixels,
+            bitmap.revision(),
             buf,
             buf_len,
             out_len,
@@ -202,7 +211,10 @@ pub extern "C" fn captrim_preview_clip_text_bitmap(
         let p = preview_from(preview)?;
         let bitmap = bitmap_for(p.engine().as_ref(), clip_id, canvas_w, canvas_h)?;
         copy_bitmap(
-            &bitmap,
+            bitmap.width,
+            bitmap.height,
+            &bitmap.pixels,
+            bitmap.revision(),
             buf,
             buf_len,
             out_len,

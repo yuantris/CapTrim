@@ -105,6 +105,19 @@ else
     log "no sample video (set CAPTRIM_SAMPLE_MP4); the page will run logic checks only"
 fi
 
+# The sticker has the same constraint (an app can only read its own sandbox) and
+# a second one: it is a generated asset, not a source file. Draw it from the
+# example that documents the ring-on-transparent-background design, so there is
+# no mystery blob in the repo and the demo always matches the decoder tests.
+if [ ! -f "$RAWFILE_DIR/sticker.png" ]; then
+    mkdir -p "$RAWFILE_DIR"
+    (cd "$ROOT_DIR" && cargo run -q -p captrim-core --example image_sticker -- "$RAWFILE_DIR/sticker.png") \
+        || die "cannot generate rawfile/sticker.png (cargo run -p captrim-core --example image_sticker)"
+    log "bundled sticker: generated rawfile/sticker.png"
+else
+    log "bundled sticker: reusing rawfile/sticker.png"
+fi
+
 # ohpm links file: dependencies (entry -> captrim HAR) into oh_modules.
 if [ ! -d "$OHOS_DIR/oh_modules/captrim" ]; then
     log "resolving module dependencies"

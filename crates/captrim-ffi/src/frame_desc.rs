@@ -73,6 +73,7 @@ fn layer_kind_code(kind: LayerKind) -> i32 {
         LayerKind::Video => 0,
         LayerKind::Subtitle => 1,
         LayerKind::Overlay => 2,
+        LayerKind::Image => 3,
     }
 }
 
@@ -226,6 +227,7 @@ mod tests {
         assert_eq!(layer_kind_code(LayerKind::Video), 0);
         assert_eq!(layer_kind_code(LayerKind::Subtitle), 1);
         assert_eq!(layer_kind_code(LayerKind::Overlay), 2);
+        assert_eq!(layer_kind_code(LayerKind::Image), 3);
     }
 
     #[test]
