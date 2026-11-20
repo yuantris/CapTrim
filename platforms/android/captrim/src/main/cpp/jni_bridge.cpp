@@ -222,6 +222,35 @@ jint nativeExportTranscode(JNIEnv *env, jobject, jlong handle, jstring srcUri,
     return check(env, code);
 }
 
+jint nativeExportBurnSubtitles(JNIEnv *env, jobject, jlong handle, jstring srcUri,
+                               jstring dstUri, jstring filterPrefix, jstring filterSuffix,
+                               jstring videoCodec, jstring workDir, jobject callback) {
+    Utf8 src(env, srcUri);
+    Utf8 dst(env, dstUri);
+    Utf8 prefix(env, filterPrefix);
+    Utf8 suffix(env, filterSuffix);
+    Utf8 codec(env, videoCodec);
+    Utf8 dir(env, workDir);
+    if (!src.get() || !dst.get() || !dir.get()) return CAPTRIM_ERR_INVALID;
+
+    ProgressContext ctx{env, nullptr, nullptr};
+    captrim_progress_cb nativeCallback = nullptr;
+    if (callback) {
+        jclass klass = env->GetObjectClass(callback);
+        ctx.onProgress = env->GetMethodID(klass, "onProgress", "(F)Z");
+        env->DeleteLocalRef(klass);
+        if (!ctx.onProgress) return CAPTRIM_ERR_INVALID;
+        ctx.callback = callback;
+        nativeCallback = progressTrampoline;
+    }
+
+    int32_t code = captrim_engine_export_burn_subtitles(
+        asEngine(handle), src.get(), dst.get(), prefix.get() ? prefix.get() : "",
+        suffix.get() ? suffix.get() : "", codec.get() ? codec.get() : "", dir.get(),
+        nativeCallback, callback ? &ctx : nullptr);
+    return check(env, code);
+}
+
 jstring nativeVersion(JNIEnv *env, jobject) {
     return staticString(env, captrim_version());
 }
@@ -355,6 +384,10 @@ JNINativeMethod kMethods[] = {
      "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
      "Lio/captrim/ProgressCallback;)I",
      reinterpret_cast<void *>(nativeExportTranscode)},
+    {"nativeExportBurnSubtitles",
+     "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+     "Ljava/lang/String;Ljava/lang/String;Lio/captrim/ProgressCallback;)I",
+     reinterpret_cast<void *>(nativeExportBurnSubtitles)},
     {"nativeVersion", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeVersion)},
     {"nativeCodeMessage", "(I)Ljava/lang/String;", reinterpret_cast<void *>(nativeCodeMessage)},
     {"nativeLastError", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeLastError)},

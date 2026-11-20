@@ -134,6 +134,35 @@ static void ct_set_error(char **out_error, const char *fmt, ...) {
     *out_error = b.data;
 }
 
+/* FFmpeg explains *why* a filter graph failed only through av_log, and the
+ * default callback writes to stderr, which is invisible inside an app process.
+ * Capture the first error line for the duration of one parse/config call so a
+ * failed burn reports "Option not found" or "Invalid filterchain" instead of a
+ * bare EINVAL. */
+static __thread char ct_log_tail[1024];
+
+static void ct_log_capture(void *avcl, int level, const char *fmt, va_list vl) {
+    (void)avcl;
+    if (level > AV_LOG_ERROR || ct_log_tail[0] != '\0') return;
+    vsnprintf(ct_log_tail, sizeof(ct_log_tail), fmt, vl);
+}
+
+static void ct_capture_begin(void) { ct_log_tail[0] = '\0'; }
+
+static void ct_capture_end(char **out_error, const char *what, int err) {
+    char base[AV_ERROR_MAX_STRING_SIZE] = {0};
+    if (av_strerror(err, base, sizeof(base)) < 0) {
+        snprintf(base, sizeof(base), "code %d", err);
+    }
+    char joined[1600];
+    if (ct_log_tail[0] != '\0') {
+        snprintf(joined, sizeof(joined), "%s: %s (ffmpeg: %s)", what, base, ct_log_tail);
+    } else {
+        snprintf(joined, sizeof(joined), "%s: %s", what, base);
+    }
+    ct_set_error(out_error, "%s", joined);
+}
+
 static void ct_av_error(char **out_error, const char *what, int err) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     if (av_strerror(err, buf, sizeof(buf)) < 0) {
@@ -483,11 +512,14 @@ static int32_t ct_filter_build(CtFilter *f, const AVFrame *first,
     inputs->next = NULL;
 
     const char *desc = (filter_desc && *filter_desc) ? filter_desc : "null";
+    ct_capture_begin();
+    av_log_set_callback(ct_log_capture);
     ret = avfilter_graph_parse_ptr(f->graph, desc, &inputs, &outputs, NULL);
+    av_log_set_callback(NULL);
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
     if (ret < 0) {
-        ct_av_error(out_error, "avfilter_graph_parse_ptr", ret);
+        ct_capture_end(out_error, "avfilter_graph_parse_ptr", ret);
         return CT_ERR_INVALID;
     }
     ret = avfilter_graph_config(f->graph, NULL);

@@ -81,6 +81,14 @@ interface SetCanvasCmd {
   frame_rate: RationalJson;
 }
 
+interface InsertTextClipCmd {
+  type: string;
+  track_id: number;
+  text: string;
+  start_us: number;
+  duration_us: number;
+}
+
 interface SetVolumeCmd {
   type: string;
   clip_id: number;
@@ -93,6 +101,12 @@ interface TrackJson {
 
 interface DraftJson {
   tracks: TrackJson[];
+}
+
+/** Ink statistics of one rendered subtitle PAM. */
+interface InkCount {
+  total: number;
+  bright: number;
 }
 
 const NTSC: RationalJson = { num: 30000, den: 1001 };
@@ -570,6 +584,79 @@ export class SelfCheck {
       ['pipeline_hw.mp4', 'pipeline_cb.mp4'].forEach((name: string): void => {
         SelfCheck.verifyDecodable(results, filesDir, name);
       });
+    } else if (which === 4) {
+      SelfCheck.check(results, '字幕烧录（core 栅格化 + FFmpeg overlay）', (): string => {
+        const engine = CapTrim.create();
+        const src = `file://${filesDir}/a.mp4`;
+        const dst = `${filesDir}/burn.mp4`;
+        const base = `${filesDir}/burn-base.mp4`;
+        const workDir = `${filesDir}/burn`;
+        try {
+          for (const path of [dst, base]) {
+            try {
+              fs.unlinkSync(path);
+            } catch (e) {
+              // 首次运行产物不存在，忽略
+            }
+          }
+          // 540x960 keeps the overlay at 1:1 with the canvas (subtitle geometry
+          // is canvas-relative) and the encode short enough for the UI thread.
+          const canvas: SetCanvasCmd = {
+            type: 'set_canvas', width: 540, height: 960,
+            frame_rate: { num: 30, den: 1 }
+          };
+          engine.apply(JSON.stringify(canvas));
+          const track: AddTrackCmd = { type: 'add_track', kind: 'subtitle' };
+          const trackId = engine.apply(JSON.stringify(track));
+          // 0.4s..1.6s only: frames outside the window must stay clean, which is
+          // what the enable=between(t,...) expression is for.
+          const subtitle: InsertTextClipCmd = {
+            type: 'insert_text_clip', track_id: trackId,
+            text: '字幕烧录 · Overlay', start_us: 400_000, duration_us: 1_200_000
+          };
+          engine.apply(JSON.stringify(subtitle));
+          const prefix = 'trim=duration=2,setpts=PTS-STARTPTS,' +
+            'scale=540:960:force_original_aspect_ratio=decrease,' +
+            'pad=540:960:(ow-iw)/2:(oh-ih)/2';
+          const ticks: number[] = [];
+          engine.exportBurnSubtitles(src, dst, prefix, 'fps=15', workDir, 'libx264',
+            (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; });
+          const burned = fs.statSync(dst).size;
+          expect(burned > 0, '烧录产物为空');
+
+          // Same picture pipeline, no subtitles: if overlay did anything at all
+          // the encoded result cannot be byte-identical.
+          engine.exportTranscode(src, base, `${prefix},fps=15`, 'libx264',
+            (v: number): boolean => { return true; });
+          const plain = fs.statSync(base).size;
+          expect(plain > 0, '基线产物为空');
+          expect(burned !== plain,
+            `烧录前后文件大小相同 (${burned} bytes)，overlay 可能没有生效`);
+
+          const info = JSON.parse(engine.probe(`file://${dst}`)) as MediaInfoJson;
+          const video = info.streams.find((s: StreamJson) => s.kind === 'video');
+          expect(video !== undefined, '烧录产物没有视频流');
+          const outVideo: StreamJson = video!;
+          expect(outVideo.width === 540 && outVideo.height === 960,
+            `分辨率应为 540x960，实际 ${outVideo.width}x${outVideo.height}`);
+
+          const entries = fs.listFileSync(workDir);
+          const pams = entries.filter((name: string): boolean => name.endsWith('.pam'));
+          expect(pams.length >= 1, `${workDir} 里没有渲染出的 PAM`);
+          // The overlay consumes exactly this file, so prove it carries real
+          // glyph ink on device (white text pixels with alpha) rather than an
+          // empty canvas — this is the half FFmpeg cannot tell us about.
+          const ink = SelfCheck.pamInk(`${workDir}/${pams[0]}`);
+          expect(ink.total > 500, `PAM 里只有 ${ink.total} 个墨迹像素`);
+          expect(ink.bright > 300, `PAM 里只有 ${ink.bright} 个白色像素`);
+
+          return `540x960 burn ${(burned / 1_000).toFixed(0)}KB vs base ` +
+            `${(plain / 1_000).toFixed(0)}KB，PAM ${pams.length} 张 ` +
+            `(${ink.bright} 白色 / ${ink.total} 墨迹像素)，进度 ${ticks.length} 次`;
+        } finally {
+          engine.close();
+        }
+      });
     }
     return results;
   }
@@ -635,6 +722,52 @@ export class SelfCheck {
         engine.close();
       }
     });
+  }
+
+  /**
+   * Count ink in a PAM (P7, RGB_ALPHA, written by the core): pixels whose
+   * alpha is non-zero, and the subset that is bright enough to be the white
+   * fill rather than the black outline. ArkTS cannot decode video, but it can
+   * read this file — the exact bytes FFmpeg's `movie` filter overlays.
+   */
+  private static pamInk(path: string): InkCount {
+    const stat = fs.statSync(path);
+    const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+    const buffer = new ArrayBuffer(stat.size);
+    try {
+      fs.readSync(file.fd, buffer);
+    } finally {
+      fs.closeSync(file);
+    }
+    const bytes = new Uint8Array(buffer);
+    // Header ends with the ASCII "ENDHDR\n" line; pixels follow immediately.
+    let headerEnd = -1;
+    const tag = 'ENDHDR\n';
+    for (let i = 0; i + tag.length <= bytes.length; i++) {
+      let match = true;
+      for (let j = 0; j < tag.length; j++) {
+        if (bytes[i + j] !== tag.charCodeAt(j)) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        headerEnd = i + tag.length;
+        break;
+      }
+    }
+    expect(headerEnd > 0, `${path} 没有 PAM 头`);
+    const result: InkCount = { total: 0, bright: 0 };
+    for (let p = headerEnd; p + 3 < bytes.length; p += 4) {
+      if (bytes[p + 3] === 0) {
+        continue;
+      }
+      result.total++;
+      if (bytes[p] > 200 && bytes[p + 1] > 200 && bytes[p + 2] > 200) {
+        result.bright++;
+      }
+    }
+    return result;
   }
 
   private static check(out: CheckResult[], name: string, body: () => string): void {

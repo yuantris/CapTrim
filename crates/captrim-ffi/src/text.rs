@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// Cache key: clip, text/style revision, canvas size.
 pub(crate) type TextCacheKey = (u64, u64, u32, u32);
 
-fn font_spec(engine: &Engine) -> Result<FontSpec> {
+pub(crate) fn font_spec(engine: &Engine) -> Result<FontSpec> {
     // Probed once per engine and remembered: `resolve_default_font` stats five
     // candidate paths, which is not something to repeat at 60 Hz.
     let mut slot = engine

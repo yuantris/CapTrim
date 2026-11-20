@@ -1,5 +1,7 @@
 # Rust
 /target/
+# Unit tests write scratch files under their own crate target dir.
+/crates/*/target/
 **/*.rs.bk
 Cargo.lock.bak
 

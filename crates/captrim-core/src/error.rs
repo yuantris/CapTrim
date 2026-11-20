@@ -61,6 +61,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Filesystem work (draft files, rendered subtitle images) maps onto [`Error::Io`]
+/// so callers keep the same `?`-based plumbing they use everywhere else.
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Human-readable text for a numeric C ABI status code.

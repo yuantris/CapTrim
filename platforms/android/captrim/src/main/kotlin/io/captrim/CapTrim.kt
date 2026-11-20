@@ -50,6 +50,17 @@ object CapTrimNative {
         callback: ProgressCallback?,
     ): Int
 
+    external fun nativeExportBurnSubtitles(
+        handle: Long,
+        srcUri: String,
+        dstUri: String,
+        filterPrefix: String,
+        filterSuffix: String,
+        videoCodec: String,
+        workDir: String,
+        callback: ProgressCallback?,
+    ): Int
+
     external fun nativeVersion(): String
     external fun nativeCodeMessage(code: Int): String
     external fun nativeLastError(): String
@@ -175,6 +186,33 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
     ) {
         CapTrimNative.nativeExportTranscode(
             requireOpen(), srcUri, dstUri, filterDesc, videoCodec, progress)
+    }
+
+    /**
+     * Export with this timeline's subtitles burned into the picture.
+     *
+     * The core rasterises every subtitle clip into [workDir] (one .pam per
+     * clip), builds the overlay graph and transcodes. [filterPrefix] runs
+     * first and must trim the source to the timeline range, put the frame on
+     * the timeline canvas and reset PTS to zero (`setpts=PTS-STARTPTS`);
+     * [filterSuffix] runs after the last overlay.
+     *
+     * [workDir] must be an absolute cache directory whose path contains no
+     * ':' , quotes, commas, semicolons, brackets or '%' — FFmpeg filter graphs
+     * carry paths verbatim. Runs on the calling thread.
+     */
+    fun exportBurnSubtitles(
+        srcUri: String,
+        dstUri: String,
+        filterPrefix: String,
+        filterSuffix: String,
+        workDir: String,
+        videoCodec: String = "",
+        progress: ProgressCallback? = null,
+    ) {
+        CapTrimNative.nativeExportBurnSubtitles(
+            requireOpen(), srcUri, dstUri, filterPrefix, filterSuffix, videoCodec,
+            workDir, progress)
     }
 
     /** Timeline length in microseconds. */

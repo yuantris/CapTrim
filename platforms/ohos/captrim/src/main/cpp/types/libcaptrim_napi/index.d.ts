@@ -48,6 +48,21 @@ export const exportTranscode: (
   videoCodec: string,
   progress?: (value: number) => boolean
 ) => CodeResult;
+/**
+ * Burn this timeline's subtitles into the picture: rasterise into workDir,
+ * overlay each clip in its time window, transcode. filterPrefix must reset
+ * PTS and put the frame on the timeline canvas; workDir must be colon-free.
+ */
+export const exportBurnSubtitles: (
+  handle: number,
+  srcUri: string,
+  dstUri: string,
+  filterPrefix: string,
+  filterSuffix: string,
+  videoCodec: string,
+  workDir: string,
+  progress?: (value: number) => boolean
+) => CodeResult;
 export const version: () => StringResult;
 export const codeMessage: (code: number) => StringResult;
 export const lastErrorMessage: () => StringResult;

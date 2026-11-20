@@ -501,6 +501,9 @@ struct Index {
             this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 2));
             setTimeout((): void => {
               this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 3));
+              setTimeout((): void => {
+                this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 4));
+              }, 8000);
             }, 8000);
           }, 8000);
         }, 8000);

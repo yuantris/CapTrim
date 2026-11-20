@@ -325,6 +325,31 @@ int32_t captrim_preview_clip_text_bitmap(captrim_preview_t *preview, uint64_t cl
 int32_t captrim_engine_set_text_font(captrim_engine_t *engine, const char *path,
                                      uint32_t collection_index);
 
+/* ---------------------------------------------------------------------------
+ * Subtitle burn-in export.
+ *
+ * Rasterises every subtitle clip into `work_dir` (one sub_<clip_id>.pam, PAM
+ * RGB_ALPHA), builds the FFmpeg graph that overlays each one inside its
+ * [start_us, end_us) window, and transcodes `src_uri` -> `dst_uri` through the
+ * normal backend. `filter_prefix` runs first and must put the frame on the
+ * timeline canvas with PTS starting at zero (setpts=PTS-STARTPTS);
+ * `filter_suffix` runs after the last overlay. Both may be NULL or "".
+ *
+ * `work_dir` must be an absolute directory whose path contains none of
+ * ':' " ' " "," ";" "[" "]" "%" — a filter graph cannot carry those. This is a
+ * device-side call by design (Windows paths carry a drive colon).
+ *
+ * Returns CAPTRIM_ERR_NO_BACKEND without the `ffmpeg` feature.
+ * ------------------------------------------------------------------------- */
+int32_t captrim_engine_export_burn_subtitles(captrim_engine_t *engine,
+                                             const char *src_uri, const char *dst_uri,
+                                             const char *filter_prefix,
+                                             const char *filter_suffix,
+                                             const char *video_codec,
+                                             const char *work_dir,
+                                             captrim_progress_cb progress,
+                                             void *user_data);
+
 #ifdef __cplusplus
 }
 #endif

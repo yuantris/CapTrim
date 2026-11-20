@@ -647,6 +647,13 @@ FFMPEG_COMMON_CFG=(
     --enable-decoder=flac
     --enable-decoder=pcm_s16le
     --enable-decoder=pcm_s24le
+    # Subtitle burn-in renders the text to a PAM (NetPBM P7, RGB_ALPHA) and
+    # feeds it through movie -> loop -> overlay. PAM rather than PNG on purpose:
+    # PNG needs zlib, and HarmonyOS ships no libz.so at runtime (verified on the
+    # Mate 60: /system/lib64/libz.so absent), which would have forced us to
+    # vendor and ship zlib for every platform just to decode our own text.
+    # The pnm/pam decoder is self-contained and lives in libavcodec/pnmdec.c.
+    --enable-decoder=pam
     --enable-encoder=aac
     --enable-encoder=mpeg4
     --enable-encoder=flac
@@ -692,6 +699,13 @@ FFMPEG_COMMON_CFG=(
     --enable-filter=lut
     --enable-filter=negate
     --enable-filter=boxblur
+    # Subtitle burn-in: `movie` opens the rendered PAM as an extra source inside
+    # the graph (the transcode entry point has a single frame input, so the
+    # bitmap cannot come in as a second -i), and `loop` turns its one frame into
+    # a still stream that `overlay ... enable=between(t,a,b)` can gate per
+    # subtitle window. image2 (demuxer) and overlay are already enabled above.
+    --enable-filter=movie
+    --enable-filter=loop
 )
 
 # FFmpeg's configure writes MSYS-style absolute paths (/c/Users/...) into the

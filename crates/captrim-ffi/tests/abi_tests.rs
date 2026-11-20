@@ -529,3 +529,72 @@ fn text_font_override_reports_bad_paths_and_resets() {
     // platform has no fonts at all, it only clears the override.
     assert_eq!(captrim_engine_set_text_font(e.handle(), ptr::null(), 0), 0);
 }
+
+#[test]
+fn burn_subtitles_rejects_unusable_work_dirs() {
+    let (e, _clip) = engine_with_subtitle("烧录");
+    let src = c("file:///src.mp4");
+    let dst = c("file:///dst.mp4");
+    let prefix = c("setpts=PTS-STARTPTS");
+    let call = |work_dir: *const c_char| {
+        captrim_engine_export_burn_subtitles(
+            e.handle(),
+            src.as_ptr(),
+            dst.as_ptr(),
+            prefix.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            work_dir,
+            None,
+            ptr::null_mut(),
+        )
+    };
+    assert_eq!(call(ptr::null()), -1, "{}", unsafe { last_error() });
+    let empty = c("");
+    assert_eq!(call(empty.as_ptr()), -1, "{}", unsafe { last_error() });
+    // A colon (drive letters here, a legal POSIX filename there) cannot be put
+    // into a filter graph, so the call must refuse before touching the backend.
+    let hostile = c("/tmp/captrim:a");
+    assert_eq!(call(hostile.as_ptr()), -1, "{}", unsafe { last_error() });
+}
+
+#[test]
+fn burn_subtitles_renders_pam_then_reaches_the_backend() {
+    let (e, clip_id) = engine_with_subtitle("烧录测试");
+    // Relative and colon-free: the host build has no FFmpeg, but the graph and
+    // the rendered images must exist before the backend is asked to encode.
+    let dir = format!("target/burn-abi-{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&dir);
+    let work_dir = c(&dir);
+    let src = c("file:///src.mp4");
+    let dst = c("file:///dst.mp4");
+    let prefix = c("setpts=PTS-STARTPTS,scale=1080:1920");
+    let code = captrim_engine_export_burn_subtitles(
+        e.handle(),
+        src.as_ptr(),
+        dst.as_ptr(),
+        prefix.as_ptr(),
+        ptr::null(),
+        ptr::null(),
+        work_dir.as_ptr(),
+        None,
+        ptr::null_mut(),
+    );
+    if code == -5 || code == -2 {
+        // No system font on this machine (or no font face for the text): the
+        // call must fail cleanly rather than emit a blank overlay.
+        return;
+    }
+    assert_eq!(code, -4, "{}", unsafe { last_error() });
+    let pam = format!("{dir}/sub_{clip_id}.pam");
+    let bytes = std::fs::read(&pam).unwrap_or_else(|e| panic!("{pam}: {e}"));
+    let header_end = bytes
+        .windows(7)
+        .position(|w| w == b"ENDHDR\n")
+        .expect("PAM header")
+        + 7;
+    let header = String::from_utf8_lossy(&bytes[..header_end]);
+    assert!(header.contains("TUPLTYPE RGB_ALPHA"), "{header}");
+    assert!(bytes.len() > header_end, "PAM carries no pixels");
+    let _ = std::fs::remove_dir_all(&dir);
+}

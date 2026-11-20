@@ -321,6 +321,40 @@ napi_value ExportTranscode(napi_env env, napi_callback_info info) {
     return CodeResult(env, code);
 }
 
+// Burn this timeline's subtitles into the picture: the core rasterises, builds
+// the overlay graph and transcodes, the bridge only forwards strings.
+napi_value ExportBurnSubtitles(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value args[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                          nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 3) return CodeResult(env, CAPTRIM_ERR_INVALID);
+
+    JsString src = JsString::From(env, args[1]);
+    JsString dst = JsString::From(env, args[2]);
+    JsString prefix = argc > 3 ? JsString::From(env, args[3]) : JsString();
+    JsString suffix = argc > 4 ? JsString::From(env, args[4]) : JsString();
+    JsString codec = argc > 5 ? JsString::From(env, args[5]) : JsString();
+    JsString workDir = argc > 6 ? JsString::From(env, args[6]) : JsString();
+
+    ProgressContext ctx{env, nullptr};
+    captrim_progress_cb callback = nullptr;
+    if (argc >= 8) {
+        napi_valuetype type = napi_undefined;
+        napi_typeof(env, args[7], &type);
+        if (type == napi_function) {
+            ctx.callback = args[7];
+            callback = ProgressTrampoline;
+        }
+    }
+
+    int32_t code = captrim_engine_export_burn_subtitles(
+        AsEngine(GetInt64(env, args[0])), src.c_str(), dst.c_str(), prefix.c_str(),
+        suffix.c_str(), codec.c_str(), workDir.c_str(), callback,
+        callback ? &ctx : nullptr);
+    return CodeResult(env, code);
+}
+
 // captrim_version() returns a static string; it must not be freed.
 napi_value VersionImpl(napi_env env, napi_callback_info) {
     return StaticStringResult(env, captrim_version());
@@ -637,6 +671,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"exportRemux", nullptr, ExportRemux, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportTranscode", nullptr, ExportTranscode, nullptr, nullptr, nullptr, napi_default,
          nullptr},
+        {"exportBurnSubtitles", nullptr, ExportBurnSubtitles, nullptr, nullptr, nullptr,
+         napi_default, nullptr},
         {"version", nullptr, VersionImpl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"codeMessage", nullptr, CodeMessage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},

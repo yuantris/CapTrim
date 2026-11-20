@@ -10,6 +10,7 @@ import {
   setMediaInfo as nativeSetMediaInfo,
   exportRemux as nativeExportRemux,
   exportTranscode as nativeExportTranscode,
+  exportBurnSubtitles as nativeExportBurnSubtitles,
   version as nativeVersion,
   codeMessage as nativeCodeMessage,
   lastErrorMessage,
@@ -346,6 +347,30 @@ export class CapTrim {
     progress: ProgressCallback = alwaysContinue): void {
     CapTrim.checkStatus(
       nativeExportTranscode(this.handle, srcUri, dstUri, filterDesc, videoCodec, progress).code);
+  }
+
+  /**
+   * Export with this timeline's subtitles burned into the picture.
+   *
+   * The core rasterises every subtitle clip into `workDir` (one .pam per clip),
+   * builds the overlay graph and transcodes; the platform supplies only the
+   * chains around it:
+   *
+   * @param filterPrefix runs first and must trim the source to the timeline
+   *   time range, put the picture on the timeline canvas
+   *   (`width` x `height`) and reset PTS to zero (`setpts=PTS-STARTPTS`):
+   *   subtitle windows are timeline microseconds from that zero.
+   * @param filterSuffix runs after the last overlay, e.g. "fps=15,scale=320:180".
+   * @param workDir absolute cache directory for the rendered images. Its path
+   *   must not contain ':' , quotes, commas, semicolons, brackets or '%' --
+   *   FFmpeg filter graphs carry paths verbatim.
+   */
+  exportBurnSubtitles(srcUri: string, dstUri: string, filterPrefix: string,
+    filterSuffix: string, workDir: string, videoCodec: string = '',
+    progress: ProgressCallback = alwaysContinue): void {
+    CapTrim.checkStatus(
+      nativeExportBurnSubtitles(this.handle, srcUri, dstUri, filterPrefix, filterSuffix,
+        videoCodec, workDir, progress).code);
   }
 
   /** Open a playback session. Close the previous one first. */
