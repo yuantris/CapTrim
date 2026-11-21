@@ -400,6 +400,9 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 
 现状：导出只有 `exportTranscode(src, dst, filter, codec)`（单源 + 调用方自拼 filter）与 `remux`；`ExportPlan` 只被“画出来”，没有任何代码把它编译成 FFmpeg 图；非视频流在转码里是**原样拷贝**（不裁、不混、不读 `volume`）。
 
+进度（2026-11-21）：核心图编译已落地，`export_graph::compile` 把 `ExportPlan` 编成 `filter_complex`，并用本机 FFmpeg 9.1 实跑复核（两场景：150 帧/5.000 s 与 120 帧/4.000 s，48 kHz 立体声，转场窗口两路同时出声、中段电平比两端低 1.9 dB）。剩 native 多输入执行器与双端接线，真机验收未做，因此下面仍按未完成计。
+
+
 - [ ] `export_graph`（core）：`ExportPlan` → FFmpeg `filter_complex`。视频侧先做：每段 `trim/setpts/scale/pad/effects`、段间 `concat`、图层按 z 序 `overlay`、`opacity_start/opacity_end` 用 `format=rgba,colorchannelmixer=aa` ramp；多源时每源一条输入。
 - [ ] 几何翻译：`fit → scale → rotation` 与 GL 同一公式（旋转用 `rotate=a=…:ow/oh` 后回贴画布），让预览里的旋转/缩放/位置在导出里一致；字幕/贴纸继续走已有 PAM `overlay` 图串。
 - [ ] 音频混流：按段 `atrim` 裁剪 + 多轨 `amix` + `volume`/`volume_end` 逐段 ramp + 转场窗口双源增益（复用 `plan_audio_at` 的取值），统一 48 kHz/立体声；音画对齐按段 PTS 重算，不依赖源时间戳。

@@ -36,8 +36,15 @@ use crate::Error;
 pub struct GraphSettings {
     /// `libx264`, `libx265`, or an empty string for the encoder default.
     pub codec: String,
+    /// Constant-quality target for the encoder (x264/x265 CRF). Ignored when
+    /// `codec` is empty. Lower is better quality, 18–28 is the usable band.
+    pub crf: u8,
+    /// Encoder speed/efficiency trade-off (`ultrafast` … `veryslow`).
+    pub preset: String,
+    /// AAC bitrate in kbps.
+    pub audio_bitrate_kbps: u32,
     /// Filter chain applied once to the joined picture, e.g. `fps=30` or
-    /// `fps=30,format=yuv420p`. Empty means `null` (label pass-through).
+    /// `fps=30,format=yuv420p`. Empty means no re-timing.
     pub filter_suffix: String,
 }
 
@@ -45,6 +52,9 @@ impl Default for GraphSettings {
     fn default() -> Self {
         Self {
             codec: "libx264".to_string(),
+            crf: 20,
+            preset: "veryfast".to_string(),
+            audio_bitrate_kbps: 192,
             filter_suffix: String::new(),
         }
     }
@@ -65,6 +75,9 @@ pub struct ExportGraph {
     /// AAC encoder tail one frame past the last planned picture frame.
     pub duration_us: i64,
     pub codec: String,
+    pub crf: u8,
+    pub preset: String,
+    pub audio_bitrate_kbps: u32,
 }
 
 impl ExportGraph {
@@ -82,6 +95,14 @@ impl ExportGraph {
         if !self.codec.is_empty() {
             args.push("-c:v".to_string());
             args.push(self.codec.clone());
+            // CRF and preset are x264/x265 options; a hardware encoder rejects
+            // them, so they are only passed to the software encoders.
+            if self.codec.starts_with("libx26") {
+                args.push("-crf".to_string());
+                args.push(self.crf.to_string());
+                args.push("-preset".to_string());
+                args.push(self.preset.clone());
+            }
         }
         if let Some(audio_label) = &self.audio_label {
             args.push("-map".to_string());
@@ -89,7 +110,7 @@ impl ExportGraph {
             args.push("-c:a".to_string());
             args.push("aac".to_string());
             args.push("-b:a".to_string());
-            args.push("192k".to_string());
+            args.push(format!("{}k", self.audio_bitrate_kbps));
         }
         args.push("-t".to_string());
         args.push(seconds(self.duration_us));
@@ -339,6 +360,9 @@ pub fn compile(
             .map(|segment| segment.end_us)
             .unwrap_or(0),
         codec: settings.codec.clone(),
+        crf: settings.crf,
+        preset: settings.preset.clone(),
+        audio_bitrate_kbps: settings.audio_bitrate_kbps,
     })
 }
 
@@ -855,6 +879,40 @@ mod tests {
         let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
         assert!(graph.audio_label.is_none());
         assert!(!graph.filter_complex.contains("concat=n=1:v=1:a=1"));
+    }
+
+    #[test]
+    fn encoder_settings_are_forwarded_and_hardware_encoders_skip_crf() {
+        let timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0)]);
+        let plan = plan_export(&timeline);
+        let graph = compile(
+            &timeline,
+            &plan,
+            &GraphSettings {
+                crf: 23,
+                preset: "medium".to_string(),
+                audio_bitrate_kbps: 128,
+                ..GraphSettings::default()
+            },
+        )
+        .unwrap();
+        let args = graph.args("out.mp4");
+        assert!(args.windows(2).any(|w| w[0] == "-crf" && w[1] == "23"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "-preset" && w[1] == "medium"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "-b:a" && w[1] == "128k"), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "-t"), "exact duration: {args:?}");
+
+        let hardware = compile(
+            &timeline,
+            &plan,
+            &GraphSettings {
+                codec: "h264_mediacodec".to_string(),
+                ..GraphSettings::default()
+            },
+        )
+        .unwrap();
+        let args = hardware.args("out.mp4");
+        assert!(!args.iter().any(|a| a == "-crf"), "hardware encoder: {args:?}");
     }
 
     // The planner already drops a layer whose scale is not positive, so the
