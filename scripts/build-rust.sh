@@ -40,9 +40,15 @@ stage_libs() {
     # libavcodec.so / libavcodec.so.61 symlinks) are staged too. Android ships
     # unversioned .so files, where *.so* collapses to *.so, so this is safe for
     # both platforms.
+    #
+    # -L dereferences the SONAME symlinks: on Windows hosts Git Bash often
+    # cannot create symlinks at all ("cannot create symbolic link ..."), and a
+    # dereferenced copy is what the packager wants anyway. The trap it avoids
+    # is a stale libavfilter.so left from an older build shadowing the fresh
+    # libavfilter.so.10.4.100 in the HAP.
     for lib in "$src_dir"/*.so*; do
         [ -e "$lib" ] || continue
-        cp -a "$lib" "$dst_dir/"
+        cp -aL "$lib" "$dst_dir/"
         found=1
     done
     [ "$found" = "1" ] || die "no .so found in $src_dir"

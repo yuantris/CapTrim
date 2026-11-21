@@ -546,6 +546,15 @@ struct Index {
               this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 3));
               setTimeout((): void => {
                 this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 4));
+                setTimeout((): void => {
+                  // The M1 export runs on a taskpool worker (see
+                  // TimelineExportTask.ets), so it does not block this thread
+                  // and cannot trip ThreadBlock6S. It still goes last: the
+                  // earlier jobs are the ones that burn the watchdog budget.
+                  SelfCheck.runTimelineExportAsync(filesDir).then((item: CheckResult): void => {
+                    this.appendChecks([item]);
+                  });
+                }, 8000);
               }, 8000);
             }, 8000);
           }, 8000);

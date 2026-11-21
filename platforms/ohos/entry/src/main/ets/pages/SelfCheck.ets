@@ -9,6 +9,8 @@
 
 import { CapTrim, CapTrimPreview, FramePlan, Step } from 'captrim';
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { taskpool } from '@kit.ArkTS';
+import { TimelineExportResult, exportTimelineTask } from './TimelineExportTask';
 
 export interface CheckResult {
   name: string;
@@ -717,6 +719,112 @@ export class SelfCheck {
       });
     }
     return results;
+  }
+
+  /**
+   * M1 end to end, off the UI thread.
+   *
+   * The timeline is built here (cheap, and `draft()` is exactly the JSON an
+   * app would save), then the export itself runs on a taskpool worker. A real
+   * export blocks far longer than OHOS ThreadBlock6S tolerates: running it
+   * inline got the app killed with a THREAD_BLOCK_6S fault right after the
+   * burn check, before any result line could be printed.
+   */
+  static async runTimelineExportAsync(filesDir: string): Promise<CheckResult> {
+    const name: string = '时间线导出（两段拼接 + 画中画 + 双音轨）';
+    const srcA = `file://${filesDir}/a.mp4`;
+    const srcB = `file://${filesDir}/b.mp4`;
+    const dst = `${filesDir}/timeline.mp4`;
+    try {
+      try {
+        fs.unlinkSync(dst);
+      } catch (e) {
+        // 首次运行产物不存在，忽略
+      }
+      // Second source for the concat + picture-in-picture, derived from the
+      // pushed sample so the check stays self-contained.
+      try {
+        fs.accessSync(`${filesDir}/b.mp4`);
+      } catch (e) {
+        const seeder = CapTrim.create();
+        try {
+          seeder.exportRemux(srcA, `${filesDir}/b.mp4`);
+        } finally {
+          seeder.close();
+        }
+      }
+      expect(fs.statSync(`${filesDir}/b.mp4`).size > 0, 'b.mp4 素材没有生成');
+
+      const engine = CapTrim.create();
+      let draft: string = '';
+      try {
+        const a = engine.addMedia(srcA);
+        const b = engine.addMedia(srcB);
+        engine.setMediaInfo(a, mediaInfo(srcA, 10_000_000));
+        engine.setMediaInfo(b, mediaInfo(srcB, 8_000_000));
+        const canvas: SetCanvasCmd = {
+          type: 'set_canvas', width: 360, height: 640,
+          frame_rate: { num: 30, den: 1 }
+        };
+        engine.apply(JSON.stringify(canvas));
+        const main: AddTrackCmd = { type: 'add_track', kind: 'main_video' };
+        const overlay: AddTrackCmd = { type: 'add_track', kind: 'overlay' };
+        const mainId = engine.apply(JSON.stringify(main));
+        const overlayId = engine.apply(JSON.stringify(overlay));
+        const first: InsertClipCmd = {
+          type: 'insert_clip', track_id: mainId, clip: clipOf(a, 0, 2_000_000, 0)
+        };
+        const second: InsertClipCmd = {
+          type: 'insert_clip', track_id: mainId, clip: clipOf(b, 0, 2_000_000, 2_000_000)
+        };
+        engine.apply(JSON.stringify(first));
+        engine.apply(JSON.stringify(second));
+        const pip: InsertClipCmd = {
+          type: 'insert_clip', track_id: overlayId, clip: clipOf(b, 0, 4_000_000, 0)
+        };
+        const pipId = engine.apply(JSON.stringify(pip));
+        engine.apply(
+          `{"type":"set_transform","clip_id":${pipId},` +
+          `"transform":{"scale":0.25,"dx":0.3,"dy":-0.35,"rotation_deg":0}}`
+        );
+        expect(engine.duration() === 4_000_000, `时间线应为 4.000s，实际 ${engine.duration()}us`);
+        draft = engine.draft();
+      } finally {
+        engine.close();
+      }
+
+      const raw: string =
+        (await taskpool.execute(exportTimelineTask, draft, dst)) as string;
+      const exported = JSON.parse(raw) as TimelineExportResult;
+      const stat = fs.statSync(dst);
+      expect(stat.size > 0, `导出产物为空 (${stat.size} bytes)`);
+      expect(exported.ticks >= 30, `进度回调次数过少 (${exported.ticks})`);
+      expect(exported.lastProgress > 0.9, `进度未走到尾 (${exported.lastProgress})`);
+
+      const info = JSON.parse(exported.probe) as MediaInfoJson;
+      const video = info.streams.find((s: StreamJson) => s.kind === 'video');
+      expect(video !== undefined, '导出产物没有视频流');
+      const outVideo: StreamJson = video!;
+      expect(outVideo.codec === 'h264', `编码器应为 h264，实际 ${outVideo.codec}`);
+      expect(outVideo.width === 360 && outVideo.height === 640,
+        `画布应为 360x640，实际 ${outVideo.width}x${outVideo.height}`);
+      const audio = info.streams.find((s: StreamJson) => s.kind === 'audio');
+      expect(audio !== undefined, '导出产物没有音轨');
+      const outAudio: StreamJson = audio!;
+      expect(outAudio.sample_rate === 48000 && outAudio.channels === 2,
+        `音轨应为 48k 立体声，实际 ${outAudio.sample_rate}Hz/${outAudio.channels}ch`);
+      expect(Math.abs(info.duration_us - 4_000_000) <= 34_000,
+        `时长应为 4.000s（±AAC 尾帧），实际 ${info.duration_us}us`);
+      return {
+        name: name,
+        pass: true,
+        detail: `360x640 h264 / aac ${outAudio.channels}ch ${outAudio.sample_rate}Hz，` +
+          `${exported.ticks} 次进度 至 ${exported.lastProgress.toFixed(2)}（worker 线程）`
+      };
+    } catch (e) {
+      const detail: string = e instanceof Error ? (e as Error).message : `${e}`;
+      return { name: name, pass: false, detail: detail };
+    }
   }
 
   private static verifyDecodable(results: CheckResult[], filesDir: string,
