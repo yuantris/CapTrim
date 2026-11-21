@@ -11,6 +11,7 @@ import {
   exportRemux as nativeExportRemux,
   exportTranscode as nativeExportTranscode,
   exportBurnSubtitles as nativeExportBurnSubtitles,
+  exportTimeline as nativeExportTimeline,
   version as nativeVersion,
   codeMessage as nativeCodeMessage,
   lastErrorMessage,
@@ -347,6 +348,32 @@ export class CapTrim {
     progress: ProgressCallback = alwaysContinue): void {
     CapTrim.checkStatus(
       nativeExportTranscode(this.handle, srcUri, dstUri, filterDesc, videoCodec, progress).code);
+  }
+
+  /**
+   * Export the whole timeline as one file (M1).
+   *
+   * Unlike exportTranscode(), which runs ONE source through one filter, this
+   * consumes the timeline: every segment, every picture layer (transform,
+   * effects, opacity), picture-in-picture and dissolve, every transition seam
+   * and every audio track. The core compiles one FFmpeg filter graph over the
+   * distinct sources from the same export plan the preview reads, so the file
+   * matches what was on screen -- there is no second renderer.
+   *
+   * Subtitle / sticker stills are not in this graph yet (burn them over the
+   * result). An opacity ramp other than 0->1 / 1->0 is refused with the
+   * segment and layer named instead of exporting the wrong picture.
+   *
+   * @param videoCodec '' = libx264; @param crf <= 0 = 20;
+   * @param preset '' = backend default; @param audioBitrateKbps <= 0 = 192.
+   * Runs synchronously on the calling thread.
+   */
+  exportTimeline(dstUri: string, videoCodec: string = '', crf: number = 20,
+    preset: string = 'veryfast', audioBitrateKbps: number = 192,
+    progress: ProgressCallback = alwaysContinue): void {
+    CapTrim.checkStatus(
+      nativeExportTimeline(this.handle, dstUri, videoCodec, crf, preset, audioBitrateKbps,
+        progress).code);
   }
 
   /**

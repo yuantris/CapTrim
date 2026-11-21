@@ -61,6 +61,16 @@ object CapTrimNative {
         callback: ProgressCallback?,
     ): Int
 
+    external fun nativeExportTimeline(
+        handle: Long,
+        dstUri: String,
+        videoCodec: String,
+        crf: Int,
+        preset: String,
+        audioBitrateKbps: Int,
+        callback: ProgressCallback?,
+    ): Int
+
     external fun nativeVersion(): String
     external fun nativeCodeMessage(code: Int): String
     external fun nativeLastError(): String
@@ -186,6 +196,36 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
     ) {
         CapTrimNative.nativeExportTranscode(
             requireOpen(), srcUri, dstUri, filterDesc, videoCodec, progress)
+    }
+
+    /**
+     * Export the whole timeline into one file (M1).
+     *
+     * Unlike [exportTranscode], which runs ONE source through one filter, this
+     * consumes the entire timeline: every segment, every picture layer (with
+     * its transform and effects), picture-in-picture and dissolve, every
+     * transition seam and every audio track. The core compiles the timeline
+     * into a single FFmpeg filter graph over the distinct sources and the
+     * native shim runs it, so the file that comes out is the timeline as the
+     * preview showed it — same plan, no second implementation.
+     *
+     * Subtitle and sticker stills are not part of this graph yet; they are
+     * burned over the result. An opacity ramp other than 0->1 / 1->0 is
+     * rejected with the segment and layer named instead of exported wrong.
+     *
+     * [videoCodec] empty = libx264; [crf] <= 0 = 20; [preset] empty = default;
+     * [audioBitrateKbps] <= 0 = 192. Runs on the calling thread.
+     */
+    fun exportTimeline(
+        dstUri: String,
+        videoCodec: String = "",
+        crf: Int = 20,
+        preset: String = "veryfast",
+        audioBitrateKbps: Int = 192,
+        progress: ProgressCallback? = null,
+    ) {
+        CapTrimNative.nativeExportTimeline(
+            requireOpen(), dstUri, videoCodec, crf, preset, audioBitrateKbps, progress)
     }
 
     /**

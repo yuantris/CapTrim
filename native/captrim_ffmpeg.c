@@ -6,6 +6,7 @@
  * enables libx264 / libx265.
  */
 #include "captrim_ffmpeg.h"
+#include "captrim_common.h"
 #include "captrim_pipeline.h"
 
 #include <libavcodec/avcodec.h>
@@ -27,14 +28,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-    int failed;
-} StrBuf;
+/* StrBuf is declared in captrim_common.h so captrim_export.c can share it. */
 
-static int sb_init(StrBuf *b, size_t cap) {
+int sb_init(StrBuf *b, size_t cap) {
     b->data = (char *)malloc(cap);
     b->len = 0;
     b->cap = cap;
@@ -62,7 +58,7 @@ static int sb_reserve(StrBuf *b, size_t extra) {
     return 0;
 }
 
-static void sb_puts(StrBuf *b, const char *s) {
+void sb_puts(StrBuf *b, const char *s) {
     size_t n = strlen(s);
     if (sb_reserve(b, n) != 0) return;
     memcpy(b->data + b->len, s, n);
@@ -70,7 +66,7 @@ static void sb_puts(StrBuf *b, const char *s) {
     b->data[b->len] = '\0';
 }
 
-static void sb_printf(StrBuf *b, const char *fmt, ...) {
+void sb_printf(StrBuf *b, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     va_list ap2;
@@ -115,7 +111,7 @@ static void ct_free(char *s) { free(s); }
 
 void ct_ff_string_free(char *s) { ct_free(s); }
 
-static void ct_set_error(char **out_error, const char *fmt, ...) {
+void ct_set_error(char **out_error, const char *fmt, ...) {
     if (!out_error) return;
     *out_error = NULL;
     StrBuf b;
@@ -141,15 +137,15 @@ static void ct_set_error(char **out_error, const char *fmt, ...) {
  * bare EINVAL. */
 static __thread char ct_log_tail[1024];
 
-static void ct_log_capture(void *avcl, int level, const char *fmt, va_list vl) {
+void ct_log_capture(void *avcl, int level, const char *fmt, va_list vl) {
     (void)avcl;
     if (level > AV_LOG_ERROR || ct_log_tail[0] != '\0') return;
     vsnprintf(ct_log_tail, sizeof(ct_log_tail), fmt, vl);
 }
 
-static void ct_capture_begin(void) { ct_log_tail[0] = '\0'; }
+void ct_capture_begin(void) { ct_log_tail[0] = '\0'; }
 
-static void ct_capture_end(char **out_error, const char *what, int err) {
+void ct_capture_end(char **out_error, const char *what, int err) {
     char base[AV_ERROR_MAX_STRING_SIZE] = {0};
     if (av_strerror(err, base, sizeof(base)) < 0) {
         snprintf(base, sizeof(base), "code %d", err);
@@ -163,7 +159,7 @@ static void ct_capture_end(char **out_error, const char *what, int err) {
     ct_set_error(out_error, "%s", joined);
 }
 
-static void ct_av_error(char **out_error, const char *what, int err) {
+void ct_av_error(char **out_error, const char *what, int err) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     if (av_strerror(err, buf, sizeof(buf)) < 0) {
         snprintf(buf, sizeof(buf), "code %d", err);

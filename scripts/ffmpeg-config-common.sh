@@ -706,6 +706,36 @@ FFMPEG_COMMON_CFG=(
     # subtitle window. image2 (demuxer) and overlay are already enabled above.
     --enable-filter=movie
     --enable-filter=loop
+    # ---- Timeline export: the graph crates/captrim-core/src/export_graph.rs
+    # compiles needs these. With --disable-everything each one is OFF, and the
+    # device then fails at avfilter_graph_parse_ptr with "No such filter" the
+    # moment a timeline has two segments or any audio -- a failure that shows
+    # up only on device, because the host verification uses a full FFmpeg.
+    #   picture : color (per-segment black canvas), concat (segment join),
+    #             setsar (square-pixel layers), fade (dissolve alpha ramp),
+    #             tpad (hold the outgoing frame of a dissolve)
+    #   audio   : anullsrc (silence for an empty segment), atrim / asetpts /
+    #             atempo (source range + speed, pitch kept), volume (gain and
+    #             the per-segment ramp), amix (layer sum, normalize=0),
+    #             aresample / aformat (48 kHz stereo), apad (pad to segment)
+    # split is not needed by the compiler (each label use gets its own
+    # buffersrc in ct_ff_export_graph), but it is kept enabled because any
+    # hand-written graph or future filter graph may reuse a source label.
+    --enable-filter=color
+    --enable-filter=concat
+    --enable-filter=setsar
+    --enable-filter=fade
+    --enable-filter=tpad
+    --enable-filter=split
+    --enable-filter=anullsrc
+    --enable-filter=atrim
+    --enable-filter=asetpts
+    --enable-filter=atempo
+    --enable-filter=volume
+    --enable-filter=amix
+    --enable-filter=aresample
+    --enable-filter=aformat
+    --enable-filter=apad
 )
 
 # FFmpeg's configure writes MSYS-style absolute paths (/c/Users/...) into the
@@ -775,6 +805,7 @@ build_c_shim() {
         "${ROOT_DIR}/native/captrim_ffmpeg.c" \
         "${ROOT_DIR}/native/captrim_pipeline.c" \
         "${ROOT_DIR}/native/captrim_audio.c" \
+        "${ROOT_DIR}/native/captrim_export.c" \
         -o "${out_dir}/libcaptrim_ffmpeg.so" \
         -L"${PREFIX}/lib" -lavformat -lavcodec -lavutil -lavfilter -lswscale -lswresample \
         -Wl,-soname,libcaptrim_ffmpeg.so "$@" \

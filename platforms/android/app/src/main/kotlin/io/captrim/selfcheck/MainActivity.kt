@@ -708,6 +708,86 @@ private class Runner(private val filesDir: String) {
             }
         }
 
+        // ---- 时间线导出（M1）------------------------------------------------
+        // The end-to-end M1 check: one call turns a real multi-clip timeline
+        // into one file. Everything the compiler emits has to work on the
+        // DEVICE FFmpeg build (concat / color / amix / atrim / atempo / fade /
+        // tpad ...), which a host ffmpeg.exe cannot prove.
+        check("时间线导出（三段拼接 + 画中画 + 双音轨）") {
+            CapTrim.create().use { engine ->
+                val dst = "$filesDir/timeline.mp4"
+                delete("timeline.mp4")
+                // Second source for the concat + picture-in-picture: derived
+                // from the pushed sample so the check stays self-contained.
+                if (File(filesDir, "b.mp4").length() == 0L) {
+                    engine.exportRemux(src(), "file://$filesDir/b.mp4", null)
+                }
+                expect(File(filesDir, "b.mp4").length() > 0, "b.mp4 素材没有生成")
+                val a = engine.addMedia(src())
+                val b = engine.addMedia("file://$filesDir/b.mp4")
+                engine.setMediaInfo(a, mediaInfo(src(), 10_000_000))
+                engine.setMediaInfo(b, mediaInfo("file://$filesDir/b.mp4", 8_000_000))
+                engine.apply(
+                    """{"type":"set_canvas","width":540,"height":960,""" +
+                        """"frame_rate":{"num":30,"den":1}}""",
+                )
+                val main = engine.apply("""{"type":"add_track","kind":"main_video"}""")!!
+                val overlay = engine.apply("""{"type":"add_track","kind":"overlay"}""")!!
+                engine.apply(
+                    JSONObject().put("type", "insert_clip").put("track_id", main)
+                        .put("clip", clipOf(a, 0, 2_000_000, 0)).toString(),
+                )
+                engine.apply(
+                    JSONObject().put("type", "insert_clip").put("track_id", main)
+                        .put("clip", clipOf(b, 0, 2_000_000, 2_000_000)).toString(),
+                )
+                engine.apply(
+                    JSONObject().put("type", "insert_clip").put("track_id", main)
+                        .put("clip", clipOf(a, 2_000_000, 4_000_000, 4_000_000)).toString(),
+                )
+                val pip = engine.apply(
+                    JSONObject().put("type", "insert_clip").put("track_id", overlay)
+                        .put("clip", clipOf(b, 0, 6_000_000, 0)).toString(),
+                )!!
+                engine.apply(
+                    """{"type":"set_transform","clip_id":$pip,""" +
+                        """"transform":{"scale":0.25,"dx":0.3,"dy":-0.35,"rotation_deg":0}}""",
+                )
+                expect(engine.duration() == 6_000_000L,
+                    "时间线应为 6.000s，实际 ${engine.duration()}us")
+                val ticks = mutableListOf<Float>()
+                engine.exportTimeline(dst, "libx264", 22, "veryfast", 160,
+                    ProgressCallback { v -> ticks.add(v); true })
+                val stat = File(dst)
+                expect(stat.length() > 0, "导出产物为空 (${stat.length()} bytes)")
+                expect(ticks.size >= 30, "进度回调次数过少 (${ticks.size})")
+                expect(ticks.last() > 0.9f, "进度未走到尾 (${ticks.last()})")
+                val info = JSONObject(engine.probe("file://$dst"))
+                val video = firstVideo(info)
+                expect(video.getString("codec") == "h264",
+                    "编码器应为 h264，实际 ${video.getString("codec")}")
+                expect(video.getInt("width") == 540 && video.getInt("height") == 960,
+                    "画布应为 540x960，实际 ${video.getInt("width")}x${video.getInt("height")}")
+                val streams = info.getJSONArray("streams")
+                var audioRate = 0
+                var audioChannels = 0
+                for (i in 0 until streams.length()) {
+                    val s = streams.getJSONObject(i)
+                    if (s.getString("kind") == "audio") {
+                        audioRate = s.getInt("sample_rate")
+                        audioChannels = s.getInt("channels")
+                    }
+                }
+                expect(audioRate == 48000 && audioChannels == 2,
+                    "音轨应为 48k 立体声，实际 ${audioRate}Hz/${audioChannels}ch")
+                val duration = info.getLong("duration_us")
+                expect(kotlin.math.abs(duration - 6_000_000L) <= 34_000L,
+                    "时长应为 6.000s（±AAC 尾帧），实际 ${duration}us")
+                "540x960 h264 / aac ${audioChannels}ch ${audioRate}Hz，" +
+                    "${ticks.size} 次进度 至 ${ticks.last()}"
+            }
+        }
+
         // ---- 三段式管线 ------------------------------------------------------
         check("三段式管线（软件基线 / 回退链路）") {
             pipelineRun("pipeline_sw.mp4", "hw:sw:libx264")

@@ -5,10 +5,78 @@
 //! preview. Returning JSON keeps the C ABI small while still letting a host
 //! app cache the plan and walk frames without a cross-boundary call each time.
 
-use crate::{captrim_engine_t, cstr, engine_from, ffi_guard, lock, owned_cstring};
-use captrim_core::{effects_to_filter_desc, plan_export, Error};
-use std::os::raw::c_char;
+use crate::{
+    captrim_engine_t, cstr, engine_from, ffi_guard, lock, owned_cstring, CaptrimProgressCb,
+};
+use captrim_core::{
+    compile_export_graph, effects_to_filter_desc, plan_export, Error, GraphSettings,
+};
+use std::os::raw::{c_char, c_void};
 use std::ptr;
+
+/// Export the whole timeline into one file (M1 "can deliver a file").
+///
+/// The core compiles the timeline's `ExportPlan` into a single FFmpeg
+/// `filter_complex` over every distinct source (segments, layers, transitions,
+/// audio tracks) and the backend runs it: N demuxers, one graph, `vout` encoded
+/// with `video_codec`, `aout` (when the project has audio) encoded as AAC.
+/// Preview and export read the same plan, so what was cut is what gets written.
+///
+/// `video_codec` may be NULL or "" for libx264; `crf` <= 0 uses 20; `preset`
+/// NULL/"" uses the backend default; `audio_bitrate_kbps` <= 0 uses 192.
+/// `progress` returns non-zero to cancel, which deletes the partial file.
+/// Returns CAPTRIM_ERR_NO_BACKEND when built without the `ffmpeg` feature.
+#[no_mangle]
+pub extern "C" fn captrim_engine_export_timeline(
+    engine: *mut captrim_engine_t,
+    dst_uri: *const c_char,
+    video_codec: *const c_char,
+    crf: i32,
+    preset: *const c_char,
+    audio_bitrate_kbps: i32,
+    progress: CaptrimProgressCb,
+    user_data: *mut c_void,
+) -> i32 {
+    ffi_guard(|| {
+        let dst = unsafe { cstr(dst_uri) }?.to_string();
+        let codec = if video_codec.is_null() {
+            String::new()
+        } else {
+            unsafe { cstr(video_codec) }?.to_string()
+        };
+        let preset = if preset.is_null() {
+            String::new()
+        } else {
+            unsafe { cstr(preset) }?.to_string()
+        };
+        let settings = GraphSettings {
+            codec,
+            crf: if crf > 0 { crf.min(51) as u8 } else { 20 },
+            preset,
+            audio_bitrate_kbps: if audio_bitrate_kbps > 0 {
+                audio_bitrate_kbps as u32
+            } else {
+                192
+            },
+            // The graph already runs at the timeline's exact frame rate; no
+            // extra re-timing is added here.
+            filter_suffix: String::new(),
+        };
+        let e = engine_from(engine)?;
+        let graph = {
+            let editor = lock(&e.editor)?;
+            let timeline = editor.timeline();
+            let plan = plan_export(timeline);
+            compile_export_graph(timeline, &plan, &settings)?
+        };
+        let mut report = |value: f32| match progress {
+            Some(cb) => unsafe { cb(value, user_data) == 0 },
+            None => true,
+        };
+        e.backend.export_graph(&graph, &dst, &mut report)?;
+        Ok(0)
+    })
+}
 
 /// Full export breakdown as an `ExportPlan` JSON object.
 #[no_mangle]

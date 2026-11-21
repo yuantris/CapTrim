@@ -82,6 +82,35 @@ int32_t captrim_engine_export_transcode(captrim_engine_t *engine,
                                         const char *filter_desc, const char *video_codec,
                                         captrim_progress_cb progress, void *user_data);
 
+/* ---- Timeline export (M1) -----------------------------------------------
+ * Export the WHOLE timeline as one file, not one source through one filter.
+ *
+ * The core compiles the timeline into an ExportPlan (frame-aligned segments,
+ * every layer's source range / transform / effects / opacity, every audio
+ * contributor's gain) and then into ONE FFmpeg filter_complex over every
+ * distinct source: segment stitching, per-layer geometry, picture-in-picture
+ * and dissolve, audio mixing and transitions. The backend runs N demuxers into
+ * that graph, encodes `vout` with video_codec and `aout` (when the project has
+ * audio) as AAC, and stops at the plan's exact duration.
+ *
+ * Missing capabilities are refused with the segment and layer named rather
+ * than exported wrong: a still layer (subtitle / sticker bitmap) is burned
+ * separately for now, and an opacity ramp other than 0->1 / 1->0 is rejected.
+ *
+ * video_codec: encoder name; NULL or "" = libx264.
+ * crf:          x264/x265 quality; <= 0 = 20 (ignored by hardware encoders).
+ * preset:       encoder speed; NULL or "" = backend default.
+ * audio_bitrate_kbps: <= 0 = 192.
+ * progress:     returns non-zero to cancel; the partial file is deleted.
+ * Returns CAPTRIM_ERR_NO_BACKEND when built without the `ffmpeg` feature. */
+int32_t captrim_engine_export_timeline(captrim_engine_t *engine,
+                                       const char *dst_uri,
+                                       const char *video_codec,
+                                       int32_t crf,
+                                       const char *preset,
+                                       int32_t audio_bitrate_kbps,
+                                       captrim_progress_cb progress, void *user_data);
+
 /* ---- Frame planning (P1) -------------------------------------------------
  * Preview and export read the same plan, which is what keeps "what I saw" and
  * "what got written" identical.

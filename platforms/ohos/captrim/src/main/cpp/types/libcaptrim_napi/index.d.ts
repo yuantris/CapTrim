@@ -63,6 +63,21 @@ export const exportBurnSubtitles: (
   workDir: string,
   progress?: (value: number) => boolean
 ) => CodeResult;
+/**
+ * Export the whole timeline as one file: the core compiles every segment,
+ * picture layer, transition and audio track into one filter_complex and the
+ * shim runs it. videoCodec '' = libx264, crf <= 0 = 20, preset '' = default,
+ * audioBitrateKbps <= 0 = 192.
+ */
+export const exportTimeline: (
+  handle: number,
+  dstUri: string,
+  videoCodec: string,
+  crf: number,
+  preset: string,
+  audioBitrateKbps: number,
+  progress?: (value: number) => boolean
+) => CodeResult;
 export const version: () => StringResult;
 export const codeMessage: (code: number) => StringResult;
 export const lastErrorMessage: () => StringResult;

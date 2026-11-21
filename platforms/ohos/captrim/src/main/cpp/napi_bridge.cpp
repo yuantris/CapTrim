@@ -355,6 +355,40 @@ napi_value ExportBurnSubtitles(napi_env env, napi_callback_info info) {
     return CodeResult(env, code);
 }
 
+// Export the whole timeline (M1): the core compiles segments, layers,
+// transitions and audio into one filter_complex; the shim runs it. The bridge
+// only forwards the encoder settings.
+napi_value ExportTimeline(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value args[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 2) return CodeResult(env, CAPTRIM_ERR_INVALID);
+
+    JsString dst = JsString::From(env, args[1]);
+    JsString codec = argc > 2 ? JsString::From(env, args[2]) : JsString();
+    int32_t crf = 0;
+    if (argc > 3) napi_get_value_int32(env, args[3], &crf);
+    JsString preset = argc > 4 ? JsString::From(env, args[4]) : JsString();
+    int32_t bitrate = 0;
+    if (argc > 5) napi_get_value_int32(env, args[5], &bitrate);
+
+    ProgressContext ctx{env, nullptr};
+    captrim_progress_cb callback = nullptr;
+    if (argc >= 7) {
+        napi_valuetype type = napi_undefined;
+        napi_typeof(env, args[6], &type);
+        if (type == napi_function) {
+            ctx.callback = args[6];
+            callback = ProgressTrampoline;
+        }
+    }
+
+    int32_t code = captrim_engine_export_timeline(
+        AsEngine(GetInt64(env, args[0])), dst.c_str(), codec.c_str(), crf,
+        preset.c_str(), bitrate, callback, callback ? &ctx : nullptr);
+    return CodeResult(env, code);
+}
+
 // captrim_version() returns a static string; it must not be freed.
 napi_value VersionImpl(napi_env env, napi_callback_info) {
     return StaticStringResult(env, captrim_version());
@@ -673,6 +707,8 @@ napi_value Init(napi_env env, napi_value exports) {
          nullptr},
         {"exportBurnSubtitles", nullptr, ExportBurnSubtitles, nullptr, nullptr, nullptr,
          napi_default, nullptr},
+        {"exportTimeline", nullptr, ExportTimeline, nullptr, nullptr, nullptr, napi_default,
+         nullptr},
         {"version", nullptr, VersionImpl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"codeMessage", nullptr, CodeMessage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},

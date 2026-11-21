@@ -251,6 +251,36 @@ jint nativeExportBurnSubtitles(JNIEnv *env, jobject, jlong handle, jstring srcUr
     return check(env, code);
 }
 
+// Export the whole timeline (M1): the core compiles its segments, layers,
+// transitions and audio tracks into one filter_complex and the FFmpeg shim
+// runs it. The platform passes only the encoder settings.
+jint nativeExportTimeline(JNIEnv *env, jobject, jlong handle, jstring dstUri,
+                          jstring videoCodec, jint crf, jstring preset,
+                          jint audioBitrateKbps, jobject callback) {
+    Utf8 dst(env, dstUri);
+    Utf8 codec(env, videoCodec);
+    Utf8 presetText(env, preset);
+    if (!dst.get()) return CAPTRIM_ERR_INVALID;
+
+    ProgressContext ctx{env, nullptr, nullptr};
+    captrim_progress_cb nativeCallback = nullptr;
+    if (callback) {
+        jclass klass = env->GetObjectClass(callback);
+        ctx.onProgress = env->GetMethodID(klass, "onProgress", "(F)Z");
+        env->DeleteLocalRef(klass);
+        if (!ctx.onProgress) return CAPTRIM_ERR_INVALID;
+        ctx.callback = callback;
+        nativeCallback = progressTrampoline;
+    }
+
+    int32_t code = captrim_engine_export_timeline(
+        asEngine(handle), dst.get(), codec.get() ? codec.get() : "",
+        static_cast<int32_t>(crf), presetText.get() ? presetText.get() : "",
+        static_cast<int32_t>(audioBitrateKbps), nativeCallback,
+        callback ? &ctx : nullptr);
+    return check(env, code);
+}
+
 jstring nativeVersion(JNIEnv *env, jobject) {
     return staticString(env, captrim_version());
 }
@@ -388,6 +418,10 @@ JNINativeMethod kMethods[] = {
      "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;"
      "Ljava/lang/String;Ljava/lang/String;Lio/captrim/ProgressCallback;)I",
      reinterpret_cast<void *>(nativeExportBurnSubtitles)},
+    {"nativeExportTimeline",
+     "(JLjava/lang/String;Ljava/lang/String;ILjava/lang/String;I"
+     "Lio/captrim/ProgressCallback;)I",
+     reinterpret_cast<void *>(nativeExportTimeline)},
     {"nativeVersion", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeVersion)},
     {"nativeCodeMessage", "(I)Ljava/lang/String;", reinterpret_cast<void *>(nativeCodeMessage)},
     {"nativeLastError", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeLastError)},

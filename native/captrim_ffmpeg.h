@@ -52,6 +52,21 @@ int32_t ct_ff_transcode(const char *src_uri, const char *dst_uri,
                         ct_progress_cb progress, void *user_data,
                         char **out_error);
 
+/* Multi-input export: runs the `filter_complex` compiled by
+ * captrim-core's export_graph (labels `[k:v]` / `[k:a]` refer to src_uris[k]).
+ *
+ * Unlike ct_ff_transcode this takes N inputs in ONE graph, encodes the graph's
+ * `vout` with `video_codec` (libx26* also gets crf/preset) and its optional
+ * `aout` with AAC at `audio_bitrate_kbps`, and stops at `duration_us`. Inputs
+ * are demuxed round-robin, each source label gets its own buffersrc, and every
+ * output frame is restamped to the plan's timeline instead of the container's.
+ * Returns CT_ERR_CANCELLED and deletes dst when *progress returns non-zero. */
+int32_t ct_ff_export_graph(const char *const *src_uris, int32_t src_count,
+                           const char *filter_complex, const char *dst_uri,
+                           const char *video_codec, int32_t crf, const char *preset,
+                           int32_t audio_bitrate_kbps, int64_t duration_us,
+                           ct_progress_cb progress, void *user_data, char **out_error);
+
 void ct_ff_string_free(char *s);
 
 #ifdef __cplusplus

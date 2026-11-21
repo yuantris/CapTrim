@@ -31,6 +31,16 @@ pub trait MediaBackend: Send + Sync {
         video_codec: &str,
         progress: &mut dyn FnMut(f32) -> bool,
     ) -> Result<()>;
+    /// Run one compiled timeline graph: N inputs, one `filter_complex`, its
+    /// `vout` (and optional `aout`) encoded into one mp4. Unlike `transcode`
+    /// this is the whole edited timeline, not one file. `progress` returns
+    /// false to cancel.
+    fn export_graph(
+        &self,
+        graph: &captrim_core::ExportGraph,
+        dst_uri: &str,
+        progress: &mut dyn FnMut(f32) -> bool,
+    ) -> Result<()>;
 }
 
 pub struct StubBackend;
@@ -63,6 +73,17 @@ impl MediaBackend for StubBackend {
         _dst_uri: &str,
         _filter_desc: &str,
         _video_codec: &str,
+        _progress: &mut dyn FnMut(f32) -> bool,
+    ) -> Result<()> {
+        Err(Error::BackendUnavailable(
+            "build captrim-ffi with --features ffmpeg and ship libcaptrim_ffmpeg.so".into(),
+        ))
+    }
+
+    fn export_graph(
+        &self,
+        _graph: &captrim_core::ExportGraph,
+        _dst_uri: &str,
         _progress: &mut dyn FnMut(f32) -> bool,
     ) -> Result<()> {
         Err(Error::BackendUnavailable(
@@ -116,6 +137,20 @@ mod ffmpeg {
             out_error: *mut *mut c_char,
         ) -> c_int;
         fn ct_ff_string_free(s: *mut c_char);
+        fn ct_ff_export_graph(
+            src_uris: *const *const c_char,
+            src_count: c_int,
+            filter_complex: *const c_char,
+            dst_uri: *const c_char,
+            video_codec: *const c_char,
+            crf: c_int,
+            preset: *const c_char,
+            audio_bitrate_kbps: c_int,
+            duration_us: i64,
+            progress: Option<unsafe extern "C" fn(c_float, *mut c_void) -> c_int>,
+            user_data: *mut c_void,
+            out_error: *mut *mut c_char,
+        ) -> c_int;
     }
 
     unsafe extern "C" fn progress_trampoline(progress: c_float, user: *mut c_void) -> c_int {
@@ -220,6 +255,48 @@ mod ffmpeg {
                     dst.as_ptr(),
                     filter.as_ptr(),
                     codec.as_ptr(),
+                    Some(progress_trampoline),
+                    user,
+                    &mut err,
+                )
+            };
+            let message = unsafe { take_error(err) };
+            if status != 0 {
+                return Err(map_status(status, message));
+            }
+            Ok(())
+        }
+
+        fn export_graph(
+            &self,
+            graph: &captrim_core::ExportGraph,
+            dst_uri: &str,
+            mut progress: &mut dyn FnMut(f32) -> bool,
+        ) -> Result<()> {
+            // The C side owns the pointer list, so every CString has to outlive
+            // the call: build them all first, then take the raw pointers.
+            let dst = cs(dst_uri)?;
+            let filter = cs(&graph.filter_complex)?;
+            let codec = cs(&graph.codec)?;
+            let preset = cs(&graph.preset)?;
+            let mut inputs = Vec::with_capacity(graph.inputs.len());
+            for uri in &graph.inputs {
+                inputs.push(cs(uri)?);
+            }
+            let raw: Vec<*const c_char> = inputs.iter().map(|c| c.as_ptr()).collect();
+            let mut err: *mut c_char = ptr::null_mut();
+            let user = &mut progress as *mut _ as *mut c_void;
+            let status = unsafe {
+                ct_ff_export_graph(
+                    raw.as_ptr(),
+                    raw.len() as c_int,
+                    filter.as_ptr(),
+                    dst.as_ptr(),
+                    codec.as_ptr(),
+                    graph.crf as c_int,
+                    preset.as_ptr(),
+                    graph.audio_bitrate_kbps as c_int,
+                    graph.duration_us,
                     Some(progress_trampoline),
                     user,
                     &mut err,
