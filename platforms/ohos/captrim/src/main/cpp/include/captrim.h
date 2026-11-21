@@ -94,9 +94,13 @@ int32_t captrim_engine_export_transcode(captrim_engine_t *engine,
  * audio) as AAC, and stops at the plan's exact duration.
  *
  * Missing capabilities are refused with the segment and layer named rather
- * than exported wrong: a still layer (subtitle / sticker bitmap) is burned
- * separately for now, and an opacity ramp other than 0->1 / 1->0 is rejected.
+ * than exported wrong (an opacity ramp other than 0->1 / 1->0 is rejected).
+ * Caption and sticker layers are stills the SDK rasterises itself, exactly
+ * like the preview does; they enter the same graph through `movie`. They need
+ * a writable directory to hold the PAM bitmaps, hence work_dir — without it a
+ * still layer is refused instead of being dropped from the picture.
  *
+ * work_dir: directory for rasterised stills; NULL or "" refuses still layers.
  * video_codec: encoder name; NULL or "" = libx264.
  * crf:          x264/x265 quality; <= 0 = 20 (ignored by hardware encoders).
  * preset:       encoder speed; NULL or "" = backend default.
@@ -105,6 +109,7 @@ int32_t captrim_engine_export_transcode(captrim_engine_t *engine,
  * Returns CAPTRIM_ERR_NO_BACKEND when built without the `ffmpeg` feature. */
 int32_t captrim_engine_export_timeline(captrim_engine_t *engine,
                                        const char *dst_uri,
+                                       const char *work_dir,
                                        const char *video_codec,
                                        int32_t crf,
                                        const char *preset,

@@ -30,6 +30,7 @@ use std::ptr;
 pub extern "C" fn captrim_engine_export_timeline(
     engine: *mut captrim_engine_t,
     dst_uri: *const c_char,
+    work_dir: *const c_char,
     video_codec: *const c_char,
     crf: i32,
     preset: *const c_char,
@@ -39,6 +40,16 @@ pub extern "C" fn captrim_engine_export_timeline(
 ) -> i32 {
     ffi_guard(|| {
         let dst = unsafe { cstr(dst_uri) }?.to_string();
+        let work_dir = if work_dir.is_null() {
+            None
+        } else {
+            let text = unsafe { cstr(work_dir) }?.to_string();
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(text))
+            }
+        };
         let codec = if video_codec.is_null() {
             String::new()
         } else {
@@ -49,21 +60,31 @@ pub extern "C" fn captrim_engine_export_timeline(
         } else {
             unsafe { cstr(preset) }?.to_string()
         };
-        let settings = GraphSettings {
-            codec,
-            crf: if crf > 0 { crf.min(51) as u8 } else { 20 },
-            preset,
-            audio_bitrate_kbps: if audio_bitrate_kbps > 0 {
-                audio_bitrate_kbps as u32
-            } else {
-                192
-            },
-            // The graph already runs at the timeline's exact frame rate; no
-            // extra re-timing is added here.
-            filter_suffix: String::new(),
-        };
         let e = engine_from(engine)?;
+        // A host that called `captrim_engine_set_text_font` gets exactly that
+        // font; otherwise the core resolves the platform default lazily, only
+        // when the plan actually carries a caption.
+        let still_font = e
+            .text_font
+            .lock()
+            .map_err(|_| Error::Internal("font mutex poisoned".into()))?
+            .clone();
         let graph = {
+            let settings = GraphSettings {
+                codec,
+                crf: if crf > 0 { crf.min(51) as u8 } else { 20 },
+                preset,
+                audio_bitrate_kbps: if audio_bitrate_kbps > 0 {
+                    audio_bitrate_kbps as u32
+                } else {
+                    192
+                },
+                // The graph already runs at the timeline's exact frame rate; no
+                // extra re-timing is added here.
+                filter_suffix: String::new(),
+                still_dir: work_dir,
+                still_font,
+            };
             let editor = lock(&e.editor)?;
             let timeline = editor.timeline();
             let plan = plan_export(timeline);

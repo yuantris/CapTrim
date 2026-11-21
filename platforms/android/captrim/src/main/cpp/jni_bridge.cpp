@@ -255,9 +255,10 @@ jint nativeExportBurnSubtitles(JNIEnv *env, jobject, jlong handle, jstring srcUr
 // transitions and audio tracks into one filter_complex and the FFmpeg shim
 // runs it. The platform passes only the encoder settings.
 jint nativeExportTimeline(JNIEnv *env, jobject, jlong handle, jstring dstUri,
-                          jstring videoCodec, jint crf, jstring preset,
-                          jint audioBitrateKbps, jobject callback) {
+                          jstring workDir, jstring videoCodec, jint crf,
+                          jstring preset, jint audioBitrateKbps, jobject callback) {
     Utf8 dst(env, dstUri);
+    Utf8 dir(env, workDir);
     Utf8 codec(env, videoCodec);
     Utf8 presetText(env, preset);
     if (!dst.get()) return CAPTRIM_ERR_INVALID;
@@ -274,7 +275,7 @@ jint nativeExportTimeline(JNIEnv *env, jobject, jlong handle, jstring dstUri,
     }
 
     int32_t code = captrim_engine_export_timeline(
-        asEngine(handle), dst.get(), codec.get() ? codec.get() : "",
+        asEngine(handle), dst.get(), dir.get(), codec.get() ? codec.get() : "",
         static_cast<int32_t>(crf), presetText.get() ? presetText.get() : "",
         static_cast<int32_t>(audioBitrateKbps), nativeCallback,
         callback ? &ctx : nullptr);
@@ -419,7 +420,7 @@ JNINativeMethod kMethods[] = {
      "Ljava/lang/String;Ljava/lang/String;Lio/captrim/ProgressCallback;)I",
      reinterpret_cast<void *>(nativeExportBurnSubtitles)},
     {"nativeExportTimeline",
-     "(JLjava/lang/String;Ljava/lang/String;ILjava/lang/String;I"
+     "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;I"
      "Lio/captrim/ProgressCallback;)I",
      reinterpret_cast<void *>(nativeExportTimeline)},
     {"nativeVersion", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeVersion)},

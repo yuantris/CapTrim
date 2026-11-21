@@ -360,20 +360,25 @@ export class CapTrim {
    * distinct sources from the same export plan the preview reads, so the file
    * matches what was on screen -- there is no second renderer.
    *
-   * Subtitle / sticker stills are not in this graph yet (burn them over the
-   * result). An opacity ramp other than 0->1 / 1->0 is refused with the
-   * segment and layer named instead of exporting the wrong picture.
+   * Caption and sticker layers are stills the SDK rasterises itself; they are
+   * written into `workDir` and drawn in the same graph, in their z position and
+   * time window. Without a work dir they are refused rather than dropped. An
+   * opacity ramp other than 0->1 / 1->0 is refused with the segment and layer
+   * named instead of exporting the wrong picture.
    *
+   * @param workDir writable directory for the still bitmaps (no ':' , quotes,
+   *        commas, semicolons, brackets or '%'); '' refuses still layers.
    * @param videoCodec '' = libx264; @param crf <= 0 = 20;
    * @param preset '' = backend default; @param audioBitrateKbps <= 0 = 192.
-   * Runs synchronously on the calling thread.
+   * Runs synchronously on the calling thread (use a taskpool worker for a
+   * real export: OHOS kills the app after 6 s of blocked UI thread).
    */
-  exportTimeline(dstUri: string, videoCodec: string = '', crf: number = 20,
-    preset: string = 'veryfast', audioBitrateKbps: number = 192,
+  exportTimeline(dstUri: string, workDir: string = '', videoCodec: string = '',
+    crf: number = 20, preset: string = 'veryfast', audioBitrateKbps: number = 192,
     progress: ProgressCallback = alwaysContinue): void {
     CapTrim.checkStatus(
-      nativeExportTimeline(this.handle, dstUri, videoCodec, crf, preset, audioBitrateKbps,
-        progress).code);
+      nativeExportTimeline(this.handle, dstUri, workDir, videoCodec, crf, preset,
+        audioBitrateKbps, progress).code);
   }
 
   /**

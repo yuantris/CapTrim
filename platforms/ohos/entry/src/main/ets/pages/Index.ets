@@ -545,16 +545,19 @@ struct Index {
             setTimeout((): void => {
               this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 3));
               setTimeout((): void => {
-                this.appendChecks(SelfCheck.runPipelineChecks(filesDir, 4));
-                setTimeout((): void => {
-                  // The M1 export runs on a taskpool worker (see
-                  // TimelineExportTask.ets), so it does not block this thread
-                  // and cannot trip ThreadBlock6S. It still goes last: the
-                  // earlier jobs are the ones that burn the watchdog budget.
-                  SelfCheck.runTimelineExportAsync(filesDir).then((item: CheckResult): void => {
-                    this.appendChecks([item]);
-                  });
-                }, 8000);
+                // Burn (two 540x960 transcodes) and the M1 timeline export both
+                // run on taskpool workers (see TimelineExportTask.ets): a UI
+                // thread blocked past 6 s gets the app killed with
+                // THREAD_BLOCK_6S. Chaining the results back here keeps every
+                // row on the same list, in order.
+                SelfCheck.runBurnAsync(filesDir).then((burned: CheckResult): void => {
+                  this.appendChecks([burned]);
+                  setTimeout((): void => {
+                    SelfCheck.runTimelineExportAsync(filesDir).then((exported: CheckResult): void => {
+                      this.appendChecks([exported]);
+                    });
+                  }, 8000);
+                });
               }, 8000);
             }, 8000);
           }, 8000);

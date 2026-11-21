@@ -157,6 +157,26 @@ pub fn plan_burn(timeline: &Timeline, dir: &Path, font: &FontSpec) -> Result<Vec
     Ok(layers)
 }
 
+/// [`plan_burn`] with the engine's font choice already resolved.
+///
+/// `font = None` means "whatever this platform calls the system font", the same
+/// lookup the preview does, so a caption cannot change glyph between the two
+/// surfaces. The export graph uses this entry point; the standalone burn ABI
+/// passes the font it was given.
+pub fn plan_burn_with_font(
+    timeline: &Timeline,
+    dir: &Path,
+    font: Option<&FontSpec>,
+) -> Result<Vec<BurnLayer>> {
+    match font {
+        Some(spec) => plan_burn(timeline, dir, spec),
+        None => {
+            let resolved = crate::text::resolve_default_font()?;
+            plan_burn(timeline, dir, &resolved)
+        }
+    }
+}
+
 /// Build the `[in] ... [out]` graph that draws `layers` over the frame
 /// produced by `prefix`.
 ///

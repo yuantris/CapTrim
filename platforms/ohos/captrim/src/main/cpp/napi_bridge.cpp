@@ -359,33 +359,34 @@ napi_value ExportBurnSubtitles(napi_env env, napi_callback_info info) {
 // transitions and audio into one filter_complex; the shim runs it. The bridge
 // only forwards the encoder settings.
 napi_value ExportTimeline(napi_env env, napi_callback_info info) {
-    size_t argc = 7;
-    napi_value args[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 8;
+    napi_value args[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     if (argc < 2) return CodeResult(env, CAPTRIM_ERR_INVALID);
 
     JsString dst = JsString::From(env, args[1]);
-    JsString codec = argc > 2 ? JsString::From(env, args[2]) : JsString();
+    JsString workDir = argc > 2 ? JsString::From(env, args[2]) : JsString();
+    JsString codec = argc > 3 ? JsString::From(env, args[3]) : JsString();
     int32_t crf = 0;
-    if (argc > 3) napi_get_value_int32(env, args[3], &crf);
-    JsString preset = argc > 4 ? JsString::From(env, args[4]) : JsString();
+    if (argc > 4) napi_get_value_int32(env, args[4], &crf);
+    JsString preset = argc > 5 ? JsString::From(env, args[5]) : JsString();
     int32_t bitrate = 0;
-    if (argc > 5) napi_get_value_int32(env, args[5], &bitrate);
+    if (argc > 6) napi_get_value_int32(env, args[6], &bitrate);
 
     ProgressContext ctx{env, nullptr};
     captrim_progress_cb callback = nullptr;
-    if (argc >= 7) {
+    if (argc >= 8) {
         napi_valuetype type = napi_undefined;
-        napi_typeof(env, args[6], &type);
+        napi_typeof(env, args[7], &type);
         if (type == napi_function) {
-            ctx.callback = args[6];
+            ctx.callback = args[7];
             callback = ProgressTrampoline;
         }
     }
 
     int32_t code = captrim_engine_export_timeline(
-        AsEngine(GetInt64(env, args[0])), dst.c_str(), codec.c_str(), crf,
-        preset.c_str(), bitrate, callback, callback ? &ctx : nullptr);
+        AsEngine(GetInt64(env, args[0])), dst.c_str(), workDir.c_str(), codec.c_str(),
+        crf, preset.c_str(), bitrate, callback, callback ? &ctx : nullptr);
     return CodeResult(env, code);
 }
 

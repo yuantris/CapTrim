@@ -64,6 +64,7 @@ object CapTrimNative {
     external fun nativeExportTimeline(
         handle: Long,
         dstUri: String,
+        workDir: String,
         videoCodec: String,
         crf: Int,
         preset: String,
@@ -209,15 +210,22 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
      * native shim runs it, so the file that comes out is the timeline as the
      * preview showed it — same plan, no second implementation.
      *
-     * Subtitle and sticker stills are not part of this graph yet; they are
-     * burned over the result. An opacity ramp other than 0->1 / 1->0 is
+     * Caption and sticker layers are stills the SDK rasterises itself; they
+     * need [workDir] to hold the PAM bitmaps and are drawn in the same graph,
+     * in their z position and time window. Without a work dir they are
+     * refused rather than dropped. An opacity ramp other than 0->1 / 1->0 is
      * rejected with the segment and layer named instead of exported wrong.
+     *
+     * [workDir] must be an absolute cache directory whose path contains no
+     * ':' , quotes, commas, semicolons, brackets or '%' — FFmpeg filter graphs
+     * carry paths verbatim.
      *
      * [videoCodec] empty = libx264; [crf] <= 0 = 20; [preset] empty = default;
      * [audioBitrateKbps] <= 0 = 192. Runs on the calling thread.
      */
     fun exportTimeline(
         dstUri: String,
+        workDir: String = "",
         videoCodec: String = "",
         crf: Int = 20,
         preset: String = "veryfast",
@@ -225,7 +233,7 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
         progress: ProgressCallback? = null,
     ) {
         CapTrimNative.nativeExportTimeline(
-            requireOpen(), dstUri, videoCodec, crf, preset, audioBitrateKbps, progress)
+            requireOpen(), dstUri, workDir, videoCodec, crf, preset, audioBitrateKbps, progress)
     }
 
     /**

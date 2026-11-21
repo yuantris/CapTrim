@@ -4,7 +4,7 @@ Android 和鸿蒙共用的视频剪辑核心 SDK。Rust 描述时间线，FFmpeg
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI、鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖剪映的基础剪辑能力：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 20/20，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 21/21，明细见[验证状态](#验证状态)。字幕与图片/贴纸图层是「没有解码器也得画出来」的两类：文字在 Rust 核心里光栅化、图片在 Rust 核心里解码并缩放旋转，产出的位图预览当纹理上传、导出写成 PAM 交给 `overlay`，两块在鸿蒙 Mate 60 与小米 2211133C（Android 16）上都验证过。转场（`Fade`）的画面与声音都在核心里：画面把后一段的透明度按窗口线性拉起来、前一段续画到窗口结束，声音在同一窗口做真正的交叉渐变（两个源同时出声、增益互补）。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。现在所处的阶段见第七节路线图：**M1「能出片」已完成**——`ExportPlan` 编译成 `filter_complex`，由 native 多输入执行器在双端真机上出片；M1 只剩「字幕/贴纸并进同一趟图」。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
+现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 20/20，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 21/21，明细见[验证状态](#验证状态)。字幕与图片/贴纸图层是「没有解码器也得画出来」的两类：文字在 Rust 核心里光栅化、图片在 Rust 核心里解码并缩放旋转，产出的位图预览当纹理上传、导出写成 PAM 交给 `overlay`，两块在鸿蒙 Mate 60 与小米 2211133C（Android 16）上都验证过。转场（`Fade`）的画面与声音都在核心里：画面把后一段的透明度按窗口线性拉起来、前一段续画到窗口结束，声音在同一窗口做真正的交叉渐变（两个源同时出声、增益互补）。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。现在所处的阶段见第七节路线图：**M1「能出片」已完成**——`ExportPlan` 编译成 `filter_complex`，由 native 多输入执行器在双端真机上出片；字幕与贴纸也并进同一趟图：still 位图由 core 栅格化后用 movie/loop/overlay 在各自时间窗入图。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
 
 ---
 
@@ -381,9 +381,9 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 - P1 调度内核：帧计划、音频主导时钟 + 漂移补偿、`step` 状态机、丢帧统计
 - P2 音频预览：`plan_audio_at` 按原始时间规划音频（不吸附帧栅格）、native 混音器统一 48kHz/立体声/f32、鸿蒙 `OH_AudioRenderer` 输出并把真实播放位置回灌主时钟、播放态 hold-and-present 压住超前解码帧
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
-- 鸿蒙真机自检 App：20 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘、滤镜 v1（effect 位 + filter_desc 翻译）、三段式管线的软件基线 / 同步硬段 / 回调式硬段与回退、硬编产物的 FFmpeg 软解复验、字幕与贴图烧录（字幕/贴图 PAM 的墨迹与半透明像素数 + 烧录/基线产物对比），以及多输入图的端到端导出（两段拼接 + 画中画 + 双音轨，worker 线程）；P2 音频输出与 hold-and-present 另有真机日志验证
+- 鸿蒙真机自检 App：20 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘、滤镜 v1（effect 位 + filter_desc 翻译）、三段式管线的软件基线 / 同步硬段 / 回调式硬段与回退、硬编产物的 FFmpeg 软解复验、字幕与贴图烧录（字幕/贴图 PAM 的墨迹与半透明像素数 + 烧录/基线产物对比），以及多输入图的端到端导出（两段拼接 + 画中画 + 字幕贴图 + 双音轨，worker 线程）；P2 音频输出与 hold-and-present 另有真机日志验证
 - Android native 自检：18 项，含 P2 音频解码/重采样/seek/音量/静音、真实 x265 HEVC 编码复探和 AMediaCodec 硬解硬编链路（`scripts/run-android-selftest.sh`）
-- Android Kotlin/JNI 层自检 App：21 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）；其中「字幕与贴图数据层」「字幕与贴图烧录」「转场期音频交叉渐变」三项是 2026-11-21 在小米 2211133C 上补的，「时间线导出（三段拼接 + 画中画 + 双音轨）」是 M1 的端到端用例
+- Android Kotlin/JNI 层自检 App：21 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）；其中「字幕与贴图数据层」「字幕与贴图烧录」「转场期音频交叉渐变」三项是 2026-11-21 在小米 2211133C 上补的，「时间线导出（三段拼接 + 画中画 + 字幕贴图 + 双音轨）」是 M1 的端到端用例
 - 鸿蒙硬解 + GL 多图层合成上屏：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放都在真机验证过
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包、本地 CI 全套
 
@@ -396,26 +396,26 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 3. **预览 = 导出**：几何（fit/scale/rotation/位置）、不透明度、音频增益都从同一份 `FramePlan` / `ExportPlan` 推导；谁要改公式，先改共同的那一份。
 4. **坑只进 `.workbuddy/memory`**：README 只写设计、能力与验收，构建/设备坑写日志，避免文档被环境噪声淹没。
 
-**M1「能出片」——把时间线变成成品 mp4（已贯通，剩字幕/贴纸同图）**
+**M1「能出片」——把时间线变成成品 mp4（已完成）**
 
-现状：`exportTimeline` 已贯通到两端应用层并都在真机上出了片——`ExportPlan` → `filter_complex` → native 多输入执行器 → mp4，Android 真机自检 21/21、鸿蒙真机自检 20/20 各含一条同构的端到端用例（三段拼接 + 画中画 + 双音轨）。
+现状：`exportTimeline` 一端调用就把整条时间线出成 mp4——`ExportPlan` → `filter_complex` → native 多输入执行器，字幕与贴纸也在同一趟图里（不再是「先出片再烧录」两条命令）。Android 真机自检 21/21、鸿蒙真机自检 20/20，各含一条同构的端到端用例（三段拼接 + 画中画 + 字幕贴图 + 双音轨）。
 
 进度（2026-11-21 晚）：
 
-- **图编译**（`export_graph::compile`）：多段 `concat`、图层按 z 序 `overlay`、`dissolve`、音频 `amix` + 转场交叉渐变、48 kHz 立体声，本机 FFmpeg 9.1 实跑复核（150 帧/5.000 s、120 帧/4.000 s，转场窗口两路同时出声）。
+- **图编译**（`export_graph::compile`）：多段 `concat`、图层按 z 序 `overlay`、`dissolve`、音频 `amix` + 转场交叉渐变、48 kHz 立体声；字幕/贴纸这类 still 层由 core 按和预览同一套代码栅格化成 PAM，用 `movie` + `loop` + `overlay enable='between(t,…)'` 进同一张图，时间窗按段裁剪。本机 FFmpeg 9.1 实跑复核三场景（纯图层、画中画、字幕+贴纸），像素计数逐帧确认「只字幕 / 两者都在 / 只贴纸」。
 - **native 执行器**（`native/captrim_export.c`）：把 `[k:v]`/`[k:a]` 重写成每处出现的独立 buffersrc（avfilter pad 不能扇出，同一输入多段复用必须每处一个源）、预热解码首帧描述源格式、按标签种类解码并 fan-out、按 `concat`/`trim` 的推进节奏 round-robin 喂包、AAC FIFO 成帧、`duration_us` 精确封顶；无音轨素材落音频轨时合成静音而不是报错。
-- **ABI**：`captrim_engine_export_timeline`（39 个导出函数）、JNI `nativeExportTimeline`（29 个方法）、NAPI `exportTimeline`（36 个函数）+ `index.d.ts` + ArkTS/Kotlin 包装。
-- **设备 FFmpeg**：`scripts/ffmpeg-config-common.sh` 增补了 M1 图需要的 15 个滤镜（`color/concat/setsar/fade/tpad/split/anullsrc/atrim/asetpts/atempo/volume/amix/aresample/aformat/apad`）。宿主用完整 `ffmpeg.exe` 验证看不出这个缺口，只有精简构建的设备会炸。
-- **后台导出**：鸿蒙把整趟导出放到 `taskpool` worker（`TimelineExportTask.ets` 的 `@Concurrent exportTimelineTask(draftJson, dstUri)`），主线程只建草稿、断言结果。这不是性能优化而是必需——主线程连续阻塞超过 6 s 会被 `THREAD_BLOCK_6S` 直接杀进程；Android 侧本来就在后台线程跑。
+- **ABI**：`captrim_engine_export_timeline(engine, dst, work_dir, codec, crf, preset, audioKbps, progress, ud)`（39 个导出函数）、JNI `nativeExportTimeline`（29 个方法）、NAPI `exportTimeline`（36 个函数）+ `index.d.ts` + ArkTS/Kotlin 包装。`work_dir` 是 still 位图的落盘目录，传空则拒绝 still 层而不是悄悄丢图层。
+- **设备 FFmpeg**：`scripts/ffmpeg-config-common.sh` 增补了 M1 图需要的滤镜（`color/concat/setsar/fade/tpad/split/anullsrc/atrim/asetpts/atempo/volume/amix/aresample/aformat/apad`，另加 still 需要的 `movie/loop`）。宿主用完整 `ffmpeg.exe` 验证看不出这个缺口，只有精简构建的设备会炸。
+- **后台导出**：鸿蒙把导出与烧录都放到 `taskpool` worker（`TimelineExportTask.ets` 的 `@Concurrent exportTimelineTask` / `burnTask`），主线程只建草稿、断言结果。这不是性能优化而是必需——主线程连续阻塞超过 6 s 会被 `THREAD_BLOCK_6S` 直接杀进程（两次实测都在结果打印前被杀）；Android 侧本来就在后台线程跑。
 
 - [x] `export_graph`（core）：`ExportPlan` → FFmpeg `filter_complex`。
 - [x] 几何翻译：`fit → scale → rotation` 与 GL 同一公式，导出与预览一致。
 - [x] 音频混流：按段 `atrim` + 多轨 `amix` + `volume`/`volume_end` ramp + 转场双源增益，统一 48 kHz 立体声。
 - [x] 导出设置：分辨率/帧率/码率/编码器（`libx264`/`libx265`/`hw:`）结构化传入，进度回调 + 取消。
-- [x] ABI 与双端：`exportTimeline(dst, codec, crf, preset, audioKbps, progress)` 在鸿蒙（NAPI/ArkTS）与 Android（JNI/Kotlin）都可用。
-- [ ] 字幕/贴纸图层并进同一趟图（`compile` 目前显式拒绝 still 层，仍走「先出片再烧录」两条命令）。
+- [x] ABI 与双端：`exportTimeline(dst, workDir, codec, crf, preset, audioKbps, progress)` 在鸿蒙（NAPI/ArkTS）与 Android（JNI/Kotlin）都可用。
+- [x] 字幕/贴纸并进同一趟图：still 层栅格化到 `work_dir`，与视频层同 z 序 `overlay`、同时间窗，不再需要第二次烧录命令。
 
-- 验收：Android 真机（小米 2211133C / Android 16 / arm64）21/21，用例导出「3 段拼接 + 画中画 + 双音轨」：540×960 h264 + aac 48 kHz 立体声、时长 6.000 s±34 ms、180 次进度到 1.0。鸿蒙 Mate 60 20/20，同一形态的用例（360×640 / 4.000 s）在 worker 线程跑完：120 次进度到 1.00，产物 224 KB，ffprobe 复核 h264 360×640 30 fps 120 帧 + aac 48 kHz 立体声，抽帧确认画中画按 `set_transform` 落在右上。
+- 验收：Android 真机（小米 2211133C / Android 16 / arm64）21/21，用例导出「3 段拼接 + 画中画 + 字幕贴图 + 双音轨」：540×960 h264 + aac 48 kHz 立体声、时长 6.000 s±34 ms、180 次进度到 1.0，抽帧可见字幕在 0.5–3.0 s、贴图在 1.0–4.0 s 各自淡出。鸿蒙 Mate 60 20/20，同形态用例（360×640 / 4.000 s）在 worker 线程跑完：120 次进度到 1.00，ffprobe 复核 h264 360×640 30 fps + aac 48 kHz 立体声，抽帧确认 1.5 s 有字幕、3.2 s 字幕消失而贴图与画中画仍在。
 
 **M2「双端对等」——Android 预览与音频输出**
 
@@ -469,12 +469,12 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 | ArkTS 静态检查 | ✅ 0 error | `devecocli check arkts`（`.ets` 与 `Index.ets` 均通过），剩 3 条「.so 未校验」告警（预期） |
 | 鸿蒙构建脚本端到端 | ✅ 通过 | Windows + Git Bash 实测产出、暂存、`hdc install` 一条命令 |
 | 鸿蒙 HAP 打包 | ✅ 真机装上了 | `scripts/build-ohos-hap.sh`：HAP 内含 `libcaptrim.so`(NAPI) + `libcaptrim_ffmpeg.so` + FFmpeg 全套(`libav*`/`libsw*`) + `libc++_shared.so`(NDK C++ 运行时，由 `build-ffmpeg-ohos.sh` 自动打入 `dist/ohos/...` 再随 `stage_libs` 进 HAP) |
-| 鸿蒙真机自检 | ✅ 20/20 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a；含滤镜 v1（effect 位 + filter_desc 翻译）、FFmpeg 软后端 probe + remux + 复杂剪辑、三段式管线的软件基线 / 同步硬段 / 回调式硬段、两个硬编 mp4 的 FFmpeg 软解复验，以及多输入图的端到端导出（两段拼接 + 画中画 + 双音轨，taskpool worker 线程），详见下节 |
+| 鸿蒙真机自检 | ✅ 20/20 通过 | Mate 60（ALN-AL00）/ OpenHarmony 7.0.0 / API 26 / arm64-v8a；含滤镜 v1（effect 位 + filter_desc 翻译）、FFmpeg 软后端 probe + remux + 复杂剪辑、三段式管线的软件基线 / 同步硬段 / 回调式硬段、两个硬编 mp4 的 FFmpeg 软解复验，以及多输入图的端到端导出（两段拼接 + 画中画 + 字幕贴图 + 双音轨，taskpool worker 线程），详见下节 |
 | P2 鸿蒙 HAP 真机验证 | ✅ 通过 | 最终 HAP 自检 18/18；暂停态音频位置 6.69 s → 10.69 s、音频帧 311296 → 487424；播放态播放头与音频主时钟差 7~25 ms，`held` 131 → 285，证明 `OH_AudioRenderer` 输出、时钟回灌与 hold-and-present 均生效 |
 | 鸿蒙硬解 + GL 合成 | ✅ 真机出画面 | 截图确认 XComponent 上确有视频帧；8 s 时间线实时播完（468 次合成，解码 458 帧仅 7 帧未上屏）；暂停落点误差 ≤1 帧；缩放/平移/旋转经 `set_transform` 全链路生效（截图对比） |
 | 画中画（双路解码） | ✅ 真机出画面 | 主轨 + overlay 轨同时解码：`slots=2`、两路各自 latch 并合成，截图可见主画面与右下角内嵌画面；8 s 时间线双路播放 `pos` 与壁钟同为 6012 ms（1.00× 实时）；只改主视频的 transform 时内嵌画面保持原位（截图对比），证明两个图层互不干扰 |
 | Android AAR 编译 | ✅ 构建通过 | `platforms/android` 没有 gradlew，本机用缓存的 Gradle 8.13 构建（`scripts/run-android-app-selftest.sh` 会自动找）；AGP 8.7.3 / Kotlin 2.0.21 / compileSdk 35 / NDK 27.0.12077973 |
-| Android 真机自检（Kotlin/JNI 层） | ✅ 21/21 通过 | 小米 2211133C / Android 16 / API 36；走 `CapTrim.kt` 公开 API，覆盖库加载、时间线、分割撤销重做、29.97fps 栅格、预览时钟、滤镜 v1（filter_desc 翻译）、字幕与贴图数据层、字幕+贴图 PAM 烧录、转场音频 ramp、时间线导出（3 段拼接 + 画中画 + 双音轨）、probe / remux / x264 / 真实 x265（复探 `codec=hevc`）/ 三段式管线软硬链路 / 硬编产物软解复验，详见下节 |
+| Android 真机自检（Kotlin/JNI 层） | ✅ 21/21 通过 | 小米 2211133C / Android 16 / API 36；走 `CapTrim.kt` 公开 API，覆盖库加载、时间线、分割撤销重做、29.97fps 栅格、预览时钟、滤镜 v1（filter_desc 翻译）、字幕与贴图数据层、字幕+贴图 PAM 烧录、转场音频 ramp、时间线导出（3 段拼接 + 画中画 + 字幕贴图 + 双音轨）、probe / remux / x264 / 真实 x265（复探 `codec=hevc`）/ 三段式管线软硬链路 / 硬编产物软解复验，详见下节 |
 | Android 真机自检（native） | ✅ 18/18 通过 | 小米 2211133C（fuxi）/ Android 16 / API 36 / arm64-v8a：`scripts/run-android-selftest.sh` 一条命令编译+推送+运行；probe / remux / 软件复杂剪辑 / libx265 真实 HEVC 软编（输出复探 `codec=hevc`）/ 三段式管线（`decoder=2 encoder=2`，即 `CT_BACKEND_ANDROID_HW`，`reason=none` 无回退）/ 硬编产物 FFmpeg 软解复验 / 硬件能力查询 / P2 音频解码重采样 seek 音量静音全通过，详见下节 |
 | FFmpeg 实际编译（Android） | ✅ 已编译验证 | `dist/android/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample + `libcaptrim_ffmpeg.so` + 真实交叉编译的 `libx265.so`（7.45 MB，119 个 `x265_*` 导出符号）；`libavcodec.so` 的 `DT_NEEDED` 含 `libx265.so`，`x265_api_get_198` 运行时由它解析；滤镜词汇所需的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；构建树中的 `libavfilter.so.10` 经 `llvm-nm -a` 验证五个 `ff_vf_*` 描述符均为已定义符号、无 UND，`filter_list.c` 同步引用）；shim 编入 `captrim_pipeline.c` 和 `captrim_android_hw.c`。构建脚本会校验 dist 里的 `libx265.so` 大于 1 MB，防止桩再混进来。回执见 `FFMPEG_BUILD.txt` |
 | FFmpeg 实际编译（HarmonyOS） | ✅ 已编译验证 | `dist/ohos/arm64-v8a`：libavcodec/format/util/filter/swscale/swresample/postproc + `libcaptrim_ffmpeg.so`，含 libx264 + libx265（GPLv2+）；`libavcodec.so` 实际编入 `ff_libx265_encoder`/`ff_libx264_encoder`（995 个 x265 相关符号）；滤镜词汇的 `eq`/`hue`/`lut`/`negate`/`boxblur` 已加入白名单并编入（`config.mak` 五个 `CONFIG_*_FILTER=yes`；`dist` 中的 `libavfilter.so.10.4.100` 经 `llvm-nm -a` 验证五个 `ff_vf_*` 描述符均为已定义符号、无 UND）；构建回执见 `FFMPEG_BUILD.txt` |
@@ -501,7 +501,7 @@ PASS 三段式管线（OHOS 回调式 Buffer 硬解/硬编） | 回调式 Buffer
 PASS 硬编产物可被 FFmpeg 软解（pipeline_hw.mp4） | FFmpeg 软解→重编码成功，进度 26 次
 PASS 硬编产物可被 FFmpeg 软解（pipeline_cb.mp4） | FFmpeg 软解→重编码成功，进度 26 次
 PASS 字幕与贴图烧录（core 栅格化 + FFmpeg overlay） | 540x960 burn 269KB vs base 252KB，PAM 2 张 (字幕 2196 白 / 3527 墨迹，贴图 8936 墨迹 / 720 半透明)，进度 16 次
-PASS 时间线导出（两段拼接 + 画中画 + 双音轨） | 360x640 h264 / aac 2ch 48000Hz，120 次进度 至 1.00（worker 线程）
+PASS 时间线导出（两段拼接 + 画中画 + 字幕贴图 + 双音轨） | 360x640 h264 / aac 2ch 48000Hz，120 次进度 至 1.00（worker 线程）
 == selfcheck 20/20 passed ==
 ```
 
@@ -547,7 +547,7 @@ Android 侧踩过三个坑：① NDK 不导出 `COLOR_FormatYUV420SemiPlanar` �
 
 ### Android 真机自检（Kotlin/JNI 层，21/21）
 
-native 自检验的是 C ABI，这一层验的是宿主 App 实际走的路：`CapTrim.kt` → JNI → Rust → FFmpeg。`platforms/android/app` 是个最小 Activity，把 21 项检查跑在后台线程，结果打到 logcat（tag `CapTrimSelfCheck`）、屏幕和 `files/selfcheck.txt`。检查项和鸿蒙 `SelfCheck.ets` 同构：时间线、分割撤销重做、29.97fps 栅格、预览时钟、滤镜 v1（filter_desc 翻译）、probe、remux、x264 复杂剪辑、真实 x265（复探 `codec=hevc`）、三段式管线软件基线与硬解硬编优先、硬编产物软解复验、时间线导出（3 段拼接 + 画中画 + 双音轨）；字幕与贴图三项（数据层、PAM 烧录、转场音频 ramp）见下方记录——Android 没有 GL 预览实现，这三项验的是数据层、位图 ABI 的消费路径和烧录产物本身。
+native 自检验的是 C ABI，这一层验的是宿主 App 实际走的路：`CapTrim.kt` → JNI → Rust → FFmpeg。`platforms/android/app` 是个最小 Activity，把 21 项检查跑在后台线程，结果打到 logcat（tag `CapTrimSelfCheck`）、屏幕和 `files/selfcheck.txt`。检查项和鸿蒙 `SelfCheck.ets` 同构：时间线、分割撤销重做、29.97fps 栅格、预览时钟、滤镜 v1（filter_desc 翻译）、probe、remux、x264 复杂剪辑、真实 x265（复探 `codec=hevc`）、三段式管线软件基线与硬解硬编优先、硬编产物软解复验、时间线导出（3 段拼接 + 画中画 + 字幕贴图 + 双音轨）；字幕与贴图三项（数据层、PAM 烧录、转场音频 ramp）见下方记录——Android 没有 GL 预览实现，这三项验的是数据层、位图 ABI 的消费路径和烧录产物本身。
 
 ```bash
 bash scripts/run-android-app-selftest.sh
@@ -578,7 +578,7 @@ PASS FFmpeg 复杂剪辑（libx265 HEVC） | x265 真实编码 0.04MB codec=hevc
 PASS 三段式管线（软件基线 / 回退链路） | decode→filter→encode 0.06MB codec=h264 进度 29 次
 PASS 三段式管线（硬解/硬编优先，失败自动回退） | decode→filter→encode 0.06MB codec=h264 进度 29 次
 PASS 硬编产物可被 FFmpeg 软解（pipeline_hw.mp4） | FFmpeg 软解→重编码成功，进度 26 次
-PASS 时间线导出（三段拼接 + 画中画 + 双音轨） | 540x960 h264 / aac 2ch 48000Hz，180 次进度 至 1.00
+PASS 时间线导出（三段拼接 + 画中画 + 字幕贴图 + 双音轨） | 540x960 h264 / aac 2ch 48000Hz，180 次进度 至 1.00
 == selfcheck 21/21 passed ==
 ```
 

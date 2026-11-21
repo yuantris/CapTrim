@@ -390,6 +390,161 @@ fn main() {
         &[("0.5", "before"), ("2.2", "mid"), ("3.0", "after")],
     );
 
+    // Scene 3: a caption and a sticker in the same picture graph. Both are
+    // stills the SDK rasterises itself, so this is the proof that a timeline
+    // with text and an image layer exports in one command instead of two
+    // passes. The backdrop is black and static so presence/absence is a pixel
+    // count, not a guess.
+    let black = work.join("graph-black.mp4");
+    run(
+        &ffmpeg,
+        &[
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=540x960:rate=30:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=48000",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-y",
+            black.to_str().unwrap(),
+        ],
+    );
+    let sticker = work.join("graph-sticker.png");
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([250, 205, 40, 255]))
+        .save_with_format(&sticker, image::ImageFormat::Png)
+        .expect("sticker png");
+
+    let mut scene3 = base_timeline(&black, &black);
+    let mut picture = Clip::new(1, 0, 2_000_000, 0);
+    picture.id = 3;
+    scene3.tracks.push(Track {
+        id: 2,
+        kind: TrackKind::MainVideo,
+        clips: vec![picture],
+    });
+    let mut caption = Clip::new(0, 0, 1_500_000, 500_000);
+    caption.id = 7;
+    caption.text = Some("CapTrim 字幕".to_string());
+    caption.transform = Transform {
+        dy: 0.36,
+        ..Transform::default()
+    };
+    scene3.tracks.push(Track {
+        id: 8,
+        kind: TrackKind::Subtitle,
+        clips: vec![caption],
+    });
+    let mut badge = Clip::new(0, 0, 2_000_000, 1_000_000);
+    badge.id = 9;
+    badge.transform = Transform {
+        scale: 0.15,
+        dx: 0.35,
+        dy: -0.35,
+        rotation_deg: 0.0,
+    };
+    badge.image = Some(captrim_core::model::ImageAsset::new(
+        sticker.to_string_lossy().into_owned(),
+        64,
+        64,
+    ));
+    scene3.tracks.push(Track {
+        id: 10,
+        kind: TrackKind::Image,
+        clips: vec![badge],
+    });
+    let plan = plan_export(&scene3);
+    let stills_dir = work.join("stills");
+    let graph = compile_export_graph(
+        &scene3,
+        &plan,
+        &GraphSettings {
+            filter_suffix: "fps=30,format=yuv420p".to_string(),
+            still_dir: Some(stills_dir),
+            ..GraphSettings::default()
+        },
+    )
+    .expect("compile scene3");
+    println!(
+        "\n=== scene3 ===\nfilter_complex:\n{}",
+        graph.filter_complex
+    );
+    assert_eq!(
+        graph.inputs.len(),
+        1,
+        "stills must ride in through movie, not extra inputs"
+    );
+    let dst3 = work.join("scene3.mp4");
+    let mut argv: Vec<String> = vec!["-v".into(), "error".into()];
+    argv.extend(graph.args(&dst3.to_string_lossy()));
+    let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    run(&ffmpeg, &argv_ref);
+
+    // 0.7 s: caption only (0.5–2.0). 1.2 s: caption + sticker. 2.4 s: sticker
+    // only (1.0–3.0) — the timeline outlives the main clip, so the caption
+    // really has to disappear while the badge stays.
+    for (t, caption_expected, sticker_expected) in [
+        ("0.7", true, false),
+        ("1.2", true, true),
+        ("2.4", false, true),
+    ] {
+        let out = work.join(format!("scene3-{t}.png"));
+        run(
+            &ffmpeg,
+            &[
+                "-v",
+                "error",
+                "-ss",
+                t,
+                "-i",
+                dst3.to_str().unwrap(),
+                "-frames:v",
+                "1",
+                "-y",
+                out.to_str().unwrap(),
+            ],
+        );
+        let pixels = image::open(&out).expect("grab").to_rgba8();
+        let (w, h) = pixels.dimensions();
+        let mut white = 0u32;
+        let mut yellow = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let p = pixels.get_pixel(x, y).0;
+                let (r, g, b) = (p[0], p[1], p[2]);
+                // Caption band: the bottom third the subtitle style centres on.
+                if y > h * 2 / 3 && r > 200 && g > 200 && b > 200 {
+                    white += 1;
+                }
+                // Top-right quadrant where the badge was placed.
+                if y < h / 2 && x > w / 2 && r > 180 && g > 140 && b < 120 {
+                    yellow += 1;
+                }
+            }
+        }
+        println!("scene3 t={t}: white={white} yellow={yellow}");
+        assert_eq!(
+            white > 200,
+            caption_expected,
+            "caption at {t}s (white pixels {white})"
+        );
+        assert_eq!(
+            yellow > 200,
+            sticker_expected,
+            "sticker at {t}s (yellow pixels {yellow})"
+        );
+    }
+
     println!("\nOK");
 
     // The dissolve window is 2.0 -> 2.5s. Two uncorrelated tones at

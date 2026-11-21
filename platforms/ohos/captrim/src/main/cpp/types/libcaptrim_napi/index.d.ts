@@ -66,12 +66,15 @@ export const exportBurnSubtitles: (
 /**
  * Export the whole timeline as one file: the core compiles every segment,
  * picture layer, transition and audio track into one filter_complex and the
- * shim runs it. videoCodec '' = libx264, crf <= 0 = 20, preset '' = default,
- * audioBitrateKbps <= 0 = 192.
+ * shim runs it. Caption and sticker layers are rasterised into workDir and
+ * drawn in the same graph; without a work dir they are refused. videoCodec
+ * '' = libx264, crf <= 0 = 20, preset '' = default, audioBitrateKbps <= 0 =
+ * 192.
  */
 export const exportTimeline: (
   handle: number,
   dstUri: string,
+  workDir: string,
   videoCodec: string,
   crf: number,
   preset: string,

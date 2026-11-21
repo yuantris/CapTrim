@@ -46,6 +46,15 @@ pub struct GraphSettings {
     /// Filter chain applied once to the joined picture, e.g. `fps=30` or
     /// `fps=30,format=yuv420p`. Empty means no re-timing.
     pub filter_suffix: String,
+    /// Directory the rasterised stills (captions, stickers) are written into
+    /// before the graph runs. A filter graph cannot draw text or decode a
+    /// sticker on its own, so the SDK rasterises them exactly as the preview
+    /// does and feeds the bitmaps in through `movie`. `None` refuses a still
+    /// layer rather than exporting a picture that silently lost it.
+    pub still_dir: Option<std::path::PathBuf>,
+    /// Caption font chosen by the host (`captrim_engine_set_text_font`).
+    /// `None` resolves the platform default, the same lookup the preview uses.
+    pub still_font: Option<crate::text::FontSpec>,
 }
 
 impl Default for GraphSettings {
@@ -56,6 +65,8 @@ impl Default for GraphSettings {
             preset: "veryfast".to_string(),
             audio_bitrate_kbps: 192,
             filter_suffix: String::new(),
+            still_dir: None,
+            still_font: None,
         }
     }
 }
@@ -135,6 +146,23 @@ pub fn compile(
 
     let mut inputs: Vec<String> = Vec::new();
     let mut chains: Vec<String> = Vec::new();
+    // Captions and stickers are stills with no media stream to trim: the SDK
+    // rasterises them with the same code the preview uploads as a texture, so
+    // they enter this graph the way the burn path feeds them — `movie` + a
+    // looped single frame + `overlay` in their time window. They are rasterised
+    // once per compile (a still can span several segments) and reused.
+    let has_stills = plan.segments.iter().any(|segment| {
+        segment
+            .video
+            .iter()
+            .any(|layer| matches!(layer.kind, LayerKind::Subtitle | LayerKind::Image))
+    });
+    let stills = match (&settings.still_dir, has_stills) {
+        (Some(dir), true) => {
+            crate::subtitles::plan_burn_with_font(timeline, dir, settings.still_font.as_ref())?
+        }
+        _ => Vec::new(),
+    };
     // Audio is compiled only when the timeline has any: an all-silent project
     // must not gain an empty AAC track.
     let has_audio = plan
@@ -171,17 +199,46 @@ pub fn compile(
         layers.sort_by_key(|layer| layer.z);
 
         for (depth, layer) in layers.iter().enumerate() {
-            // Subtitles and stickers are stills the SDK rasterises itself (and
-            // the burn path composites); they have no media stream to trim, so
-            // the picture graph must not pretend to draw them. Wiring them in
-            // is the remaining half of M1: burn the stills over this graph's
-            // output rather than mixing two very different sources here.
+            // Subtitles and stickers: no stream to trim, so they are overlaid
+            // from their rasterised PAM, in the same z position as any other
+            // layer. `enable` takes segment-local time — every segment chain
+            // starts at 0 after `setpts`/`trim`, and `concat` then stitches the
+            // segments back into timeline time.
             if matches!(layer.kind, LayerKind::Subtitle | LayerKind::Image) {
-                return Err(Error::InvalidArgument(format!(
-                    "segment {i} layer {depth} is a {:?} still; stills are burned after the \
-                     picture export",
-                    layer.kind
-                )));
+                let Some(still) = stills.iter().find(|still| still.clip_id == layer.clip_id) else {
+                    return Err(Error::InvalidArgument(format!(
+                        "segment {i} layer {depth} is a {:?} still but the export has no work \
+                         dir to rasterise it into; pass a writable directory (captions and \
+                         stickers are drawn from PAM bitmaps, not from a media stream)",
+                        layer.kind
+                    )));
+                };
+                // A still may outlive the segment it sits in: clamp its window
+                // to this segment and skip the segments it does not touch.
+                let window_start = still.start_us.max(segment.start_us) - segment.start_us;
+                let window_end = still.end_us.min(segment.end_us) - segment.start_us;
+                if window_end <= window_start {
+                    continue;
+                }
+                chains.push(format!(
+                    "movie={}[st{i}_{depth}];[st{i}_{depth}]loop=loop=-1:size=1:start=0[img{i}_{depth}]",
+                    // The filter graph parser eats a backslash, so a Windows
+                    // host must see forward slashes; device paths already use
+                    // them. `validate_burn_dir` has already rejected the
+                    // characters that cannot be carried at all.
+                    still.path.replace('\\', "/")
+                ));
+                let stacked = format!("a{i}_{depth}");
+                chains.push(format!(
+                    "[{base}][img{i}_{depth}]overlay=x={x}:y={y}:\
+                     enable='between(t,{a},{b})':eof_action=endall[{stacked}]",
+                    x = still.x,
+                    y = still.y,
+                    a = seconds(window_start),
+                    b = seconds(window_end),
+                ));
+                base = stacked;
+                continue;
             }
             let transform = &layer.transform;
             if !transform.scale.is_finite() || transform.scale <= 0.0 {
@@ -815,7 +872,14 @@ mod tests {
     }
 
     #[test]
-    fn a_still_layer_is_refused_until_the_burn_pass_is_wired() {
+    fn a_still_layer_needs_a_work_dir_and_is_drawn_when_it_has_one() {
+        let Some(font) = crate::text::default_font_specs()
+            .into_iter()
+            .find(|spec| crate::text::load_font(spec).is_ok())
+        else {
+            eprintln!("no system font available; skipping still-layer test");
+            return;
+        };
         let mut timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0)]);
         let mut text = Clip::new(0, 0, 1_000_000, 0);
         text.id = 7;
@@ -826,8 +890,40 @@ mod tests {
             clips: vec![text],
         });
         let plan = plan_export(&timeline);
+
+        // Without a directory there is nowhere to write the bitmap: refuse and
+        // name the segment instead of exporting a picture without the caption.
         let err = compile(&timeline, &plan, &GraphSettings::default()).unwrap_err();
-        assert!(err.to_string().contains("burned"), "{err}");
+        assert!(err.to_string().contains("work dir"), "{err}");
+
+        let dir = std::path::PathBuf::from("target/export-graph-tests/stills");
+        let _ = std::fs::remove_dir_all(&dir);
+        let graph = compile(
+            &timeline,
+            &plan,
+            &GraphSettings {
+                still_dir: Some(dir),
+                still_font: Some(font),
+                ..GraphSettings::default()
+            },
+        )
+        .unwrap();
+        let filter = &graph.filter_complex;
+        // The caption sits on the canvas from 0, so its window is the whole
+        // segment and the overlay must be enabled there.
+        assert!(filter.contains("movie="), "{filter}");
+        assert!(filter.contains("loop=loop=-1:size=1:start=0"), "{filter}");
+        assert!(
+            filter.contains("enable='between(t,0.000000,") && filter.contains("eof_action=endall"),
+            "{filter}"
+        );
+        assert_eq!(graph.inputs.len(), 1, "the still must not add an input");
+
+        // A caption is drawn above the video layer it stacks over: the overlay
+        // consumes the label the previous layer produced.
+        let video_overlay = filter.find("overlay=x='(main_w-overlay_w)/2").unwrap();
+        let still_overlay = filter.rfind("eof_action=endall").unwrap();
+        assert!(video_overlay < still_overlay, "{filter}");
     }
 
     #[test]

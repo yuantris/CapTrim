@@ -10,7 +10,7 @@
 import { CapTrim, CapTrimPreview, FramePlan, Step } from 'captrim';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { taskpool } from '@kit.ArkTS';
-import { TimelineExportResult, exportTimelineTask } from './TimelineExportTask';
+import { TimelineExportResult, exportTimelineTask, BurnResult, burnTask } from './TimelineExportTask';
 
 export interface CheckResult {
   name: string;
@@ -604,121 +604,140 @@ export class SelfCheck {
       ['pipeline_hw.mp4', 'pipeline_cb.mp4'].forEach((name: string): void => {
         SelfCheck.verifyDecodable(results, filesDir, name);
       });
-    } else if (which === 4) {
-      SelfCheck.check(results, '字幕与贴图烧录（core 栅格化 + FFmpeg overlay）', (): string => {
-        const engine = CapTrim.create();
-        const src = `file://${filesDir}/a.mp4`;
-        const dst = `${filesDir}/burn.mp4`;
-        const base = `${filesDir}/burn-base.mp4`;
-        const workDir = `${filesDir}/burn`;
-        try {
-          for (const path of [dst, base]) {
-            try {
-              fs.unlinkSync(path);
-            } catch (e) {
-              // 首次运行产物不存在，忽略
-            }
-          }
-          // The PAM count below must describe this run only, so the previous
-          // run's renders (different clip ids) cannot inflate it.
-          try {
-            fs.rmdirSync(workDir);
-          } catch (e) {
-            // 目录不存在或非空？plan_burn 会重建；旧文件在下面按名字过滤。
-          }
-          // 540x960 keeps the overlay at 1:1 with the canvas (subtitle geometry
-          // is canvas-relative) and the encode short enough for the UI thread.
-          const canvas: SetCanvasCmd = {
-            type: 'set_canvas', width: 540, height: 960,
-            frame_rate: { num: 30, den: 1 }
-          };
-          engine.apply(JSON.stringify(canvas));
-          const track: AddTrackCmd = { type: 'add_track', kind: 'subtitle' };
-          const trackId = engine.apply(JSON.stringify(track));
-          // 0.4s..1.6s only: frames outside the window must stay clean, which is
-          // what the enable=between(t,...) expression is for.
-          const subtitle: InsertTextClipCmd = {
-            type: 'insert_text_clip', track_id: trackId,
-            text: '字幕烧录 · Overlay', start_us: 400_000, duration_us: 1_200_000
-          };
-          engine.apply(JSON.stringify(subtitle));
-
-          // The sticker is the second half of this check: its pixels come from
-          // a PNG decoded in Rust (no libz on this device, so FFmpeg could not
-          // decode it), then fitted, scaled and rotated by the same core code
-          // the GL preview uploads. 0.25 scale in the top-right corner keeps it
-          // clear of the caption so both layers stay readable.
-          const imageTrack: AddTrackCmd = { type: 'add_track', kind: 'image' };
-          const imageTrackId = engine.apply(JSON.stringify(imageTrack));
-          const stickerCmd: InsertImageClipCmd = {
-            type: 'insert_image_clip', track_id: imageTrackId,
-            uri: `file://${filesDir}/sticker.png`,
-            start_us: 400_000, duration_us: 1_200_000
-          };
-          const stickerId = engine.apply(JSON.stringify(stickerCmd));
-          expect(stickerId > 0, '贴图没有插入，sticker.png 可能不存在');
-          engine.apply(JSON.stringify({
-            type: 'set_transform', clip_id: stickerId,
-            transform: { scale: 0.25, dx: 0.3, dy: -0.35, rotation_deg: 0 }
-          } as SetTransformCmd));
-          const prefix = 'trim=duration=2,setpts=PTS-STARTPTS,' +
-            'scale=540:960:force_original_aspect_ratio=decrease,' +
-            'pad=540:960:(ow-iw)/2:(oh-ih)/2';
-          const ticks: number[] = [];
-          engine.exportBurnSubtitles(src, dst, prefix, 'fps=15', workDir, 'libx264',
-            (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; });
-          const burned = fs.statSync(dst).size;
-          expect(burned > 0, '烧录产物为空');
-
-          // Same picture pipeline, no subtitles: if overlay did anything at all
-          // the encoded result cannot be byte-identical.
-          engine.exportTranscode(src, base, `${prefix},fps=15`, 'libx264',
-            (v: number): boolean => { return true; });
-          const plain = fs.statSync(base).size;
-          expect(plain > 0, '基线产物为空');
-          expect(burned !== plain,
-            `烧录前后文件大小相同 (${burned} bytes)，overlay 可能没有生效`);
-
-          const info = JSON.parse(engine.probe(`file://${dst}`)) as MediaInfoJson;
-          const video = info.streams.find((s: StreamJson) => s.kind === 'video');
-          expect(video !== undefined, '烧录产物没有视频流');
-          const outVideo: StreamJson = video!;
-          expect(outVideo.width === 540 && outVideo.height === 960,
-            `分辨率应为 540x960，实际 ${outVideo.width}x${outVideo.height}`);
-
-          const entries = fs.listFileSync(workDir);
-          const pams = entries.filter((name: string): boolean => name.endsWith('.pam'));
-          const captions = pams.filter((name: string): boolean => name.startsWith('sub_'));
-          const stills = pams.filter((name: string): boolean => name.startsWith('img_'));
-          expect(captions.length === 1, `应渲染 1 张字幕 PAM，实际 ${captions.length}`);
-          expect(stills.length === 1, `应渲染 1 张贴图 PAM，实际 ${stills.length}`);
-          // The overlay consumes exactly these files, so prove they carry real
-          // pixels on device rather than an empty canvas — this is the half
-          // FFmpeg cannot tell us about.
-          const ink = SelfCheck.pamInk(`${workDir}/${captions[0]}`);
-          expect(ink.total > 500, `字幕 PAM 里只有 ${ink.total} 个墨迹像素`);
-          expect(ink.bright > 300, `字幕 PAM 里只有 ${ink.bright} 个白色像素`);
-
-          // The sticker is 256x256 fitted into 540x960 (scale 2.1) and then
-          // drawn at 0.25, i.e. 135x135; the ring covers ~47% of that square.
-          const stickerInk = SelfCheck.pamInk(`${workDir}/${stills[0]}`);
-          expect(stickerInk.total > 3000, `贴图 PAM 里只有 ${stickerInk.total} 个墨迹像素`);
-          // A ring on a transparent background: partial alpha at its edge is
-          // what proves the PNG's alpha channel survived the decode and the
-          // resample. Flattened alpha would leave a solid square instead.
-          expect(stickerInk.partial > 200,
-            `贴图 PAM 只有 ${stickerInk.partial} 个半透明边缘像素，alpha 可能被压平`);
-
-          return `540x960 burn ${(burned / 1_000).toFixed(0)}KB vs base ` +
-            `${(plain / 1_000).toFixed(0)}KB，PAM ${pams.length} 张 ` +
-            `(字幕 ${ink.bright} 白 / ${ink.total} 墨迹，贴图 ${stickerInk.total} 墨迹 / ` +
-            `${stickerInk.partial} 半透明)，进度 ${ticks.length} 次`;
-        } finally {
-          engine.close();
-        }
-      });
     }
     return results;
+  }
+
+  /**
+   * Caption + sticker burn, off the UI thread.
+   *
+   * The two transcodes (burned and baseline) are the longest jobs in this
+   * self check — 16 s together — and a blocked UI thread past 6 s is enough for
+   * the system to kill the app. The draft is built here, the pixels are
+   * rasterised and encoded on a worker, and only the cheap assertions (file
+   * sizes, PAM ink counts, probe metrics) run here.
+   */
+  static async runBurnAsync(filesDir: string): Promise<CheckResult> {
+    const name: string = '字幕与贴图烧录（core 栅格化 + FFmpeg overlay）';
+    const src = `file://${filesDir}/a.mp4`;
+    const dst = `${filesDir}/burn.mp4`;
+    const base = `${filesDir}/burn-base.mp4`;
+    const workDir = `${filesDir}/burn`;
+    try {
+      for (const path of [dst, base]) {
+        try {
+          fs.unlinkSync(path);
+        } catch (e) {
+          // 首次运行产物不存在，忽略
+        }
+      }
+      // The PAM count below must describe this run only, so the previous
+      // run's renders (different clip ids) cannot inflate it.
+      try {
+        fs.rmdirSync(workDir);
+      } catch (e) {
+        // 目录不存在或非空？plan_burn 会重建；旧文件在下面按名字过滤。
+      }
+      // 540x960 keeps the overlay at 1:1 with the canvas (subtitle geometry is
+      // canvas-relative); running on a worker means the size no longer has to
+      // fit a UI-thread budget.
+      const engine = CapTrim.create();
+      let draft: string = '';
+      try {
+        const canvas: SetCanvasCmd = {
+          type: 'set_canvas', width: 540, height: 960,
+          frame_rate: { num: 30, den: 1 }
+        };
+        engine.apply(JSON.stringify(canvas));
+        const track: AddTrackCmd = { type: 'add_track', kind: 'subtitle' };
+        const trackId = engine.apply(JSON.stringify(track));
+        // 0.4s..1.6s only: frames outside the window must stay clean, which is
+        // what the enable=between(t,...) expression is for.
+        const subtitle: InsertTextClipCmd = {
+          type: 'insert_text_clip', track_id: trackId,
+          text: '字幕烧录 · Overlay', start_us: 400_000, duration_us: 1_200_000
+        };
+        engine.apply(JSON.stringify(subtitle));
+
+        // The sticker is the second half of this check: its pixels come from
+        // a PNG decoded in Rust (no libz on this device, so FFmpeg could not
+        // decode it), then fitted, scaled and rotated by the same core code
+        // the GL preview uploads.
+        const imageTrack: AddTrackCmd = { type: 'add_track', kind: 'image' };
+        const imageTrackId = engine.apply(JSON.stringify(imageTrack));
+        const stickerCmd: InsertImageClipCmd = {
+          type: 'insert_image_clip', track_id: imageTrackId,
+          uri: `file://${filesDir}/sticker.png`,
+          start_us: 400_000, duration_us: 1_200_000
+        };
+        const stickerId = engine.apply(JSON.stringify(stickerCmd));
+        expect(stickerId > 0, '贴图没有插入，sticker.png 可能不存在');
+        engine.apply(JSON.stringify({
+          type: 'set_transform', clip_id: stickerId,
+          transform: { scale: 0.25, dx: 0.3, dy: -0.35, rotation_deg: 0 }
+        } as SetTransformCmd));
+        draft = engine.draft();
+      } finally {
+        engine.close();
+      }
+
+      const prefix = 'trim=duration=2,setpts=PTS-STARTPTS,' +
+        'scale=540:960:force_original_aspect_ratio=decrease,' +
+        'pad=540:960:(ow-iw)/2:(oh-ih)/2';
+      const raw: string = (await taskpool.execute(
+        burnTask, draft, src, dst, base, prefix, workDir)) as string;
+      const burned = fs.statSync(dst).size;
+      expect(burned > 0, '烧录产物为空');
+      // Same picture pipeline, no captions or stickers: if overlay did anything
+      // at all the encoded result cannot be byte-identical.
+      const plain = fs.statSync(base).size;
+      expect(plain > 0, '基线产物为空');
+      expect(burned !== plain,
+        `烧录前后文件大小相同 (${burned} bytes)，overlay 可能没有生效`);
+
+      const info = JSON.parse(raw) as BurnResult;
+      const probed = JSON.parse(info.probe) as MediaInfoJson;
+      const video = probed.streams.find((s: StreamJson) => s.kind === 'video');
+      expect(video !== undefined, '烧录产物没有视频流');
+      const outVideo: StreamJson = video!;
+      expect(outVideo.width === 540 && outVideo.height === 960,
+        `分辨率应为 540x960，实际 ${outVideo.width}x${outVideo.height}`);
+
+      const entries = fs.listFileSync(workDir);
+      const pams = entries.filter((name: string): boolean => name.endsWith('.pam'));
+      const captions = pams.filter((name: string): boolean => name.startsWith('sub_'));
+      const stills = pams.filter((name: string): boolean => name.startsWith('img_'));
+      expect(captions.length === 1, `应渲染 1 张字幕 PAM，实际 ${captions.length}`);
+      expect(stills.length === 1, `应渲染 1 张贴图 PAM，实际 ${stills.length}`);
+      // The overlay consumes exactly these files, so prove they carry real
+      // pixels on device rather than an empty canvas — the half FFmpeg cannot
+      // tell us about.
+      const ink = SelfCheck.pamInk(`${workDir}/${captions[0]}`);
+      expect(ink.total > 500, `字幕 PAM 里只有 ${ink.total} 个墨迹像素`);
+      expect(ink.bright > 300, `字幕 PAM 里只有 ${ink.bright} 个白色像素`);
+
+      // The sticker is 256x256 fitted into 540x960 (scale 2.1) and then drawn
+      // at 0.25, i.e. 135x135; the ring covers ~47% of that square.
+      const stickerInk = SelfCheck.pamInk(`${workDir}/${stills[0]}`);
+      expect(stickerInk.total > 3000, `贴图 PAM 里只有 ${stickerInk.total} 个墨迹像素`);
+      // A ring on a transparent background: partial alpha at its edge is what
+      // proves the PNG's alpha channel survived the decode and the resample.
+      // Flattened alpha would leave a solid square instead.
+      expect(stickerInk.partial > 200,
+        `贴图 PAM 只有 ${stickerInk.partial} 个半透明边缘像素，alpha 可能被压平`);
+
+      return {
+        name: name,
+        pass: true,
+        detail: `540x960 burn ${(burned / 1_000).toFixed(0)}KB vs base ` +
+          `${(plain / 1_000).toFixed(0)}KB，PAM ${pams.length} 张 ` +
+          `(字幕 ${ink.bright} 白 / ${ink.total} 墨迹，贴图 ${stickerInk.total} 墨迹 / ` +
+          `${stickerInk.partial} 半透明)，进度 ${info.ticks} 次（worker 线程）`
+      };
+    } catch (e) {
+      const detail: string = e instanceof Error ? (e as Error).message : `${e}`;
+      return { name: name, pass: false, detail: detail };
+    }
   }
 
   /**
@@ -731,7 +750,7 @@ export class SelfCheck {
    * burn check, before any result line could be printed.
    */
   static async runTimelineExportAsync(filesDir: string): Promise<CheckResult> {
-    const name: string = '时间线导出（两段拼接 + 画中画 + 双音轨）';
+    const name: string = '时间线导出（两段拼接 + 画中画 + 字幕贴图 + 双音轨）';
     const srcA = `file://${filesDir}/a.mp4`;
     const srcB = `file://${filesDir}/b.mp4`;
     const dst = `${filesDir}/timeline.mp4`;
@@ -787,6 +806,29 @@ export class SelfCheck {
           `{"type":"set_transform","clip_id":${pipId},` +
           `"transform":{"scale":0.25,"dx":0.3,"dy":-0.35,"rotation_deg":0}}`
         );
+        // Captions and stickers are stills the core rasterises into filesDir
+        // and overlays in the same graph: this also puts `pam`, `movie` and
+        // `loop` on the device-side proof list.
+        const subtitle: AddTrackCmd = { type: 'add_track', kind: 'subtitle' };
+        const subtitleId = engine.apply(JSON.stringify(subtitle));
+        const caption: InsertTextClipCmd = {
+          type: 'insert_text_clip', track_id: subtitleId,
+          text: '字幕随片导出', start_us: 500_000, duration_us: 2_500_000
+        };
+        engine.apply(JSON.stringify(caption));
+        const image: AddTrackCmd = { type: 'add_track', kind: 'image' };
+        const imageId = engine.apply(JSON.stringify(image));
+        expect(fs.statSync(`${filesDir}/sticker.png`).size > 0,
+          'sticker.png 不在沙箱里，贴图用例无法运行');
+        const badge: InsertImageClipCmd = {
+          type: 'insert_image_clip', track_id: imageId,
+          uri: `file://${filesDir}/sticker.png`, start_us: 1_000_000, duration_us: 3_000_000
+        };
+        const badgeId = engine.apply(JSON.stringify(badge));
+        engine.apply(
+          `{"type":"set_transform","clip_id":${badgeId},` +
+          `"transform":{"scale":0.15,"dx":0.35,"dy":-0.35,"rotation_deg":0}}`
+        );
         expect(engine.duration() === 4_000_000, `时间线应为 4.000s，实际 ${engine.duration()}us`);
         draft = engine.draft();
       } finally {
@@ -794,7 +836,7 @@ export class SelfCheck {
       }
 
       const raw: string =
-        (await taskpool.execute(exportTimelineTask, draft, dst)) as string;
+        (await taskpool.execute(exportTimelineTask, draft, dst, filesDir)) as string;
       const exported = JSON.parse(raw) as TimelineExportResult;
       const stat = fs.statSync(dst);
       expect(stat.size > 0, `导出产物为空 (${stat.size} bytes)`);

@@ -712,8 +712,8 @@ private class Runner(private val filesDir: String) {
         // The end-to-end M1 check: one call turns a real multi-clip timeline
         // into one file. Everything the compiler emits has to work on the
         // DEVICE FFmpeg build (concat / color / amix / atrim / atempo / fade /
-        // tpad ...), which a host ffmpeg.exe cannot prove.
-        check("时间线导出（三段拼接 + 画中画 + 双音轨）") {
+        // tpad / movie / loop / pam ...), which a host ffmpeg.exe cannot prove.
+        check("时间线导出（三段拼接 + 画中画 + 字幕贴图 + 双音轨）") {
             CapTrim.create().use { engine ->
                 val dst = "$filesDir/timeline.mp4"
                 delete("timeline.mp4")
@@ -753,10 +753,33 @@ private class Runner(private val filesDir: String) {
                     """{"type":"set_transform","clip_id":$pip,""" +
                         """"transform":{"scale":0.25,"dx":0.3,"dy":-0.35,"rotation_deg":0}}""",
                 )
+                // Stills ride in through the same graph: the core rasterises
+                // the caption and the sticker into filesDir and overlays them
+                // in their windows, so this check also covers pam/movie/loop
+                // on the device build.
+                val subtitleTrack = engine.apply("""{"type":"add_track","kind":"subtitle"}""")!!
+                engine.apply(
+                    JSONObject().put("type", "insert_text_clip").put("track_id", subtitleTrack)
+                        .put("text", "字幕随片导出")
+                        .put("start_us", 500_000).put("duration_us", 3_000_000).toString(),
+                )
+                val imageTrack = engine.apply("""{"type":"add_track","kind":"image"}""")!!
+                val sticker = writeSticker()
+                val badge = engine.apply(
+                    JSONObject().put("type", "insert_image_clip").put("track_id", imageTrack)
+                        .put("uri", "file://${sticker.absolutePath}")
+                        .put("start_us", 1_000_000).put("duration_us", 3_000_000).toString(),
+                )!!
+                engine.apply(
+                    """{"type":"set_transform","clip_id":$badge,""" +
+                        """"transform":{"scale":0.15,"dx":0.35,"dy":-0.35,"rotation_deg":0}}""",
+                )
                 expect(engine.duration() == 6_000_000L,
                     "时间线应为 6.000s，实际 ${engine.duration()}us")
                 val ticks = mutableListOf<Float>()
-                engine.exportTimeline(dst, "libx264", 22, "veryfast", 160,
+                // Stills need a writable directory; the app's files dir has no
+                // character the filter graph cannot carry.
+                engine.exportTimeline(dst, filesDir, "libx264", 22, "veryfast", 160,
                     ProgressCallback { v -> ticks.add(v); true })
                 val stat = File(dst)
                 expect(stat.length() > 0, "导出产物为空 (${stat.length()} bytes)")
