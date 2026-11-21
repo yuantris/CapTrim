@@ -66,9 +66,10 @@ pub extern "C" fn captrim_engine_export_burn_subtitles(
             return Err(Error::invalid("work_dir must not be null"));
         }
         let work_dir = unsafe { crate::cstr(work_dir)? };
-        if work_dir.is_empty() {
-            return Err(Error::invalid("work_dir must not be empty"));
-        }
+        // Checked before anything else that can fail for an unrelated reason:
+        // on a host without a system font the font lookup would answer first and
+        // turn "your directory is unusable" into "no font found".
+        captrim_core::subtitles::validate_burn_dir(work_dir)?;
 
         // Clone the timeline so the (possibly long) rasterise + transcode never
         // holds the editor lock: the UI must stay able to edit while exporting.

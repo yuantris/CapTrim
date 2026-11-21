@@ -65,7 +65,7 @@ pub fn plan_burn(timeline: &Timeline, dir: &Path, font: &FontSpec) -> Result<Vec
     let dir_text = dir
         .to_str()
         .ok_or_else(|| Error::invalid("subtitle work dir is not valid UTF-8"))?;
-    validate_filter_path(dir_text)?;
+    validate_burn_dir(dir_text)?;
     std::fs::create_dir_all(dir)?;
     let style = TextStyle::subtitle(timeline.width, timeline.height);
     let canvas_w = timeline.width as f32;
@@ -166,7 +166,7 @@ pub fn plan_burn(timeline: &Timeline, dir: &Path, font: &FontSpec) -> Result<Vec
 /// the last overlay (e.g. `fps=15,scale=320:180`). Both may be empty.
 pub fn burn_filter(layers: &[BurnLayer], prefix: &str, suffix: &str) -> Result<String> {
     for layer in layers {
-        validate_filter_path(&layer.path)?;
+        validate_burn_dir(&layer.path)?;
     }
     if layers.is_empty() {
         return Ok(format!(
@@ -223,7 +223,14 @@ fn chain_or_null(parts: &[&str], fallback: &str) -> String {
 /// that the graph parser treats as syntax is rejected instead of half-escaped.
 /// This is why a burn export is a device-side operation: a Windows path always
 /// carries a drive colon.
-fn validate_filter_path(path: &str) -> Result<()> {
+///
+/// Public because the ABI checks a caller's `work_dir` *before* it looks for a
+/// system font: an unusable argument must be reported as an unusable argument,
+/// not as "no font found" on a machine that happens to have none.
+pub fn validate_burn_dir(path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        return Err(Error::invalid("burn work dir must not be empty"));
+    }
     const FORBIDDEN: [char; 7] = [':', '\'', ',', ';', '[', ']', '%'];
     if let Some(bad) = path.chars().find(|c| FORBIDDEN.contains(c)) {
         return Err(Error::invalid(format!(
