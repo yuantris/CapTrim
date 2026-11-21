@@ -8,23 +8,25 @@
 //!
 //! Scope of the first slice, deliberately narrow and honest:
 //!
-//! * one picture layer per segment (no `overlay` stacking of clips yet),
-//! * identity or single-layer `Transform` (fit, scale, rotate, offset all
-//!   translated; multi-layer z-order comes next),
-//! * constant opacity (a dissolve segment is refused, not silently flattened),
+//! * any number of picture layers per segment, stacked bottom-to-top by `z`,
+//! * identity or arbitrary `Transform` (fit, scale, rotate, offset),
+//! * constant opacity, and the 0→1 / 1→0 alpha ramps a dissolve produces,
 //! * audio is not compiled yet (the audio mixer is the next step).
 //!
 //! Every unsupported shape returns an error naming the segment instead of
 //! producing a graph that would quietly export the wrong picture.
 //!
-//! Video: each segment becomes `<input>trim,setpts,<effects>,scale,pad[sN]`,
-//! and the segments are joined with `concat`. `setpts` carries the clip's
-//! speed as an exact fraction, so a 2x clip consumes twice the source material
-//! over the same output frames instead of drifting.
+//! Video: each segment starts from a black canvas cut to its frame count and
+//! overlays its layers in `z` order. Every layer is
+//! `trim,setpts,<effects>,scale,format=rgba,<rotate>,<opacity>` and lands at
+//! the canvas centre plus its `(dx, dy)`. `setpts` carries the clip's speed as
+//! an exact fraction, so a 2x clip consumes twice the source material over the
+//! same output frames instead of drifting. Segments are joined with `concat`.
 
 use crate::effects::effects_to_filter_desc;
-use crate::export::ExportPlan;
-use crate::model::{Timeline, Transform};
+use crate::export::{ExportPlan, ExportVideoItem};
+use crate::model::Timeline;
+use crate::render::LayerKind;
 use crate::time::Rational;
 use crate::Error;
 
@@ -99,119 +101,150 @@ pub fn compile(
     let mut chains: Vec<String> = Vec::new();
 
     for segment in &plan.segments {
-        // A dissolve carries an opacity ramp; flattening it would drop the
-        // transition, so refuse it before anything else is considered.
-        let any_ramp = segment.video.iter().any(|layer| {
-            (layer.opacity_start - 1.0).abs() > f32::EPSILON
-                || (layer.opacity_end - 1.0).abs() > f32::EPSILON
-        });
-        if any_ramp {
+        if segment.video.is_empty() {
             return Err(Error::InvalidArgument(format!(
-                "segment {} holds part of a dissolve ({} picture layers, opacity ramp); \
-                 dissolves are not compiled yet",
-                segment.index,
-                segment.video.len()
+                "segment {} has no picture layers",
+                segment.index
             )));
-        }
-        if segment.video.len() != 1 {
-            return Err(Error::InvalidArgument(format!(
-                "segment {} has {} picture layers; overlay stacking is not compiled yet",
-                segment.index,
-                segment.video.len()
-            )));
-        }
-        let layer = &segment.video[0];
-        let transform = &layer.transform;
-        if !transform.scale.is_finite() || transform.scale <= 0.0 {
-            return Err(Error::InvalidArgument(format!(
-                "segment {} has scale {}; it must be a positive number",
-                segment.index, transform.scale
-            )));
-        }
-        if !transform.rotation_deg.is_finite() {
-            return Err(Error::InvalidArgument(format!(
-                "segment {} has rotation {}",
-                segment.index, transform.rotation_deg
-            )));
-        }
-
-        let input = inputs
-            .iter()
-            .position(|uri| uri == &layer.uri)
-            .unwrap_or_else(|| {
-                inputs.push(layer.uri.clone());
-                inputs.len() - 1
-            });
-
-        let mut chain = format!(
-            "[{input}:v]trim=start={}:end={},{}",
-            seconds(layer.source_start_us),
-            seconds(layer.source_end_us),
-            speed_setpts(&layer.speed),
-        );
-        let effects = effects_to_filter_desc(&layer.effects)?;
-        if !effects.is_empty() {
-            chain.push(',');
-            chain.push_str(&effects);
-        }
-        if *transform == Transform::default() {
-            // Same geometry as the preview: fit inside the canvas, letterbox
-            // the rest. The identity transform is the common case, and this
-            // chain needs no overlay, so keep it exact and cheap.
-            chain.push_str(&format!(
-                ",scale={w}:{h}:force_original_aspect_ratio=decrease,\
-                 pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[seg{i}]",
-                w = timeline.width,
-                h = timeline.height,
-                i = segment.index
-            ));
-            chains.push(chain);
-            continue;
-        }
-
-        // Geometry contract (model::Transform docs, and the GL compositor):
-        // fit -> scale -> rotate -> translate, translation in canvas units.
-        //
-        // `scale=W*scale:H*scale:decrease` reproduces fit*scale without knowing
-        // the source size, because the filter fits the input into that box.
-        // Rotation then grows the box to the rotated extent (the preview draws
-        // the rotated quad, corners and all), and `overlay` places that box's
-        // centre at the canvas centre plus (dx, dy), cropping whatever leaves
-        // the canvas exactly as the viewport does.
-        let scale = transform.scale as f64;
-        let box_w = ceil_px(timeline.width as f64 * scale);
-        let box_h = ceil_px(timeline.height as f64 * scale);
-        chain.push_str(&format!(
-            ",scale={box_w}:{box_h}:force_original_aspect_ratio=decrease,setsar=1,format=rgba"
-        ));
-        let radians = transform.rotation_deg as f64 * std::f64::consts::PI / 180.0;
-        if transform.rotation_deg != 0.0 {
-            chain.push_str(&format!(
-                ",rotate={radians}:ow='abs(iw*cos({r}))+abs(ih*sin({r}))':\
-                 oh='abs(iw*sin({r}))+abs(ih*cos({r}))':c=none",
-                r = radians
-            ));
         }
         let i = segment.index;
         let frames = (segment.end_frame - segment.start_frame).max(1);
-        chain.push_str(&format!("[lay{i}]"));
-        chains.push(chain);
-        // The backdrop is cut to the segment's exact frame count: an endless
-        // `color` plus `shortest=1` ends one frame early, which shaves a frame
-        // off the joined picture and desyncs audio later on.
+        let duration_s = frames as f64 / fps_value(&timeline.frame_rate);
+
+        // Every segment starts from a black canvas cut to its exact frame
+        // count, then stacks its layers bottom-to-top. An endless `color` plus
+        // `shortest=1` would end one frame early and desync the whole export,
+        // so the backdrop is trimmed instead.
         chains.push(format!(
             "color=black:s={w}x{h}:r={rate},trim=end_frame={frames}[bg{i}]",
             w = timeline.width,
             h = timeline.height,
             rate = rate_string(&timeline.frame_rate),
         ));
-        chains.push(format!(
-            "[bg{i}][lay{i}]overlay=x='(main_w-overlay_w)/2+({dx})*main_w':\
-             y='(main_h-overlay_h)/2+({dy})*main_h':format=auto[ov{i}]",
-            dx = transform.dx,
-            dy = transform.dy,
-        ));
-        chains.push(format!("[ov{i}]format=yuv420p[seg{i}]"));
+        let mut base = format!("bg{i}");
+
+        let mut layers: Vec<&ExportVideoItem> = segment.video.iter().collect();
+        // `z` is the compositor's stacking order; the preview draws the same
+        // list in the same order, so equal values keep the planner's order.
+        layers.sort_by_key(|layer| layer.z);
+
+        for (depth, layer) in layers.iter().enumerate() {
+            // Subtitles and stickers are stills the SDK rasterises itself (and
+            // the burn path composites); they have no media stream to trim, so
+            // the picture graph must not pretend to draw them. Wiring them in
+            // is the remaining half of M1: burn the stills over this graph's
+            // output rather than mixing two very different sources here.
+            if matches!(layer.kind, LayerKind::Subtitle | LayerKind::Image) {
+                return Err(Error::InvalidArgument(format!(
+                    "segment {i} layer {depth} is a {:?} still; stills are burned after the \
+                     picture export",
+                    layer.kind
+                )));
+            }
+            let transform = &layer.transform;
+            if !transform.scale.is_finite() || transform.scale <= 0.0 {
+                return Err(Error::InvalidArgument(format!(
+                    "segment {i} layer {depth} has scale {}; it must be a positive number",
+                    transform.scale
+                )));
+            }
+            if !transform.dx.is_finite() || !transform.dy.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "segment {i} layer {depth} has a non-finite offset"
+                )));
+            }
+            if !transform.rotation_deg.is_finite() {
+                return Err(Error::InvalidArgument(format!(
+                    "segment {i} layer {depth} has rotation {}",
+                    transform.rotation_deg
+                )));
+            }
+
+            let input = inputs
+                .iter()
+                .position(|uri| uri == &layer.uri)
+                .unwrap_or_else(|| {
+                    inputs.push(layer.uri.clone());
+                    inputs.len() - 1
+                });
+
+            // A dissolve holds the outgoing picture on its last frame while the
+            // incoming one fades in, so its source range collapses to a single
+            // instant (`start == end`). Trimming there yields an empty stream
+            // and the outgoing picture would vanish under the fade. Take the
+            // frame that covers that instant (one output frame back, because
+            // `start` is exclusive on frame PTS), clone it for the segment and
+            // drop the rest; the clone runs before the opacity ramp so a held
+            // layer would still fade if it ever carries one.
+            let held = layer.source_end_us <= layer.source_start_us;
+            let frame_us = 1_000_000.0 / fps_value(&timeline.frame_rate);
+            let mut chain = if held {
+                format!(
+                    "[{input}:v]trim=start={start},trim=end_frame=1,setpts=PTS-STARTPTS,\
+                     tpad=stop_mode=clone:stop_duration={duration:.6},trim=end_frame={frames}",
+                    start = seconds((layer.source_start_us - frame_us.round() as i64).max(0)),
+                    duration = duration_s + 0.1,
+                    frames = frames,
+                )
+            } else {
+                format!(
+                    "[{input}:v]trim=start={}:end={},{}",
+                    seconds(layer.source_start_us),
+                    seconds(layer.source_end_us),
+                    speed_setpts(&layer.speed),
+                )
+            };
+            let effects = effects_to_filter_desc(&layer.effects)?;
+            if !effects.is_empty() {
+                chain.push(',');
+                chain.push_str(&effects);
+            }
+
+            // Geometry contract (model::Transform docs, and the GL compositor):
+            // fit -> scale -> rotate -> translate, translation in canvas units.
+            //
+            // `scale=W*scale:H*scale:decrease` reproduces fit*scale without
+            // knowing the source size, because the filter fits the input into
+            // that box. Rotation then grows the box to the rotated extent (the
+            // preview draws the rotated quad, corners and all), and `overlay`
+            // places that box's centre at the canvas centre plus (dx, dy),
+            // cropping whatever leaves the canvas exactly as the viewport does.
+            let scale = transform.scale as f64;
+            let box_w = ceil_px(timeline.width as f64 * scale);
+            let box_h = ceil_px(timeline.height as f64 * scale);
+            chain.push_str(&format!(
+                ",scale={box_w}:{box_h}:force_original_aspect_ratio=decrease,setsar=1,format=rgba"
+            ));
+            let radians = transform.rotation_deg as f64 * std::f64::consts::PI / 180.0;
+            if transform.rotation_deg != 0.0 {
+                chain.push_str(&format!(
+                    ",rotate={radians}:ow='abs(iw*cos({r}))+abs(ih*sin({r}))':\
+                     oh='abs(iw*sin({r}))+abs(ih*cos({r}))':c=none",
+                    r = radians
+                ));
+            }
+            if let Some(opacity) =
+                opacity_filter(layer.opacity_start, layer.opacity_end, duration_s)?
+            {
+                chain.push(',');
+                chain.push_str(&opacity);
+            }
+
+            let layer_label = format!("l{i}_{depth}");
+            chain.push_str(&format!("[{layer_label}]"));
+            chains.push(chain);
+
+            let stacked = format!("a{i}_{depth}");
+            chains.push(format!(
+                "[{base}][{layer_label}]overlay=x='(main_w-overlay_w)/2+({dx})*main_w':\
+                 y='(main_h-overlay_h)/2+({dy})*main_h':format=auto[{stacked}]",
+                dx = transform.dx,
+                dy = transform.dy,
+            ));
+            base = stacked;
+        }
+
+        chains.push(format!("[{base}]format=yuv420p[seg{i}]"));
     }
 
     let mut filter = String::new();
@@ -232,12 +265,23 @@ pub fn compile(
         "joined".to_string()
     };
 
+    // Frame count has to match the plan exactly: `fps` re-times the joined
+    // stream and can emit one extra frame past the last planned one when the
+    // overlay timestamps land a hair early, so the tail is trimmed to the
+    // plan's own end frame. Nothing is invented and nothing is dropped.
+    let total_frames = plan
+        .segments
+        .last()
+        .map(|segment| segment.end_frame)
+        .unwrap_or(0);
     filter.push(';');
-    if settings.filter_suffix.is_empty() {
-        filter.push_str(&format!("[{joined}]null[vout]"));
+    let retimed = if settings.filter_suffix.is_empty() {
+        joined
     } else {
-        filter.push_str(&format!("[{joined}]{}[vout]", settings.filter_suffix));
-    }
+        filter.push_str(&format!("[{joined}]{}[retimed];", settings.filter_suffix));
+        "retimed".to_string()
+    };
+    filter.push_str(&format!("[{retimed}]trim=end_frame={total_frames}[vout]"));
 
     Ok(ExportGraph {
         inputs,
@@ -270,6 +314,46 @@ fn rate_string(rate: &Rational) -> String {
     }
 }
 
+fn fps_value(rate: &Rational) -> f64 {
+    rate.num as f64 / rate.den as f64
+}
+
+/// Alpha for one layer over one segment.
+///
+/// The preview multiplies each layer's own alpha by an opacity that is linear
+/// in frame time, so export has to reproduce that ramp, not just its start.
+/// `colorchannelmixer=aa` covers a constant, and the two ramps that actually
+/// occur today -- a dissolve's incoming 0→1 and outgoing 1→0 -- are exactly
+/// `fade`'s alpha mode. Any other ramp is refused with both endpoints named
+/// rather than silently drawn at the wrong level.
+fn opacity_filter(start: f32, end: f32, duration_s: f64) -> crate::Result<Option<String>> {
+    for value in [start, end] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(Error::InvalidArgument(format!(
+                "layer opacity {value} is outside 0..=1"
+            )));
+        }
+    }
+    const EPS: f32 = 1e-6;
+    if (start - end).abs() <= EPS {
+        return Ok(if start >= 1.0 - EPS {
+            None
+        } else {
+            Some(format!("colorchannelmixer=aa={start:.4}"))
+        });
+    }
+    if start <= EPS && (end - 1.0).abs() <= EPS {
+        return Ok(Some(format!("fade=t=in:st=0:d={duration_s:.6}:alpha=1")));
+    }
+    if (start - 1.0).abs() <= EPS && end <= EPS {
+        return Ok(Some(format!("fade=t=out:st=0:d={duration_s:.6}:alpha=1")));
+    }
+    Err(Error::InvalidArgument(format!(
+        "opacity ramp {start} -> {end} is not compiled yet; only constant, 0->1 and 1->0 \
+         are supported"
+    )))
+}
+
 /// `setpts` for a clip's speed: timeline time = source time / speed, so the
 /// PTS scale factor is `1/speed`, kept as an exact fraction.
 fn speed_setpts(speed: &Rational) -> String {
@@ -286,7 +370,9 @@ fn speed_setpts(speed: &Rational) -> String {
 mod tests {
     use super::*;
     use crate::export::plan_export;
-    use crate::model::{Clip, MediaSource, Track, TrackKind, Transition, TransitionKind};
+    use crate::model::{
+        Clip, MediaSource, Track, TrackKind, Transform, Transition, TransitionKind,
+    };
 
     fn timeline(clips: Vec<Clip>) -> Timeline {
         let mut timeline = Timeline {
@@ -383,7 +469,11 @@ mod tests {
         let timeline = timeline(vec![clip]);
         let plan = plan_export(&timeline);
         let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
-        let chain = graph.filter_complex.split(';').next().unwrap();
+        let chain = graph
+            .filter_complex
+            .split(';')
+            .find(|chain| chain.contains("hflip"))
+            .expect("a chain carrying the effects");
         assert!(chain.contains("hflip,negate"), "{chain}");
         assert!(
             chain.find("hflip").unwrap() < chain.find("scale=").unwrap(),
@@ -392,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dissolve_segment_is_refused_instead_of_flattened() {
+    fn a_dissolve_stacks_both_pictures_and_ramps_the_incoming_one() {
         let mut second = clip(1, 4, 2_000_000, 4_000_000, 2_000_000);
         second.transition_in = Some(Transition {
             kind: TransitionKind::Fade,
@@ -400,8 +490,71 @@ mod tests {
         });
         let timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0), second]);
         let plan = plan_export(&timeline);
-        let err = compile(&timeline, &plan, &GraphSettings::default()).unwrap_err();
-        assert!(err.to_string().contains("dissolve"), "{err}");
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        let filter = &graph.filter_complex;
+        // The window segment holds both clips: the outgoing picture stays
+        // opaque underneath, the incoming one fades 0 -> 1 on top of it.
+        let window = plan
+            .segments
+            .iter()
+            .find(|segment| segment.video.len() == 2)
+            .expect("a dissolve segment");
+        assert!(filter.contains("fade=t=in:st=0:d="), "{filter}");
+        // The outgoing picture has no source left to read (its range collapsed
+        // to the out point), so it must be frozen and cloned, not dropped.
+        assert!(
+            filter.contains("tpad=stop_mode=clone:stop_duration="),
+            "the outgoing picture must hold its last frame: {filter}"
+        );
+        // Its frame count is the fade's duration: 0.5s at 30fps.
+        assert!(
+            window.end_frame - window.start_frame == 15,
+            "window should be 15 frames, got {}",
+            window.end_frame - window.start_frame
+        );
+        assert_eq!(
+            filter.matches("overlay=").count(),
+            plan.segments.iter().map(|s| s.video.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn layers_stack_bottom_to_top_in_z_order() {
+        let mut timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0)]);
+        timeline.media.push(MediaSource {
+            id: 2,
+            uri: "file:///pip.mp4".into(),
+            info: None,
+        });
+        // A picture-in-picture track sits above the main video track (z order
+        // follows track order), so the PiP must be the second overlay.
+        let mut pip = clip(2, 5, 0, 2_000_000, 0);
+        pip.transform = Transform {
+            scale: 0.25,
+            dx: 0.3,
+            dy: -0.3,
+            ..Transform::default()
+        };
+        timeline.tracks.push(Track {
+            id: 6,
+            kind: TrackKind::Overlay,
+            clips: vec![pip],
+        });
+        let plan = plan_export(&timeline);
+        assert_eq!(plan.segments[0].video.len(), 2, "two layers in one segment");
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        let filter = &graph.filter_complex;
+        let first = filter
+            .find("[bg0][l0_0]overlay=")
+            .expect("bottom layer first");
+        let second = filter
+            .find("[a0_0][l0_1]overlay=")
+            .expect("top layer second");
+        assert!(first < second, "{filter}");
+        assert!(
+            filter.contains("scale=136:240"),
+            "PiP box at 0.25: {filter}"
+        );
     }
 
     #[test]
@@ -465,6 +618,22 @@ mod tests {
         let filter = &graph.filter_complex;
         assert!(filter.contains("+(0.25)*main_w"), "{filter}");
         assert!(filter.contains("+(-0.1)*main_h"), "{filter}");
+    }
+
+    #[test]
+    fn a_still_layer_is_refused_until_the_burn_pass_is_wired() {
+        let mut timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0)]);
+        let mut text = Clip::new(0, 0, 1_000_000, 0);
+        text.id = 7;
+        text.text = Some("字幕".to_string());
+        timeline.tracks.push(Track {
+            id: 8,
+            kind: TrackKind::Subtitle,
+            clips: vec![text],
+        });
+        let plan = plan_export(&timeline);
+        let err = compile(&timeline, &plan, &GraphSettings::default()).unwrap_err();
+        assert!(err.to_string().contains("burned"), "{err}");
     }
 
     // The planner already drops a layer whose scale is not positive, so the
