@@ -7,6 +7,7 @@ pub mod clock;
 pub mod effects;
 pub mod error;
 pub mod export;
+pub mod export_graph;
 pub mod images;
 pub mod media;
 pub mod model;
@@ -27,6 +28,7 @@ pub use error::{code_message, Error, Result};
 pub use export::{
     frame_index_ceil, plan_export, ExportAudioItem, ExportPlan, ExportSegment, ExportVideoItem,
 };
+pub use export_graph::{compile as compile_export_graph, ExportGraph, GraphSettings};
 pub use images::{
     fitted_size, image_revision, load_image, local_path, render_image, source_dimensions,
     ImageBitmap, SourceImage,
