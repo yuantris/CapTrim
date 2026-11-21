@@ -4,7 +4,7 @@ Android 和鸿蒙共用的视频剪辑核心 SDK。Rust 描述时间线，FFmpeg
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI、鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖剪映的基础剪辑能力：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 19/19，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 20/20，明细见[验证状态](#验证状态)。字幕与图片/贴纸图层是「没有解码器也得画出来」的两类：文字在 Rust 核心里光栅化、图片在 Rust 核心里解码并缩放旋转，产出的位图预览当纹理上传、导出写成 PAM 交给 `overlay`，两块在鸿蒙 Mate 60 与小米 2211133C（Android 16）上都验证过。转场（`Fade`）的画面与声音都在核心里：画面把后一段的透明度按窗口线性拉起来、前一段续画到窗口结束，声音在同一窗口做真正的交叉渐变（两个源同时出声、增益互补）。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
+现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 19/19，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 20/20，明细见[验证状态](#验证状态)。字幕与图片/贴纸图层是「没有解码器也得画出来」的两类：文字在 Rust 核心里光栅化、图片在 Rust 核心里解码并缩放旋转，产出的位图预览当纹理上传、导出写成 PAM 交给 `overlay`，两块在鸿蒙 Mate 60 与小米 2211133C（Android 16）上都验证过。转场（`Fade`）的画面与声音都在核心里：画面把后一段的透明度按窗口线性拉起来、前一段续画到窗口结束，声音在同一窗口做真正的交叉渐变（两个源同时出声、增益互补）。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。现在所处的阶段见第七节路线图：**M1「能出片」是唯一阻断项**——导出还没有时间线合成器，除“单源转码 + 字幕/贴纸烧录”外的剪辑操作目前只在预览里生效。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
 
 ---
 
@@ -362,7 +362,7 @@ hold-and-present 处理解码器的 300 ms 喂帧前瞻：播放中 PTS 超过�
 
 FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等（和 `scale`/`fit` 既有取舍一致）；必须相等的是「跑哪些效果、什么顺序」。这四个 filter（`eq`/`hue`/`negate`/`boxblur`，外加 `negate` 依赖的 `lut`）现已编进双端 FFmpeg 裁剪白名单（两端 `config.mak` 均为 `CONFIG_*_FILTER=yes`），`effects_to_filter_desc()` 产出的链在真机可执行。预览侧：`captrim_layer_desc_t` 新增 `effects` 位掩码（8 个 `CAPTRIM_EFFECT_*`，与 core 的 `EFFECT_*` 和 canonical order 同源），OHOS GLSL 片元着色器按同一顺序应用八个效果（翻转走 UV、色彩运算走 RGB、模糊走 5×5 box），presenter 把位直接透传。导出侧：`captrim_effects_to_filter_desc()` 把 `ExportVideoItem.effects` 翻成 FFmpeg 链，双端（NAPI `effectsToFilterDesc` / JNI `nativeEffectsToFilterDesc`）已接线，词汇与常数始终只在 core 定义一次。
 
-## 七、已完成 / 未完成
+## 七、已完成 / 路线图（到可发布 SDK）
 
 **已完成**
 
@@ -387,12 +387,56 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 - 鸿蒙硬解 + GL 多图层合成上屏：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放都在真机验证过
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包、本地 CI 全套
 
-**未完成（按优先级）**
+**路线图：从当前状态到可发布 SDK**
 
-- 字幕与图片/贴纸图层都在鸿蒙 Mate 60 与小米 2211133C 上跑通（`fontdue` 光栅化 / 纯 Rust 图片解码 → 预览走 `GL_TEXTURE_2D`、导出走 PAM + `overlay`）。Android 侧验的是数据层、位图 ABI 消费路径与烧录产物（20/20，含两张 PAM 的墨迹/半透明像素数），预览渲染仍是契约层，没有 GL 实现
-- 转场后续：转场期音频交叉渐变已完成（两条音轨同窗口、增益互补，导出计划带 `volume`/`volume_end` 线性 ramp）；剩下「更多转场类型（擦除/推拉等，复用同一窗口模型）」与「前驱素材越出裁剪点时用 handle material 代替冻结帧」。音频的交叉渐变已按源越出裁剪点读取：素材还有内容就继续出声，文件读完就自然淡入静音
-- P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
-- 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
+基调先说清楚，后面每个阶段都按这四条验收：
+
+1. **只做真的**：不允许装载桩、`LD_PRELOAD`、只让自检变绿的实现。功能以「真机点得出、导出文件复核得出」为准。
+2. **真机是完成条件**：宿主机单测、`cargo check`、本机 FFmpeg 抽帧只能算中间态，写进「验证状态」的必须是双端真机结果。
+3. **预览 = 导出**：几何（fit/scale/rotation/位置）、不透明度、音频增益都从同一份 `FramePlan` / `ExportPlan` 推导；谁要改公式，先改共同的那一份。
+4. **坑只进 `.workbuddy/memory`**：README 只写设计、能力与验收，构建/设备坑写日志，避免文档被环境噪声淹没。
+
+**M1「能出片」——把时间线变成成品 mp4（当前唯一阻断项）**
+
+现状：导出只有 `exportTranscode(src, dst, filter, codec)`（单源 + 调用方自拼 filter）与 `remux`；`ExportPlan` 只被“画出来”，没有任何代码把它编译成 FFmpeg 图；非视频流在转码里是**原样拷贝**（不裁、不混、不读 `volume`）。
+
+- [ ] `export_graph`（core）：`ExportPlan` → FFmpeg `filter_complex`。视频侧先做：每段 `trim/setpts/scale/pad/effects`、段间 `concat`、图层按 z 序 `overlay`、`opacity_start/opacity_end` 用 `format=rgba,colorchannelmixer=aa` ramp；多源时每源一条输入。
+- [ ] 几何翻译：`fit → scale → rotation` 与 GL 同一公式（旋转用 `rotate=a=…:ow/oh` 后回贴画布），让预览里的旋转/缩放/位置在导出里一致；字幕/贴纸继续走已有 PAM `overlay` 图串。
+- [ ] 音频混流：按段 `atrim` 裁剪 + 多轨 `amix` + `volume`/`volume_end` 逐段 ramp + 转场窗口双源增益（复用 `plan_audio_at` 的取值），统一 48 kHz/立体声；音画对齐按段 PTS 重算，不依赖源时间戳。
+- [ ] 导出设置：分辨率/帧率/码率/编码器策略（`libx264`/`libx265`/`hw:`）结构化传入，后台任务 + 可取消（进度回调已有），失败保留可诊断错误码。
+- [ ] ABI 与双端：新增「按计划导出」C 函数（NAPI/JNI/头文件/d.ts 同步），鸿蒙与 Android 各接一个 `exportTimeline(dst, settings, progress)`。
+- 验收：双端真机对同一草稿导出「3 段拼接 + 画中画 + 淡入淡出转场 + 字幕 + 贴纸 + 两条音频轨」，`probe` 校验时长/分辨率/流数正确，FFmpeg 抽帧确认窗口内外一致，音画偏差 ≤ 1 帧；同一草稿的 `ExportPlan` 与 `FramePlan` 逐帧集合一致（已有测试继续跑）。
+
+**M2「双端对等」——Android 预览与音频输出**
+
+现状：Android 侧只有 `jni_bridge.cpp`，没有 GL 合成、没有 AAudio 输出；Kotlin 也没有包装 `clip_text_bitmap` / `clip_image_bitmap`，字幕贴纸拿不到位图；帧数据走 JSON。
+
+- [ ] Android GL 合成器：每层一个 `SurfaceTexture` + EGL，复用鸿蒙 `gl_compositor` 的绘制序/transform/effect 语义（同一套 `captrim_layer_desc_t`）。
+- [ ] Android 音频输出：AAudio 48 kHz 立体声，位置回灌主时钟，接住 hold-and-present。
+- [ ] 桥接补齐：`clip_text_bitmap` / `clip_image_bitmap`、二进制帧描述（避免每帧 JSON 往返），Kotlin 侧给出与 ArkTS 同构的 API。
+- 验收：小米 2211133C 上 1080p 双图层实时预览，丢帧统计与拖动响应有数据；音画差 ≤ 30 ms；字幕/贴纸位图在预览里可见（截图 + 日志）。
+
+**M3「剪映基础手感」——命令层与表现力**
+
+现状：多数操作只有数据层，导出不落片（见 M1）；缺入点裁剪、复制、磁性插入、音频分离、关键帧、文本样式、音频保调。
+
+- [ ] 编辑命令：`SetInPoint`、`DuplicateClip`、磁性插入（重叠时顺延/推挤，替代现在的“报错”）、`DetachAudio`（分离到 Audio 轨并把原片段静音）、轨道重排（z 序）、批量多选。
+- [ ] 关键帧：位置/缩放/旋转/不透明度/音量，模型 + 线性/缓动插值 + 预览 + 导出同源。
+- [ ] 文本样式：字号/颜色/描边宽度与颜色/背景框/对齐/行距/自由位置；贴纸支持动图（GIF/WebP）与圆角/裁剪。
+- [ ] 转场：`wipe`/`slide`/闪白，前驱越界改用 handle material（源有素材就真读，不再冻结帧）。
+- [ ] 音频：片段淡入淡出、变速保调、波形数据；音频轨的独立音量/静音在导出生效。
+- [ ] 媒体：缩略图、波形、媒体库元数据缓存（`probe` 已有，缺派生数据）。
+- 验收：按剪映基础清单（分割、入点/出点裁剪、变速与保调、倒放除外、旋转/镜像、音频分离、音量与淡入淡出、复制/排序、画中画、字幕、贴纸、转场）逐项在双端真机上可操作，且同一操作在导出文件里可复核（分割后的时长、变速后的音调、分离后的单轨声音）。
+
+**M4「可发布 SDK」——合规、分发与稳定性**
+
+- [ ] 许可定调：GPL（现状，含 x264/x265）或 LGPL 构建（去 x264/x265，保留硬编 + 平台编码）；二选一写进 README 与 `dist/*/FFMPEG_BUILD.txt`。
+- [ ] 分发：Android `maven-publish` 产出可依赖 AAR；鸿蒙 `ohpm` 包 + `.d.ts`；版本号与变更日志；符号表/混淆规则。
+- [ ] 文档与示例：API 参考（C/Kotlin/ArkTS）、双端最小编辑器 Demo（导入→分割→变速→字幕→导出），不再只有自检 App。
+- [ ] 稳定性：文本长度与图片像素上限、OOM 防护、长时导出基准、低端机矩阵、崩溃符号化。
+- 验收：一个不读源码的第三方 App 按文档接入并导出成品；双端 Demo 各跑通；CI 全绿且发布产物可被新工程直接依赖。
+
+**明确排除到 v2**：倒放（反向解码 + 整段帧缓存，复杂度约等于其余功能之和）。
 
 逐帧数据不要走 JSON 往返：当前 `planFrame` / `step` 返回 JSON，是为了让 P1 骨架在没有渲染器时也能跑通、也能两端对齐。真实的合成器应当从 C++ 直接调 C ABI（同一份 `captrim_preview_step`），避免每帧一次 JSON 解析与跨语言拷贝。ArkTS 侧已做类型化封装，Android 侧返回原始 JSON 是刻意的：AAR 保持零依赖，也不塞一个无法用单元测试验证的手写解析器。
 
