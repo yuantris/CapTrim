@@ -198,9 +198,8 @@ for ABI in $ABIS; do
     export X265_CMAKE_EXTRA="-DANDROID_ABI=${ABI} -DANDROID_PLATFORM=android-${ANDROID_API} -DANDROID_STL=c++_static"
     resolve_external_codecs "$ABI" "$CC" "$CXX" "$ARCH" "$SYSROOT"
 
-    BUILD="${ROOT_DIR}/build/ffmpeg-android/${ABI}"
+    read -r BUILD OUT <<< "$(license_dirs android "$ABI")"
     PREFIX="${BUILD}/prefix"
-    OUT="${ROOT_DIR}/dist/android/${ABI}"
     # Always start the FFmpeg build tree from scratch. Enabling new filters in
     # a reconfigure updates config.mak + filter_list.c and compiles the new
     # vf_*.o, but make's incremental rule can judge an existing libavfilter.so

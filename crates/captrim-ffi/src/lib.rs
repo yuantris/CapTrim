@@ -434,6 +434,12 @@ pub extern "C" fn captrim_engine_export_transcode(
         } else {
             unsafe { cstr(video_codec)? }
         };
+        // NOTE: the pipeline accepts a STAGE SPEC here ("hw:sw:libx264"), not a
+        // bare encoder name, so it must not be resolved through the encoder
+        // capability table: that would reject the spec. "No software H.264
+        // encoder" is handled one layer down, in ct_ff_transcode /
+        // captrim_pipeline.c, which fall back to whatever software encoder the
+        // build actually has.
         let mut report = |value: f32| match progress {
             Some(cb) => unsafe { cb(value, user_data) == 0 },
             None => true,

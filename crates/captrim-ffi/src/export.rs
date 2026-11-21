@@ -9,7 +9,7 @@ use crate::{
     captrim_engine_t, cstr, engine_from, ffi_guard, lock, owned_cstring, CaptrimProgressCb,
 };
 use captrim_core::{
-    compile_export_graph, effects_to_filter_desc, plan_export, Error, GraphSettings,
+    compile_export_graph, effects_to_filter_desc_with, plan_export, Error, GraphSettings,
 };
 use std::os::raw::{c_char, c_void};
 use std::ptr;
@@ -50,11 +50,19 @@ pub extern "C" fn captrim_engine_export_timeline(
                 Some(std::path::PathBuf::from(text))
             }
         };
-        let codec = if video_codec.is_null() {
+        let requested_codec = if video_codec.is_null() {
             String::new()
         } else {
             unsafe { cstr(video_codec) }?.to_string()
         };
+        // "" means H.264 with whatever this build has; a named encoder is
+        // checked against the shipped FFmpeg. Either way the answer is decided
+        // before a frame is decoded, so an LGPL build reports what it lacks
+        // instead of dying inside the encoder open.
+        let backend = crate::default_backend();
+        let codec = captrim_core::encoders::resolve(&requested_codec, &|name| {
+            backend.encoder_available(name)
+        })?;
         let preset = if preset.is_null() {
             String::new()
         } else {
@@ -88,6 +96,16 @@ pub extern "C" fn captrim_engine_export_timeline(
             let editor = lock(&e.editor)?;
             let timeline = editor.timeline();
             let plan = plan_export(timeline);
+            // The graph compiler translates effects itself, but a filter this
+            // build lacks would then surface as a libavfilter parse error after
+            // the demuxers already opened. Decide up front, per effect.
+            for segment in &plan.segments {
+                for item in &segment.video {
+                    effects_to_filter_desc_with(&item.effects, &|filter| {
+                        backend.filter_available(filter)
+                    })?;
+                }
+            }
             compile_export_graph(timeline, &plan, &settings)?
         };
         let mut report = |value: f32| match progress {
@@ -142,8 +160,50 @@ pub extern "C" fn captrim_effects_to_filter_desc(
         let json = unsafe { cstr(effects_json)? };
         let effects: Vec<String> = serde_json::from_str(json)
             .map_err(|e| Error::invalid(format!("effects must be a JSON string array: {e}")))?;
-        let desc = effects_to_filter_desc(&effects)?;
+        // Doubles as the capability probe for the effect vocabulary: an LGPL
+        // build has no `eq` / `boxblur` (GPL filters inside FFmpeg), so
+        // brightness / contrast / saturation / blur come back as -11 with the
+        // effects that do work, instead of a graph that fails at parse time.
+        let backend = crate::default_backend();
+        let desc =
+            effects_to_filter_desc_with(&effects, &|filter| backend.filter_available(filter))?;
         unsafe { *out_desc = owned_cstring(desc)? };
+        Ok(0)
+    })
+}
+
+/// Whether this build can encode with `name` (`libx264`, `libx265`, `mpeg4`,
+/// ...). Lets an app offer only encoders that exist instead of discovering it
+/// when an export fails. Returns 1 available, 0 not.
+#[no_mangle]
+pub extern "C" fn captrim_encoder_available(name: *const c_char) -> i32 {
+    ffi_guard(|| {
+        if name.is_null() {
+            return Ok(0);
+        }
+        let name = unsafe { cstr(name) }?;
+        let backend = crate::default_backend();
+        Ok(if backend.encoder_available(name) {
+            1
+        } else {
+            0
+        })
+    })
+}
+
+/// Software encoders this build ships, comma separated (may be empty).
+/// Caller frees the string with `captrim_string_free`.
+#[no_mangle]
+pub extern "C" fn captrim_encoders(out: *mut *mut c_char) -> i32 {
+    ffi_guard(|| {
+        if out.is_null() {
+            return Err(Error::invalid("out is null"));
+        }
+        unsafe { *out = ptr::null_mut() };
+        let backend = crate::default_backend();
+        let names = captrim_core::encoders::available(&|name| backend.encoder_available(name));
+        let text = names.join(",");
+        unsafe { *out = owned_cstring(text)? };
         Ok(0)
     })
 }

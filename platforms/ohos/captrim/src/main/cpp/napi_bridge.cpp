@@ -148,6 +148,14 @@ napi_value StringResult(napi_env env, int32_t code, char *owned) {
     return object;
 }
 
+napi_value BooleanResult(napi_env env, bool value) {
+    napi_value object = CodeResult(env, 0);
+    napi_value flag;
+    napi_get_boolean(env, value, &flag);
+    napi_set_named_property(env, object, "value", flag);
+    return object;
+}
+
 napi_value StaticStringResult(napi_env env, const char *text) {
     napi_value object = CodeResult(env, 0);
     napi_value value;
@@ -406,6 +414,23 @@ napi_value CodeMessage(napi_env env, napi_callback_info info) {
 
 napi_value LastError(napi_env env, napi_callback_info) {
     return StaticStringResult(env, captrim_last_error_message());
+}
+
+// Software encoders in this build. GPL profile: libx264/libx265 present; LGPL
+// profile: absent by design, so the ArkTS layer asks instead of assuming.
+napi_value Encoders(napi_env env, napi_callback_info) {
+    char *names = nullptr;
+    int32_t code = captrim_encoders(&names);
+    return StringResult(env, code, names);
+}
+
+napi_value EncoderAvailable(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) return BooleanResult(env, false);
+    JsString name = JsString::From(env, args[0]);
+    return BooleanResult(env, captrim_encoder_available(name.c_str()) == 1);
 }
 
 // ---- Frame planning --------------------------------------------------------
@@ -713,6 +738,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"version", nullptr, VersionImpl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"codeMessage", nullptr, CodeMessage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastErrorMessage", nullptr, LastError, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"encoders", nullptr, Encoders, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"encoderAvailable", nullptr, EncoderAvailable, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"planFrameAt", nullptr, PlanFrameAt, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"planFrame", nullptr, PlanFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportPlan", nullptr, ExportPlan, nullptr, nullptr, nullptr, napi_default, nullptr},

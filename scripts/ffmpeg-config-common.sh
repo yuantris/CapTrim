@@ -1,23 +1,49 @@
 #!/usr/bin/env bash
-# Shared, FULL-FEATURED FFmpeg configuration for CapTrim.
+# Shared FFmpeg configuration for CapTrim, in two licence profiles.
 #
-# LICENSE: This build enables GPL codecs (libx264 / libx265), so the resulting
-# binaries are GPLv2-or-later, NOT LGPL. CapTrim is a LEARNING project that
-# prioritizes full functionality over license-minimalism; if you ever distribute
-# the binaries you must comply with GPL: provide the corresponding FFmpeg / x264
-# / x265 source AND the exact configure lines. See write_build_receipt ->
-# dist/<platform>/<abi>/FFMPEG_BUILD.txt.
+#   CAPTRIM_LICENSE=gpl   (default) libx264 / libx265 on, --enable-gpl on ->
+#                         the binaries are GPLv2+, full software encoding.
+#                         Distribution must ship FFmpeg + x264 + x265 source
+#                         and the exact configure line (see write_build_receipt).
+#   CAPTRIM_LICENSE=lgpl  no --enable-gpl, no x264 / x265 -> LGPLv2.1+, which
+#                         is what a closed-source SDK can link and ship.
+#                         Software H.264/HEVC encoding is then UNAVAILABLE
+#                         (FFmpeg ships no LGPL software AVC encoder); the SDK
+#                         reports that through the encoder table instead of
+#                         failing at encode time. Decoding, every filter this
+#                         project uses, muxing and AAC are identical.
 #
-# Components kept: libavformat, libavcodec, libavfilter, libswscale,
-# libswresample, libavutil, plus external libx264 / libx265 (built from source
-# by this script). We start from --disable-everything and opt IN a broad, common
-# set so the build stays tractable; remove --disable-everything for an even
-# fuller build.
+# The two profiles differ ONLY in configure flags: same sources, same ABI, same
+# feature code. Never make a build work in one profile only -- CI runs
+# scripts/check-license-profile.sh so a flag that leaks into the wrong profile
+# is caught without a 10-minute FFmpeg rebuild.
 
 set -euo pipefail
 
 log() { printf '[captrim] %s\n' "$*"; }
 die() { printf '[captrim][error] %s\n' "$*" >&2; exit 1; }
+
+# Licence profile. Everything downstream keys off this one variable: configure
+# flags, whether x264/x265 are built at all, and where the artifacts land.
+CAPTRIM_LICENSE="${CAPTRIM_LICENSE:-gpl}"
+case "$CAPTRIM_LICENSE" in
+    gpl|lgpl) ;;
+    *) die "CAPTRIM_LICENSE must be 'gpl' or 'lgpl' (got '$CAPTRIM_LICENSE')" ;;
+esac
+
+# Artifact directories: the default profile keeps the historical layout so
+# every existing script/README path still works; the LGPL build gets its own
+# tree so both profiles can sit side by side and be diffed.
+license_dirs() {
+    local platform="$1" abi="$2"
+    if [ "$CAPTRIM_LICENSE" = "lgpl" ]; then
+        printf '%s %s' "${ROOT_DIR}/build/ffmpeg-${platform}-lgpl/${abi}" \
+            "${ROOT_DIR}/dist/${platform}-lgpl/${abi}"
+    else
+        printf '%s %s' "${ROOT_DIR}/build/ffmpeg-${platform}/${abi}" \
+            "${ROOT_DIR}/dist/${platform}/${abi}"
+    fi
+}
 
 need_env() {
     local name="$1"
@@ -58,8 +84,17 @@ X264_SRC="${X264_SRC:-${ROOT_DIR}/third_party/x264}"
 X265_SRC="${X265_SRC:-${ROOT_DIR}/third_party/x265}"
 X264_REF="${X264_REF:-master}"
 X265_REF="${X265_REF:-master}"
-BUILD_X264="${BUILD_X264:-1}"
-BUILD_X265="${BUILD_X265:-1}"
+# A GPL profile needs both external codecs; an LGPL profile must build neither
+# (linking x264 would drag the whole SDK back under GPL). `CAPTRIM_LICENSE=lgpl
+# BUILD_X264=1` is therefore not honoured: the switch is profile-driven, not
+# a preference.
+if [ "$CAPTRIM_LICENSE" = "lgpl" ]; then
+    BUILD_X264=0
+    BUILD_X265=0
+else
+    BUILD_X264="${BUILD_X264:-1}"
+    BUILD_X265="${BUILD_X265:-1}"
+fi
 
 # Filled by resolve_external_codecs()
 X264_PREFIX=""
@@ -368,6 +403,12 @@ resolve_external_codecs() {
     # Reset per-ABI so repeated calls don't duplicate --enable flags.
     X264_PREFIX=""; X265_PREFIX=""
     EXT_CFLAGS=""; EXT_LDFLAGS=""; FFMPEG_EXTRA_ENABLE=""
+    if [ "$CAPTRIM_LICENSE" = "lgpl" ]; then
+        # Nothing GPL enters this build: no x264, no x265, no --enable-gpl.
+        # Everything else (decoders, filters, muxers, AAC) is untouched.
+        log "LGPL profile: skipping libx264 / libx265 (would make the SDK GPL)"
+        return 0
+    fi
     # Android and HarmonyOS both use arm64-v8a, but their static codec archives
     # are NOT interchangeable: an Android x264.a references bionic's
     # __assert2, which musl on OHOS cannot resolve (configure then reports
@@ -587,6 +628,22 @@ ensure_build_tools() {
     command -v cmake >/dev/null 2>&1 || log "WARNING: cmake not on PATH (x265 build will be skipped)"
 }
 
+# Flags that only belong in the GPL profile: --enable-gpl and the external
+# software encoders it unlocks. The ENCODER components must be opted in
+# explicitly as well: with --disable-everything, --enable-libx264 only enables
+# the *library*; without --enable-encoder=libx264 the encoder is never compiled
+# into libavcodec (verified: CONFIG_LIBX264_ENCODER was 0). libx264rgb is the
+# RGB-pixel-format variant.
+LICENSE_GPL_CFG=()
+if [ "$CAPTRIM_LICENSE" = "gpl" ]; then
+    LICENSE_GPL_CFG=(
+        --enable-gpl
+        --enable-encoder=libx264
+        --enable-encoder=libx264rgb
+        --enable-encoder=libx265
+    )
+fi
+
 # Components required by native/captrim_ffmpeg.c and by the P1 preview path,
 # plus the learning-project "full functionality" set.
 FFMPEG_COMMON_CFG=(
@@ -596,7 +653,7 @@ FFMPEG_COMMON_CFG=(
     --disable-network
     --disable-autodetect
     --disable-avdevice
-    --enable-gpl
+    "${LICENSE_GPL_CFG[@]}"
     --enable-shared
     --disable-static
     --enable-pic
@@ -658,15 +715,10 @@ FFMPEG_COMMON_CFG=(
     --enable-encoder=mpeg4
     --enable-encoder=flac
     --enable-encoder=rawvideo
-    # CRITICAL: with --disable-everything the libx264/libx265 ENCODER components
-    # are OFF even though --enable-libx264/--enable-libx265 (added in
-    # resolve_external_codecs) only enables the *libraries*. The encoders must be
-    # turned on explicitly or libx264.o/libx265.o are never compiled into
-    # libavcodec (verified: CONFIG_LIBX264_ENCODER/265_ENCODER were 0 -> 0 symbols
-    # in libavcodec.so). libx264rgb is the RGB-pixel-format variant of libx264.
-    --enable-encoder=libx264
-    --enable-encoder=libx264rgb
-    --enable-encoder=libx265
+    # GPL profile only: libx264 / libx264rgb / libx265 come in through
+    # LICENSE_GPL_CFG above. An LGPL profile leaves them out entirely, so the
+    # only video encoders left are mpeg4 / flac / rawvideo, and the SDK reports
+    # that through its encoder table rather than failing at encode time.
     # ---- Filters for the middle "FFmpeg processing" stage of the transcode
     # pipeline. With --disable-everything each filter is OFF unless opted in.
     # buffer/buffersink are the graph anchors (frame-in / frame-out); scale and
@@ -765,13 +817,21 @@ write_build_receipt() {
     shift
     {
         echo "# CapTrim FFmpeg build receipt"
+        echo "# License profile: ${CAPTRIM_LICENSE}"
         echo "# FFmpeg ref: ${FFMPEG_REF:-unknown}"
         echo "# FFmpeg source: ${FFMPEG_SRC:-not recorded}"
-        echo "# x264 source: ${X264_SRC:-not recorded} (ref ${X264_REF:-unknown})"
-        echo "# x265 source: ${X265_SRC:-not recorded} (ref ${X265_REF:-unknown})"
+        if [ "$CAPTRIM_LICENSE" = "lgpl" ]; then
+            echo "# License: LGPL v2.1 or later (no --enable-gpl, no libx264 / libx265)"
+            echo "# NOTE: dynamically linked LGPL build. Redistribution must ship the"
+            echo "#       FFmpeg source matching these binaries, this configure line and"
+            echo "#       keep the libraries replaceable."
+        else
+            echo "# x264 source: ${X264_SRC:-not recorded} (ref ${X264_REF:-unknown})"
+            echo "# x265 source: ${X265_SRC:-not recorded} (ref ${X265_REF:-unknown})"
+            echo "# License: GPL v2 or later (--enable-gpl / --enable-libx264 / --enable-libx265)"
+            echo "# NOTE: distributing the binaries requires shipping FFmpeg + x264 + x265 source."
+        fi
         echo "# Built at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "# License: GPL v2.1 or later (--enable-gpl / --enable-libx264 / --enable-libx265)"
-        echo "# NOTE: distributing the binaries requires shipping FFmpeg + x264 + x265 source."
         echo "# configure:"
         printf '%s\n' "$*"
     } > "$out_dir/FFMPEG_BUILD.txt"

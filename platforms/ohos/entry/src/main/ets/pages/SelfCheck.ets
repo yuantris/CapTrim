@@ -7,7 +7,7 @@
 // does on the host. Every check below fails loudly rather than returning a
 // suspicious zero.
 
-import { CapTrim, CapTrimPreview, FramePlan, Step } from 'captrim';
+import { CapTrim, CapTrimError, CapTrimPreview, FramePlan, Step } from 'captrim';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { taskpool } from '@kit.ArkTS';
 import { TimelineExportResult, exportTimelineTask, BurnResult, burnTask } from './TimelineExportTask';
@@ -254,6 +254,15 @@ export class SelfCheck {
       return `libcaptrim ${version}`;
     });
 
+    // Which licence profile this build is: GPL carries libx264 / libx265, LGPL
+    // carries neither (and is the only one a closed-source SDK may distribute).
+    SelfCheck.check(results, '软件编码器清单（许可 profile 自报）', (): string => {
+      const encoders = CapTrim.encoders();
+      expect(encoders.length > 0, 'encoders() 为空：FFmpeg 构建没有任何软件编码器');
+      const isGpl = CapTrim.hasEncoder('libx264') || CapTrim.hasEncoder('libx265');
+      return `${isGpl ? 'GPL' : 'LGPL'} profile，可用: ${encoders}`;
+    });
+
     SelfCheck.check(results, '时间线构建（2 轨 3 片段）', (): string => {
       const fx = new Fixture();
       try {
@@ -415,11 +424,30 @@ export class SelfCheck {
 
     SelfCheck.check(results, '滤镜 v1（effect 位 + filter_desc 翻译）', (): string => {
       // The translation ABI is the single source of the FFmpeg chain: the
-      // platform never duplicates the vocabulary or its constants.
-      const desc = CapTrim.effectsToFilterDesc(['blur', 'invert', 'hflip']);
-      expect(desc === 'hflip,negate,boxblur=2:1',
-        `effects 翻译应为 hflip,negate,boxblur=2:1，实际 "${desc}"`);
+      // platform never duplicates the vocabulary or its constants. It is also
+      // the capability probe: `boxblur` / `eq` are GPL filters inside FFmpeg,
+      // so an LGPL build must return -11 naming the effect instead of a chain
+      // libavfilter would reject at graph-parse time.
+      const base = CapTrim.effectsToFilterDesc(['invert', 'hflip']);
+      expect(base === 'hflip,negate', `effects 翻译应为 hflip,negate，实际 "${base}"`);
       expect(CapTrim.effectsToFilterDesc([]) === '', '空 effects 应翻成空链');
+
+      let chain: string = '';
+      let unsupportedNote: string = '';
+      try {
+        chain = CapTrim.effectsToFilterDesc(['blur', 'invert', 'hflip']);
+      } catch (e) {
+        const err = e as Error;
+        const unsupported = (err as CapTrimError).code === -11;
+        expect(unsupported, `缺少 boxblur 时应报 -11，实际 ${err.message}`);
+        expect(err.message.includes('blur') && err.message.includes('available effects'),
+          `错误信息应点名 effect 与可用项，实际 "${err.message}"`);
+        unsupportedNote = err.message;
+      }
+      if (unsupportedNote === '') {
+        expect(chain === 'hflip,negate,boxblur=2:1',
+          `effects 翻译应为 hflip,negate,boxblur=2:1，实际 "${chain}"`);
+      }
 
       // set_effects survives into the export plan as the per-segment effects
       // list, which is exactly what the exporter feeds back to the translation.
@@ -430,7 +458,9 @@ export class SelfCheck {
         const plan = JSON.stringify(fx.editor.exportPlan());
         expect(plan.includes('"hflip"'), `exportPlan 未携带 effects: ${plan}`);
         expect(plan.includes('"invert"'), `exportPlan 未携带 invert: ${plan}`);
-        return `desc="${desc}"，plan 携带 effects`;
+        return unsupportedNote === ''
+          ? `desc="${chain}"，plan 携带 effects`
+          : `desc 未生成（${unsupportedNote}），plan 携带 effects`;
       } finally {
         fx.close();
       }
@@ -482,7 +512,12 @@ export class SelfCheck {
     // Exercises a real "complex edit command": scale down, horizontal flip,
     // drop to 15fps, then H.264 re-encode. Passing proves the full software
     // backbone works on device (and is available as the hardware fallback).
-    SelfCheck.check(results, 'FFmpeg 复杂剪辑（滤镜+libx264重编码）', (): string => {
+    SelfCheck.check(results, 'FFmpeg 复杂剪辑（滤镜+H.264 重编码）', (): string => {
+      // '' = whichever software H.264 encoder this build carries (libx264 in the
+      // GPL profile). The LGPL profile has none, so report it instead of failing.
+      if (!CapTrim.hasEncoder('libx264') && !CapTrim.hasEncoder('libopenh264')) {
+        return '跳过：本构建无软件 H.264 编码器（LGPL profile）';
+      }
       const engine = CapTrim.create();
       const src = `file://${filesDir}/a.mp4`;
       const dst = `${filesDir}/edited.mp4`;
@@ -504,7 +539,7 @@ export class SelfCheck {
         engine.exportTranscode(
           src, dst,
           'trim=duration=2,setpts=PTS-STARTPTS,scale=320:180,hflip,fps=15',
-          'libx264',
+          '',
           (v: number): boolean => { rawFrames.push(Math.round(v * 100)); return true; }
         );
         const stat = fs.statSync(dst);
@@ -545,6 +580,11 @@ export class SelfCheck {
     // Three-stage pipeline, software baseline. "hw:sw:" forces every stage to
     // FFmpeg but still exercises ct_pipeline_run(): decoder -> libavfilter ->
     // encoder vtables, per-frame ct_frame_t handoff, progress and flush.
+    // The encoder is whatever software encoder this build carries: an LGPL build
+    // has no H.264 one, and mpeg4 still exercises the same three stages end to
+    // end, so the profile difference stays visible instead of hiding the case.
+    const softCodec: string = SelfCheck.softwareEncoder();
+    const softH264: boolean = softCodec === 'libx264' || softCodec === 'libopenh264';
     SelfCheck.check(results, '三段式管线（软件基线 / 回退链路）', (): string => {
       const engine = CapTrim.create();
       const src = `file://${filesDir}/a.mp4`;
@@ -562,7 +602,7 @@ export class SelfCheck {
           // the UI thread, and a full 22s transcode makes the system's
           // ThreadBlock6S watchdog kill the app (verified on Mate 60).
           'trim=duration=2,setpts=PTS-STARTPTS,scale=320:180,hflip,fps=15',
-          'hw:sw:libx264',
+          `hw:sw:${softCodec}`,
           (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; }
         );
         const stat = fs.statSync(dst);
@@ -572,11 +612,12 @@ export class SelfCheck {
         const video = info.streams.find((s: StreamJson) => s.kind === 'video');
         expect(video !== undefined, '管线产物没有视频流');
         const outVideo: StreamJson = video!;
-        expect(outVideo.codec === 'h264', `编码器应为 h264，实际 ${outVideo.codec}`);
+        expect(outVideo.codec === (softH264 ? 'h264' : 'mpeg4'),
+          `编码器应为 ${softH264 ? 'h264' : 'mpeg4'}，实际 ${outVideo.codec}`);
         expect(outVideo.width === 320 && outVideo.height === 180,
           `分辨率应为 320x180，实际 ${outVideo.width}x${outVideo.height}`);
-        return `decode→filter→encode ${(stat.size / 1_000_000).toFixed(2)}MB ` +
-          `进度 ${ticks.length} 次`;
+        return `decode→filter→encode(${outVideo.codec} ${softCodec}) ` +
+          `${(stat.size / 1_000_000).toFixed(2)}MB 进度 ${ticks.length} 次`;
       } finally {
         engine.close();
       }
@@ -623,6 +664,12 @@ export class SelfCheck {
     const dst = `${filesDir}/burn.mp4`;
     const base = `${filesDir}/burn-base.mp4`;
     const workDir = `${filesDir}/burn`;
+    // Both worker tasks ask for '' (any software H.264 encoder). An LGPL build
+    // has none, so a burn would end in CAPTRIM_ERR_UNSUPPORTED; report it as a
+    // skip so the profile difference reads as a fact, not as a broken app.
+    if (!CapTrim.hasEncoder('libx264') && !CapTrim.hasEncoder('libopenh264')) {
+      return { name: name, pass: true, detail: '跳过：本构建无软件 H.264 编码器（LGPL profile）' };
+    }
     try {
       for (const path of [dst, base]) {
         try {
@@ -754,6 +801,11 @@ export class SelfCheck {
     const srcA = `file://${filesDir}/a.mp4`;
     const srcB = `file://${filesDir}/b.mp4`;
     const dst = `${filesDir}/timeline.mp4`;
+    // The worker asks for '' (any software H.264 encoder); an LGPL build has
+    // none and would fail with CAPTRIM_ERR_UNSUPPORTED here.
+    if (!CapTrim.hasEncoder('libx264') && !CapTrim.hasEncoder('libopenh264')) {
+      return { name: name, pass: true, detail: '跳过：本构建无软件 H.264 编码器（LGPL profile）' };
+    }
     try {
       try {
         fs.unlinkSync(dst);
@@ -869,6 +921,23 @@ export class SelfCheck {
     }
   }
 
+  /**
+   * The software encoder this build actually carries, for cases that must run
+   * on both licence profiles. GPL: libx264. LGPL: mpeg4 (the only software
+   * encoder left once --enable-gpl is gone). Never invent one: the pipeline
+   * test asks for a name the binary really has, so a profile without H.264
+   * still proves decode→filter→encode instead of skipping the whole stage.
+   */
+  private static softwareEncoder(): string {
+    if (CapTrim.hasEncoder('libx264')) {
+      return 'libx264';
+    }
+    if (CapTrim.hasEncoder('libopenh264')) {
+      return 'libopenh264';
+    }
+    return 'mpeg4';
+  }
+
   private static verifyDecodable(results: CheckResult[], filesDir: string,
                                  srcName: string): void {
     SelfCheck.check(results, `硬编产物可被 FFmpeg 软解（${srcName}）`, (): string => {
@@ -882,13 +951,14 @@ export class SelfCheck {
           // 首次运行产物不存在，忽略
         }
         const ticks: number[] = [];
+        const codec = SelfCheck.softwareEncoder();
         engine.exportTranscode(
-          `file://${src}`, dst, 'scale=64:64', 'libx264',
+          `file://${src}`, dst, 'scale=64:64', codec,
           (v: number): boolean => { ticks.push(Math.round(v * 100)); return true; }
         );
         expect(fs.statSync(dst).size > 0, '软解再编码产物为空');
         expect(ticks.length >= 2, `可解码帧数异常 (进度 ${ticks.length} 次)`);
-        return `FFmpeg 软解→重编码成功，进度 ${ticks.length} 次`;
+        return `FFmpeg 软解→重编码(${codec})成功，进度 ${ticks.length} 次`;
       } finally {
         engine.close();
       }

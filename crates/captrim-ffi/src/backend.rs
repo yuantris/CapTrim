@@ -41,6 +41,20 @@ pub trait MediaBackend: Send + Sync {
         dst_uri: &str,
         progress: &mut dyn FnMut(f32) -> bool,
     ) -> Result<()>;
+    /// Whether this FFmpeg build can encode with `encoder` (a libavcodec
+    /// encoder name such as `libx264`). The answer is per-build, not per-device:
+    /// the LGPL profile simply does not contain the GPL encoders.
+    fn encoder_available(&self, encoder: &str) -> bool;
+    /// Whether this FFmpeg build contains the named libavfilter filter.
+    ///
+    /// Two filters the effect vocabulary needs are GPL inside FFmpeg itself:
+    /// `eq` (brightness / contrast / saturation) and `boxblur` (blur). An LGPL
+    /// build therefore has no colour grading and no blur, even though every
+    /// other filter the compiler emits is present. The stub backend answers
+    /// `true` — it cannot render anything, and its callers are type checks.
+    fn filter_available(&self, _filter: &str) -> bool {
+        true
+    }
 }
 
 pub struct StubBackend;
@@ -90,6 +104,10 @@ impl MediaBackend for StubBackend {
             "build captrim-ffi with --features ffmpeg and ship libcaptrim_ffmpeg.so".into(),
         ))
     }
+
+    fn encoder_available(&self, _encoder: &str) -> bool {
+        false
+    }
 }
 
 pub fn default_backend() -> Arc<dyn MediaBackend> {
@@ -137,6 +155,8 @@ mod ffmpeg {
             out_error: *mut *mut c_char,
         ) -> c_int;
         fn ct_ff_string_free(s: *mut c_char);
+        fn ct_ff_encoder_available(name: *const c_char) -> c_int;
+        fn ct_ff_filter_available(name: *const c_char) -> c_int;
         fn ct_ff_export_graph(
             src_uris: *const *const c_char,
             src_count: c_int,
@@ -307,6 +327,26 @@ mod ffmpeg {
                 return Err(map_status(status, message));
             }
             Ok(())
+        }
+
+        fn encoder_available(&self, encoder: &str) -> bool {
+            // The C shim answers from avcodec_find_encoder_by_name, so this is
+            // the truth of what the shipped FFmpeg actually contains, not a
+            // guess from the licence profile.
+            match cs(encoder) {
+                Ok(name) => unsafe { ct_ff_encoder_available(name.as_ptr()) == 1 },
+                Err(_) => false,
+            }
+        }
+
+        fn filter_available(&self, filter: &str) -> bool {
+            // Same reasoning as encoder_available: ask libavfilter, do not infer
+            // from the profile. `eq` / `boxblur` are compiled out of an LGPL
+            // build by FFmpeg's own configure (they are GPL filters).
+            match cs(filter) {
+                Ok(name) => unsafe { ct_ff_filter_available(name.as_ptr()) == 1 },
+                Err(_) => false,
+            }
         }
     }
 }

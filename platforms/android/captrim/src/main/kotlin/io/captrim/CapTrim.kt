@@ -75,6 +75,8 @@ object CapTrimNative {
     external fun nativeVersion(): String
     external fun nativeCodeMessage(code: Int): String
     external fun nativeLastError(): String
+    external fun nativeEncoders(): String
+    external fun nativeEncoderAvailable(name: String): Boolean
 
     external fun nativePlanFrameAt(handle: Long, frameIndex: Long): String
     external fun nativePlanFrame(handle: Long, tUs: Long): String
@@ -120,6 +122,23 @@ class CapTrim private constructor(private var handle: Long) : AutoCloseable {
 
         @JvmStatic
         fun lastError(): String = CapTrimNative.nativeLastError()
+
+        /**
+         * Software encoders this FFmpeg build ships, comma separated, e.g.
+         * "libx264,libx264rgb,libx265,mpeg4".
+         *
+         * The SDK is built in two licence profiles: a GPL one with libx264 /
+         * libx265, and an LGPL one without them (which is the one a
+         * closed-source app may distribute). Everything else is identical, so
+         * an encoder picker should be built from this list rather than from a
+         * hardcoded assumption.
+         */
+        @JvmStatic
+        val encoders: String get() = CapTrimNative.nativeEncoders()
+
+        /** Whether [name] (e.g. "libx264") exists in this build. */
+        @JvmStatic
+        fun hasEncoder(name: String): Boolean = CapTrimNative.nativeEncoderAvailable(name)
 
         /**
          * Translate an ExportVideoItem.effects list into the FFmpeg filter_desc

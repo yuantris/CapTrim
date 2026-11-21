@@ -15,6 +15,11 @@ pub enum Error {
     Encode(String),
     Cancelled,
     Internal(String),
+    /// The request is well-formed but this build cannot do it: an encoder the
+    /// licence profile left out, a filter the device FFmpeg was not configured
+    /// with. Distinct from [`Error::Encode`] so an app can tell "your timeline is
+    /// broken" from "this build does not ship that encoder".
+    Unsupported(String),
 }
 
 impl Error {
@@ -29,6 +34,7 @@ impl Error {
             Error::Encode(_) => -7,
             Error::Cancelled => -8,
             Error::Internal(_) => -9,
+            Error::Unsupported(_) => -11,
         }
     }
 
@@ -55,6 +61,7 @@ impl fmt::Display for Error {
             Error::Encode(m) => write!(f, "encode error: {m}"),
             Error::Cancelled => write!(f, "cancelled"),
             Error::Internal(m) => write!(f, "internal error: {m}"),
+            Error::Unsupported(m) => write!(f, "unsupported by this build: {m}"),
         }
     }
 }
@@ -85,6 +92,7 @@ pub fn code_message(code: i32) -> &'static str {
         -8 => "cancelled",
         -9 => "internal error",
         -10 => "panic caught at FFI boundary",
+        -11 => "unsupported by this build",
         _ => "unknown error",
     }
 }

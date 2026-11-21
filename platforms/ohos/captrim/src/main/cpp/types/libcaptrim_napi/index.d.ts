@@ -14,6 +14,10 @@ export interface StringResult extends CodeResult {
   value: string;
 }
 
+export interface BoolResult extends CodeResult {
+  value: boolean;
+}
+
 /** A microsecond value: a timeline position, or a drift correction. */
 export interface I64Result extends CodeResult {
   value_us: number;
@@ -84,6 +88,15 @@ export const exportTimeline: (
 export const version: () => StringResult;
 export const codeMessage: (code: number) => StringResult;
 export const lastErrorMessage: () => StringResult;
+
+/**
+ * Software encoders this FFmpeg build ships, comma separated. The GPL profile
+ * has libx264/libx265; the LGPL profile (the one a closed-source app may
+ * distribute) has neither, so build an encoder picker from this list.
+ */
+export const encoders: () => StringResult;
+/** Whether the named encoder (e.g. "libx264") exists in this build. */
+export const encoderAvailable: (name: string) => BoolResult;
 
 /** Plan one frame by index: the export path. Returns a FramePlan JSON. */
 export const planFrameAt: (handle: number, frameIndex: number) => StringResult;

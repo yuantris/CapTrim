@@ -109,6 +109,36 @@ fn filter_part(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The FFmpeg filter that implements one effect.
+///
+/// This is what makes the licence profile visible to the caller: `eq` and
+/// `boxblur` are **GPL filters inside FFmpeg itself** (`eq_filter_deps="gpl"`,
+/// `boxblur_filter_deps="gpl"` in FFmpeg's configure), so an LGPL build has no
+/// brightness / contrast / saturation / blur at all. `hflip`, `vflip`,
+/// `hue` and `negate` are LGPL and survive. Without this look-up the four
+/// effects would fail deep inside `avfilter_graph_parse_ptr` with a bare
+/// "No such filter" long after the export started.
+pub fn ffmpeg_filter(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "hflip" => "hflip",
+        "vflip" => "vflip",
+        "brightness" | "contrast" | "saturation" => "eq",
+        "grayscale" => "hue",
+        "invert" => "negate",
+        "blur" => "boxblur",
+        _ => return None,
+    })
+}
+
+/// Effects this build can actually render, in canonical order.
+pub fn available_effects(is_filter_available: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
+    CANONICAL_ORDER
+        .iter()
+        .copied()
+        .filter(|name| ffmpeg_filter(name).map(is_filter_available) == Some(true))
+        .collect()
+}
+
 /// Translate a clip's effect list into an FFmpeg filter chain for
 /// `ct_ff_transcode`'s `filter_desc`, emitted in [`CANONICAL_ORDER`] with
 /// duplicates collapsed. Returns an empty string when there is nothing to
@@ -118,9 +148,36 @@ fn filter_part(name: &str) -> Option<&'static str> {
 /// already rejects them at edit time, so reaching this function with one
 /// means a caller bypassed the model.
 pub fn effects_to_filter_desc(effects: &[String]) -> Result<String> {
+    effects_to_filter_desc_with(effects, &|_| true)
+}
+
+/// [`effects_to_filter_desc`] against a build whose filter set is known.
+///
+/// An effect whose FFmpeg filter is absent returns [`Error::Unsupported`]
+/// naming both the effect and the filter, plus the effects that do work, so an
+/// app can offer only what this build can render instead of failing mid-export.
+/// A build missing `eq` (LGPL profile) therefore loses brightness, contrast and
+/// saturation — a real loss, reported as one.
+pub fn effects_to_filter_desc_with(
+    effects: &[String],
+    is_filter_available: &dyn Fn(&str) -> bool,
+) -> Result<String> {
     for name in effects {
         if !is_known_effect(name) {
             return Err(Error::invalid(format!("unknown effect: {name}")));
+        }
+        let filter = ffmpeg_filter(name).expect("known effects all have a filter");
+        if !is_filter_available(filter) {
+            let usable = available_effects(is_filter_available);
+            return Err(Error::Unsupported(format!(
+                "effect '{name}' needs the FFmpeg '{filter}' filter, which is GPL-only \
+                 and absent from this build; available effects: {}",
+                if usable.is_empty() {
+                    "none".to_string()
+                } else {
+                    usable.join(",")
+                }
+            )));
         }
     }
     let mut parts: Vec<&'static str> = Vec::new();
@@ -196,5 +253,58 @@ mod tests {
         let mask = effects_mask(&names(&["blur", "hflip", "blur", "invert"]));
         assert_eq!(mask, EFFECT_HFLIP | EFFECT_INVERT | EFFECT_BLUR);
         assert_eq!(effects_mask(&[]), 0);
+    }
+
+    #[test]
+    fn every_canonical_name_names_the_filter_it_needs() {
+        for name in CANONICAL_ORDER {
+            assert!(ffmpeg_filter(name).is_some(), "{name} must name a filter");
+        }
+        assert_eq!(ffmpeg_filter("blur"), Some("boxblur"));
+        assert_eq!(ffmpeg_filter("brightness"), Some("eq"));
+        assert_eq!(ffmpeg_filter("sepia"), None);
+    }
+
+    /// The LGPL profile is built without FFmpeg's GPL filters (`eq`, `boxblur`).
+    /// Those four effects must say so by name instead of producing a graph that
+    /// libavfilter rejects later with "No such filter".
+    #[test]
+    fn gpl_only_filters_make_the_effect_unsupported() {
+        // Filters an LGPL build still has; `eq` and `boxblur` are missing.
+        let lgpl = |filter: &str| !matches!(filter, "eq" | "boxblur");
+        assert_eq!(
+            available_effects(&lgpl),
+            vec!["hflip", "vflip", "grayscale", "invert"]
+        );
+
+        let err = effects_to_filter_desc_with(&names(&["brightness"]), &lgpl).unwrap_err();
+        assert!(err.to_string().contains("brightness"), "{err}");
+        assert!(err.to_string().contains("eq"), "{err}");
+        assert_eq!(err.code(), -11);
+
+        let err = effects_to_filter_desc_with(&names(&["blur"]), &lgpl).unwrap_err();
+        assert!(err.to_string().contains("boxblur"), "{err}");
+
+        // Everything LGPL keeps still translates; the same chain the GPL build
+        // emits, minus the two GPL parts.
+        assert_eq!(
+            effects_to_filter_desc_with(&names(&["grayscale", "hflip"]), &lgpl).unwrap(),
+            "hflip,hue=s=0"
+        );
+    }
+
+    /// A full GPL build must produce exactly the historical chain: the
+    /// availability check may not change a single byte of what export emits.
+    #[test]
+    fn gpl_build_chain_is_unchanged() {
+        let gpl = |_: &str| true;
+        assert_eq!(
+            effects_to_filter_desc_with(
+                &names(&["blur", "grayscale", "hflip", "brightness"]),
+                &gpl
+            )
+            .unwrap(),
+            "hflip,eq=brightness=0.15,hue=s=0,boxblur=2:1"
+        );
     }
 }

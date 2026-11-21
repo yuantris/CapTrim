@@ -5,6 +5,7 @@
 
 pub mod clock;
 pub mod effects;
+pub mod encoders;
 pub mod error;
 pub mod export;
 pub mod export_graph;
@@ -20,9 +21,10 @@ pub mod timeline;
 
 pub use clock::PlaybackClock;
 pub use effects::{
-    effects_mask, effects_to_filter_desc, is_known_effect, CANONICAL_ORDER, EFFECT_BLUR,
-    EFFECT_BRIGHTNESS, EFFECT_CONTRAST, EFFECT_GRAYSCALE, EFFECT_HFLIP, EFFECT_INVERT,
-    EFFECT_SATURATION, EFFECT_VFLIP,
+    available_effects, effects_mask, effects_to_filter_desc, effects_to_filter_desc_with,
+    ffmpeg_filter, is_known_effect, CANONICAL_ORDER, EFFECT_BLUR, EFFECT_BRIGHTNESS,
+    EFFECT_CONTRAST, EFFECT_GRAYSCALE, EFFECT_HFLIP, EFFECT_INVERT, EFFECT_SATURATION,
+    EFFECT_VFLIP,
 };
 pub use error::{code_message, Error, Result};
 pub use export::{

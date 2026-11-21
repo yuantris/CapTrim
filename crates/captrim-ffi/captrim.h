@@ -30,6 +30,9 @@ extern "C" {
 #define CAPTRIM_ERR_CANCELLED     (-8)
 #define CAPTRIM_ERR_INTERNAL      (-9)
 #define CAPTRIM_ERR_PANIC         (-10)
+/* Well-formed request, but this build cannot do it: an encoder the licence
+ * profile left out, a filter the device FFmpeg was not configured with. */
+#define CAPTRIM_ERR_UNSUPPORTED   (-11)
 
 typedef struct captrim_engine captrim_engine_t;
 
@@ -156,6 +159,18 @@ int32_t captrim_engine_export_plan(captrim_engine_t *engine, char **out_json);
  * it with captrim_string_free(). Invalid JSON or an unknown name is an error. */
 int32_t captrim_effects_to_filter_desc(const char *effects_json,
                                        char **out_desc);
+
+/* Encoder capability of the shipped FFmpeg build. The SDK is built in a GPL
+ * profile (libx264 / libx265 present) and an LGPL profile (both absent, which
+ * is what a closed-source app can distribute); everything else is identical.
+ * Captrim resolves an empty `video_codec` to an encoder this build actually
+ * has, and refuses an unavailable one with CAPTRIM_ERR_UNSUPPORTED before any
+ * decoding starts. An app should read these two calls to build its encoder
+ * picker instead of offering encoders that will fail. */
+int32_t captrim_encoder_available(const char *name);
+/* Comma-separated list of the software encoders this build ships, e.g.
+ * "libx264,libx264rgb,libx265,mpeg4"; release with captrim_string_free(). */
+int32_t captrim_encoders(char **out);
 
 /* Timeline length. Either out pointer may be NULL. */
 int32_t captrim_engine_duration(captrim_engine_t *engine,

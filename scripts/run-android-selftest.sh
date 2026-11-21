@@ -15,7 +15,13 @@ esac
 
 CC="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/${HOST_TAG}/bin/aarch64-linux-android26-clang"
 [ -x "$CC" ] || CC="${CC}.cmd"
-DIST="$ROOT/dist/android/arm64-v8a"
+LICENSE_SUFFIX=""
+case "${CAPTRIM_LICENSE:-gpl}" in
+    lgpl) LICENSE_SUFFIX="-lgpl" ;;
+    gpl) ;;
+    *) echo "CAPTRIM_LICENSE must be 'gpl' or 'lgpl'" >&2; exit 1 ;;
+esac
+DIST="$ROOT/dist/android${LICENSE_SUFFIX}/arm64-v8a"
 SAMPLE="${1:-$ROOT/platforms/ohos/entry/src/main/resources/rawfile/sample.mp4}"
 DEVICE_DIR=/data/local/tmp/captrim-selftest
 

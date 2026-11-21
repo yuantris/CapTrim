@@ -111,6 +111,40 @@ static void ct_free(char *s) { free(s); }
 
 void ct_ff_string_free(char *s) { ct_free(s); }
 
+/* Licence-profile capability probe. The LGPL build simply does not contain
+ * libx264 / libx265, and the SDK must be able to say so before a timeline is
+ * compiled rather than failing deep inside the encoder open. Asking libavcodec
+ * directly means the answer tracks the shipped binaries, not a build flag. */
+int32_t ct_ff_encoder_available(const char *name) {
+    if (!name || !*name) return 0;
+    return avcodec_find_encoder_by_name(name) != NULL ? 1 : 0;
+}
+
+/* Same probe for libavfilter. Two filters the effect vocabulary translates to
+ * are GPL *inside FFmpeg* (`eq_filter_deps="gpl"`, `boxblur_filter_deps="gpl"`
+ * in configure), so an LGPL build has no colour grading and no blur. Asking
+ * libavfilter keeps that answer tied to the shipped libavfilter.so instead of
+ * a duplicated table of which filters are GPL. */
+int32_t ct_ff_filter_available(const char *name) {
+    if (!name || !*name) return 0;
+    return avfilter_get_by_name(name) != NULL ? 1 : 0;
+}
+
+/* The software encoder to use when a caller asks for "any" (empty name), or
+ * when the pipeline spec leaves its last field empty. Preference order matches
+ * crates/captrim-core/src/encoders.rs, but the answer comes from the shipped
+ * libavcodec: a GPL build gets libx264, an LGPL build gets mpeg4 instead of
+ * dying on a hard-coded libx264 it was never built with. Returns NULL only if
+ * the build somehow carries none of them. */
+const char *ct_sw_encoder_default(void) {
+    static const char *candidates[] = {"libx264", "libopenh264", "mpeg4"};
+    size_t i;
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        if (avcodec_find_encoder_by_name(candidates[i])) return candidates[i];
+    }
+    return NULL;
+}
+
 void ct_set_error(char **out_error, const char *fmt, ...) {
     if (!out_error) return;
     *out_error = NULL;
@@ -739,7 +773,11 @@ int32_t ct_ff_transcode(const char *src_uri, const char *dst_uri,
             if (spec[0] == 's') force_sw = 1; else force_async = 1;
             spec += 3;
         }
-        const char *fallback = *spec ? spec : "libx264";
+        const char *fallback = *spec ? spec : ct_sw_encoder_default();
+        if (!fallback) {
+            ct_set_error(out_error, "this build has no software video encoder at all");
+            return CT_ERR_ENCODE;
+        }
 
         ct_pipeline_report_t report;
         memset(&report, 0, sizeof(report));
@@ -766,7 +804,11 @@ int32_t ct_ff_transcode(const char *src_uri, const char *dst_uri,
     AVPacket *pkt = NULL;
     int32_t status = CT_OK;
     int ret;
-    const char *codec_name = (video_codec && *video_codec) ? video_codec : "libx264";
+    const char *codec_name = (video_codec && *video_codec) ? video_codec : ct_sw_encoder_default();
+    if (!codec_name) {
+        ct_set_error(out_error, "this build has no software video encoder at all");
+        return CT_ERR_ENCODE;
+    }
 
     ret = avformat_open_input(&t.in, src_uri, NULL, NULL);
     if (ret < 0) {

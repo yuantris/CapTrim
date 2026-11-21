@@ -15,6 +15,20 @@ cd "$ROOT_DIR"
 log() { printf '[captrim] %s\n' "$*"; }
 die() { printf '[captrim][error] %s\n' "$*" >&2; exit 1; }
 
+# Licence profile of the FFmpeg libraries this build links against. It only
+# selects WHERE they are read from: build-ffmpeg-*.sh writes the GPL profile to
+# dist/<plat>/<abi> and the LGPL profile to dist/<plat>-lgpl/<abi>, so the two
+# can coexist and a licence build never overwrites the other. The staged
+# platform package is shared either way (gradle/hvigor read exactly one path),
+# so whatever you built last is what ships.
+CAPTRIM_LICENSE="${CAPTRIM_LICENSE:-gpl}"
+case "$CAPTRIM_LICENSE" in
+    gpl)  LICENSE_SUFFIX="" ;;
+    lgpl) LICENSE_SUFFIX="-lgpl" ;;
+    *) die "CAPTRIM_LICENSE must be 'gpl' or 'lgpl' (got '$CAPTRIM_LICENSE')" ;;
+esac
+log "licence profile: ${CAPTRIM_LICENSE}"
+
 # On Windows / Git-Bash the NDK clang.exe is a *native* Windows binary and does
 # not understand MSYS-style paths like /c/Users/... (it would look for
 # C:\c\Users\... and never find libcaptrim_ffmpeg.so). Convert a path to a
@@ -101,13 +115,13 @@ for ABI in $ABIS; do
         else
             LINKER="${LINKER_BASE}"
         fi
-        NATIVE_DIR="${ROOT_DIR}/dist/android/${ABI}"
+        NATIVE_DIR="${ROOT_DIR}/dist/android${LICENSE_SUFFIX}/${ABI}"
         STAGE_DIR="${ROOT_DIR}/platforms/android/captrim/src/main/jniLibs/${ABI}"
     else
         [ -n "${OHOS_NDK_HOME:-}" ] || die "OHOS_NDK_HOME is not set"
         export OHOS_NDK_HOME
         LINKER="${ROOT_DIR}/scripts/toolchain/${WRAPPER}${WRAPPER_EXT}"
-        NATIVE_DIR="${ROOT_DIR}/dist/ohos/${ABI}"
+        NATIVE_DIR="${ROOT_DIR}/dist/ohos${LICENSE_SUFFIX}/${ABI}"
         STAGE_DIR="${ROOT_DIR}/platforms/ohos/captrim/libs/${ABI}"
     fi
 
@@ -119,6 +133,18 @@ for ABI in $ABIS; do
     if [ -n "$FEATURES" ]; then
         [ -f "${NATIVE_DIR}/libcaptrim_ffmpeg.so" ] || \
             die "run build-ffmpeg-${PLATFORM}.sh first, or set FEATURES= to build the stub backend (missing ${NATIVE_DIR}/libcaptrim_ffmpeg.so)"
+        # native/*.c and native/*.h are compiled into libcaptrim_ffmpeg.so by
+        # build-ffmpeg-<platform>.sh. Editing them without re-running that
+        # script ships a stale shim; the Rust lib then references a symbol the
+        # prebuilt .so never exported, and the app dies at dlopen with a
+        # misleading "module does not provide an export 'version'" SyntaxError.
+        # Fail here instead, with the one command that fixes it.
+        for src in "${ROOT_DIR}"/native/*.c "${ROOT_DIR}"/native/*.h; do
+            [ -e "$src" ] || continue
+            if [ "$src" -nt "${NATIVE_DIR}/libcaptrim_ffmpeg.so" ]; then
+                die "$(basename "$src") is newer than ${NATIVE_DIR}/libcaptrim_ffmpeg.so; the C shim is stale. Re-run: CAPTRIM_LICENSE=${CAPTRIM_LICENSE} bash scripts/build-ffmpeg-${PLATFORM}.sh (or the ~1 min relink: CAPTRIM_LICENSE=${CAPTRIM_LICENSE} bash scripts/relink-cshim.sh ${PLATFORM})"
+            fi
+        done
     fi
 
     LINKER_VAR="CARGO_TARGET_$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"

@@ -290,6 +290,21 @@ jstring nativeCodeMessage(JNIEnv *env, jobject, jint code) {
     return staticString(env, captrim_code_message(static_cast<int32_t>(code)));
 }
 
+// Software encoders this build ships. The GPL profile has libx264/libx265, the
+// LGPL profile deliberately does not, so an app asks instead of guessing which
+// codec string will work on the device it happens to be running on.
+jstring nativeEncoders(JNIEnv *env, jobject) {
+    char *names = nullptr;
+    int32_t code = captrim_encoders(&names);
+    return planResult(env, code, names);
+}
+
+jboolean nativeEncoderAvailable(JNIEnv *env, jobject, jstring name) {
+    Utf8 text(env, name);
+    if (!text.get()) return JNI_FALSE;
+    return captrim_encoder_available(text.get()) == 1 ? JNI_TRUE : JNI_FALSE;
+}
+
 jstring nativeLastError(JNIEnv *env, jobject) {
     return staticString(env, captrim_last_error_message());
 }
@@ -425,6 +440,9 @@ JNINativeMethod kMethods[] = {
      reinterpret_cast<void *>(nativeExportTimeline)},
     {"nativeVersion", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeVersion)},
     {"nativeCodeMessage", "(I)Ljava/lang/String;", reinterpret_cast<void *>(nativeCodeMessage)},
+    {"nativeEncoders", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeEncoders)},
+    {"nativeEncoderAvailable", "(Ljava/lang/String;)Z",
+     reinterpret_cast<void *>(nativeEncoderAvailable)},
     {"nativeLastError", "()Ljava/lang/String;", reinterpret_cast<void *>(nativeLastError)},
     {"nativePlanFrameAt", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrameAt)},
     {"nativePlanFrame", "(JJ)Ljava/lang/String;", reinterpret_cast<void *>(nativePlanFrame)},

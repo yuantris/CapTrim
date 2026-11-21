@@ -15,6 +15,8 @@ import {
   version as nativeVersion,
   codeMessage as nativeCodeMessage,
   lastErrorMessage,
+  encoders as nativeEncoders,
+  encoderAvailable as nativeEncoderAvailable,
   planFrameAt as nativePlanFrameAt,
   planFrame as nativePlanFrame,
   exportPlan as nativeExportPlan,
@@ -37,6 +39,7 @@ import {
   presentRelease
 } from 'libcaptrim_napi.so';
 import type {
+  BoolResult,
   CodeResult,
   DurationResult,
   HandleResult,
@@ -215,6 +218,28 @@ export class CapTrim {
 
   static codeMessage(code: number): string {
     return nativeCodeMessage(code).value;
+  }
+
+  /**
+   * Software encoders this FFmpeg build ships, comma separated, e.g.
+   * "libx264,libx264rgb,libx265,mpeg4".
+   *
+   * The SDK ships in two licence profiles: GPL (libx264/libx265) and LGPL
+   * (neither, which is what a closed-source app may distribute). Everything
+   * else is identical, so build an encoder picker from this list instead of
+   * hardcoding a codec that only one of the profiles can encode.
+   */
+  static encoders(): string {
+    const result: StringResult = nativeEncoders();
+    CapTrim.checkStatus(result.code);
+    return result.value;
+  }
+
+  /** Whether the named encoder (e.g. "libx264") exists in this build. */
+  static hasEncoder(name: string): boolean {
+    const result: BoolResult = nativeEncoderAvailable(name);
+    CapTrim.checkStatus(result.code);
+    return result.value;
   }
 
   /**

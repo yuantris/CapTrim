@@ -9,6 +9,10 @@
  * HarmonyOS only, captrim_ohos_hw.c.
  */
 #include "captrim_pipeline.h"
+/* ct_sw_encoder_default(): the same "which software encoder does this build
+ * actually carry" answer the FFmpeg shim uses, so the pipeline never names an
+ * encoder the linked libavcodec does not contain. */
+#include "captrim_ffmpeg.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -533,7 +537,11 @@ static int32_t swenc_open(ct_encoder_t *self, const ct_frame_t *first,
     self->ctx = c;
     c->dst_uri = ctp_strdup(dst_uri);
 
-    const char *codec_name = (video_codec && *video_codec) ? video_codec : "libx264";
+    const char *codec_name = (video_codec && *video_codec) ? video_codec : ct_sw_encoder_default();
+    if (!codec_name) {
+        ctp_set_error(out_error, "this build has no software video encoder at all");
+        return CT_ERR_ENCODE;
+    }
     const AVCodec *codec = avcodec_find_encoder_by_name(codec_name);
     if (!codec) {
         ctp_set_error(out_error, "encoder not available: %s", codec_name);

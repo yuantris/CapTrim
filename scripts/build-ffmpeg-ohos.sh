@@ -145,9 +145,8 @@ for ABI in $ABIS; do
     # linked from its llvm/lib). (Set FFMPEG_EXTRA_LIBS to override.)
     FFMPEG_EXTRA_LIBS="${FFMPEG_EXTRA_LIBS:--lc++ -lc++abi -lm}"
 
-    BUILD="${ROOT_DIR}/build/ffmpeg-ohos/${ABI}"
+    read -r BUILD OUT <<< "$(license_dirs ohos "$ABI")"
     PREFIX="${BUILD}/prefix"
-    OUT="${ROOT_DIR}/dist/ohos/${ABI}"
     # Always start the FFmpeg build tree from scratch. Enabling new filters in
     # a reconfigure updates config.mak + filter_list.c and compiles the new
     # vf_*.o, but make's incremental rule can judge an existing libavfilter.so

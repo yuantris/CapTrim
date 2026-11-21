@@ -38,12 +38,12 @@ export function burnTask(draftJson: string, srcUri: string, dstUri: string, base
   const engine: CapTrim = CapTrim.create(draftJson);
   try {
     let ticks: number = 0;
-    engine.exportBurnSubtitles(srcUri, dstUri, prefix, 'fps=15', workDir, 'libx264',
+    engine.exportBurnSubtitles(srcUri, dstUri, prefix, 'fps=15', workDir, '',
       (value: number): boolean => {
         ticks++;
         return true;
       });
-    engine.exportTranscode(srcUri, baseUri, `${prefix},fps=15`, 'libx264',
+    engine.exportTranscode(srcUri, baseUri, `${prefix},fps=15`, '',
       (value: number): boolean => true);
     const result: BurnResult = {
       ticks: ticks,
@@ -66,7 +66,7 @@ export function exportTimelineTask(draftJson: string, dstUri: string, workDir: s
     let last: number = 0;
     // `workDir` is where the core rasterises caption and sticker bitmaps for
     // this export; it is the same sandbox directory the burn check uses.
-    engine.exportTimeline(dstUri, workDir, 'libx264', 22, 'veryfast', 160,
+    engine.exportTimeline(dstUri, workDir, '', 22, 'veryfast', 160,
       (value: number): boolean => {
         ticks++;
         last = value;

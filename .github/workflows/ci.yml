@@ -46,6 +46,13 @@ jobs:
       - name: ABI / NAPI contract
         run: bash scripts/check-native-abi.sh
 
+      # Licence profiles are decided in one file (scripts/ffmpeg-config-common.sh)
+      # and cost 10 minutes per ABI to verify by rebuilding. This asserts the
+      # GPL/LGPL split statically: no --enable-gpl outside the common file, no
+      # libx264/libx265 in the LGPL configure line, separate artifact trees.
+      - name: Licence profiles
+        run: bash scripts/check-license-profile.sh
+
       # `cargo check` type-checks against the HarmonyOS std without invoking a
       # linker, so this needs no DevEco NDK and still catches the mistakes that
       # actually break the cross build (unsupported platform APIs, bad cfg).

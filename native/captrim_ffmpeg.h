@@ -69,6 +69,24 @@ int32_t ct_ff_export_graph(const char *const *src_uris, int32_t src_count,
 
 void ct_ff_string_free(char *s);
 
+/* 1 when this FFmpeg build contains the named encoder (libx264 / libx265 /
+ * mpeg4 ...), 0 otherwise. The LGPL profile deliberately lacks the GPL
+ * encoders; asking libavcodec keeps the answer tied to the shipped binaries. */
+int32_t ct_ff_encoder_available(const char *name);
+
+/* 1 when this FFmpeg build contains the named libavfilter filter, 0 otherwise.
+ * `eq` and `boxblur` are GPL filters inside FFmpeg itself, so they are absent
+ * from the LGPL profile together with the software encoders; the SDK reports
+ * that per effect instead of emitting a graph libavfilter will reject. */
+int32_t ct_ff_filter_available(const char *name);
+
+/* The software encoder to use when the caller asks for "any" (empty name) or
+ * when the pipeline spec has an empty encoder field: libx264 -> libopenh264 ->
+ * mpeg4, decided by what the shipped libavcodec actually contains. Never NULL
+ * for a normal build; a build with none returns NULL and the caller fails with
+ * a clear error instead of naming an encoder it does not have. */
+const char *ct_sw_encoder_default(void);
+
 #ifdef __cplusplus
 }
 #endif

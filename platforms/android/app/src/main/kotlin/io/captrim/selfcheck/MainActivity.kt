@@ -287,6 +287,18 @@ private class Runner(private val filesDir: String) {
             "libcaptrim $version"
         }
 
+        // Which licence profile this build is: the GPL one carries libx264 /
+        // libx265, the LGPL one (the only one a closed-source SDK may ship)
+        // carries neither and must say so rather than fail at encode time.
+        check("软件编码器清单（许可 profile 自报）") {
+            val encoders = CapTrim.encoders
+            expect(encoders.isNotEmpty(), "encoders() 为空：FFmpeg 构建没有任何软件编码器")
+            val x264 = CapTrim.hasEncoder("libx264")
+            val x265 = CapTrim.hasEncoder("libx265")
+            val profile = if (x264 || x265) "GPL" else "LGPL"
+            "$profile profile，可用: $encoders"
+        }
+
         check("时间线构建（2 轨 3 片段）") {
             Fixture().use { fx ->
                 expect(fx.clipCount() == 3, "片段数应为 3，实际 ${fx.clipCount()}")
@@ -444,12 +456,26 @@ private class Runner(private val filesDir: String) {
         }
 
         check("滤镜 v1（effect 位 + filter_desc 翻译）") {
-            val desc = CapTrim.effectsToFilterDesc("blur", "invert", "hflip")
-            expect(desc == "hflip,negate,boxblur=2:1",
-                "canonical order 翻译错误：$desc")
+            // boxblur / eq are GPL filters *inside* FFmpeg, so an LGPL build
+            // must answer -11 naming the effect rather than hand back a chain
+            // libavfilter cannot parse. Same ABI, same call, profile-dependent
+            // answer — which is exactly what the capability table is for.
+            val base = CapTrim.effectsToFilterDesc("invert", "hflip")
+            expect(base == "hflip,negate", "canonical order 翻译错误：$base")
             val empty = CapTrim.effectsToFilterDesc()
             expect(empty.isEmpty(), "空 effects 应翻译为空串，实际 \"$empty\"")
-            "blur/invert/hflip → $desc；空数组 → 空串"
+
+            var chain = "unsupported"
+            try {
+                chain = CapTrim.effectsToFilterDesc("blur", "invert", "hflip")
+                expect(chain == "hflip,negate,boxblur=2:1",
+                    "canonical order 翻译错误：$chain")
+            } catch (e: CapTrimException) {
+                expect(e.code == -11, "缺少 boxblur 时应报 -11，实际 ${e.code}: ${e.message}")
+                expect(e.message!!.contains("blur") && e.message!!.contains("available effects"),
+                    "错误信息应点名 effect 与可用项，实际 \"${e.message}\"")
+            }
+            "hflip,negate 恒定；blur → $chain"
         }
 
         check("字幕与贴图数据层（图层种类 + 草稿往返）") {
@@ -507,7 +533,7 @@ private class Runner(private val filesDir: String) {
                     "pad=540:960:(ow-iw)/2:(oh-ih)/2"
                 val ticks = mutableListOf<Float>()
                 engine.exportBurnSubtitles(
-                    src(), dst, prefix, "fps=15", workDir.absolutePath, "libx264",
+                    src(), dst, prefix, "fps=15", workDir.absolutePath, "",
                     ProgressCallback { v -> ticks.add(v); true },
                 )
                 val burned = File(dst).length()
@@ -515,7 +541,7 @@ private class Runner(private val filesDir: String) {
 
                 // Same picture pipeline without the layers: if the overlays did
                 // anything the encoded result cannot match.
-                engine.exportTranscode(src(), base, "$prefix,fps=15", "libx264",
+                engine.exportTranscode(src(), base, "$prefix,fps=15", "",
                     ProgressCallback { _ -> true })
                 val plain = File(base).length()
                 expect(plain > 0, "基线产物为空")
@@ -653,7 +679,12 @@ private class Runner(private val filesDir: String) {
             }
         }
 
-        check("FFmpeg 复杂剪辑（滤镜+libx264重编码）") {
+        check("FFmpeg 复杂剪辑（滤镜+H.264 重编码）") {
+            // "" means "whatever software H.264 encoder this build has" (libx264
+            // in the GPL profile). An LGPL profile has none, so say so up front.
+            if (!CapTrim.hasEncoder("libx264") && !CapTrim.hasEncoder("libopenh264")) {
+                return@check "跳过：本构建无软件 H.264 编码器（LGPL profile）"
+            }
             CapTrim.create().use { engine ->
                 val dst = "$filesDir/edited.mp4"
                 delete("edited.mp4")
@@ -664,7 +695,7 @@ private class Runner(private val filesDir: String) {
                 engine.exportTranscode(
                     src(), dst,
                     "trim=duration=2,setpts=PTS-STARTPTS,scale=320:180,hflip,fps=15",
-                    "libx264",
+                    "",
                     ProgressCallback { v -> ticks.add(v); true },
                 )
                 val stat = File(dst)
@@ -686,6 +717,9 @@ private class Runner(private val filesDir: String) {
         // Real x265: the loader-stub era could fake a green native self-check,
         // never a re-probed hevc bitstream.
         check("FFmpeg 复杂剪辑（libx265 HEVC）") {
+            // libx265 only exists in the GPL profile. The LGPL profile has to
+            // say so instead of failing, otherwise a licensed build looks broken.
+            if (!CapTrim.hasEncoder("libx265")) return@check "跳过：本构建无 libx265（LGPL profile）"
             CapTrim.create().use { engine ->
                 val dst = "$filesDir/x265.mp4"
                 delete("x265.mp4")
@@ -779,7 +813,7 @@ private class Runner(private val filesDir: String) {
                 val ticks = mutableListOf<Float>()
                 // Stills need a writable directory; the app's files dir has no
                 // character the filter graph cannot carry.
-                engine.exportTimeline(dst, filesDir, "libx264", 22, "veryfast", 160,
+                engine.exportTimeline(dst, filesDir, "", 22, "veryfast", 160,
                     ProgressCallback { v -> ticks.add(v); true })
                 val stat = File(dst)
                 expect(stat.length() > 0, "导出产物为空 (${stat.length()} bytes)")
@@ -812,8 +846,12 @@ private class Runner(private val filesDir: String) {
         }
 
         // ---- 三段式管线 ------------------------------------------------------
+        // The software baseline asks for whatever software encoder this build
+        // carries: an LGPL build has no H.264 one, and mpeg4 still drives the
+        // same decode→filter→encode stages, so the profile difference stays
+        // visible instead of silently skipping the whole stage.
         check("三段式管线（软件基线 / 回退链路）") {
-            pipelineRun("pipeline_sw.mp4", "hw:sw:libx264")
+            pipelineRun("pipeline_sw.mp4", "hw:sw:${softwareEncoder()}")
         }
 
         // "hw:" prefers the AMediaCodec stage-1/3 factories (captrim_android_hw.c)
@@ -824,21 +862,33 @@ private class Runner(private val filesDir: String) {
         }
 
         check("硬编产物可被 FFmpeg 软解（pipeline_hw.mp4）") {
+            val codec = softwareEncoder()
             CapTrim.create().use { engine ->
                 val dst = "$filesDir/verify.mp4"
                 delete("verify.mp4")
                 val ticks = mutableListOf<Float>()
                 engine.exportTranscode(
                     "file://$filesDir/pipeline_hw.mp4", dst,
-                    "scale=64:64", "libx264",
+                    "scale=64:64", codec,
                     ProgressCallback { v -> ticks.add(v); true },
                 )
                 val stat = File(dst)
                 expect(stat.length() > 0, "软解再编码产物为空")
                 expect(ticks.size >= 2, "可解码帧数异常 (进度 ${ticks.size} 次)")
-                "FFmpeg 软解→重编码成功，进度 ${ticks.size} 次"
+                "FFmpeg 软解→重编码($codec)成功，进度 ${ticks.size} 次"
             }
         }
+    }
+
+    /**
+     * The software encoder this build really carries, for cases that must run on
+     * both licence profiles. GPL: libx264. LGPL: mpeg4, the only software
+     * encoder left once --enable-gpl is gone.
+     */
+    private fun softwareEncoder(): String = when {
+        CapTrim.hasEncoder("libx264") -> "libx264"
+        CapTrim.hasEncoder("libopenh264") -> "libopenh264"
+        else -> "mpeg4"
     }
 
     private fun firstVideo(info: JSONObject): JSONObject {
@@ -865,8 +915,9 @@ private class Runner(private val filesDir: String) {
             expect(stat.length() > 0, "管线输出为空 (${stat.length()} bytes)")
             expect(ticks.isNotEmpty(), "管线进度回调未触发")
             val outVideo = firstVideo(JSONObject(engine.probe("file://$dst")))
-            expect(outVideo.getString("codec") == "h264",
-                "编码器应为 h264，实际 ${outVideo.getString("codec")}")
+            val expectH264 = codec.endsWith("libx264") || codec.endsWith("libopenh264")
+            expect(outVideo.getString("codec") == (if (expectH264) "h264" else "mpeg4"),
+                "编码器应为 ${if (expectH264) "h264" else "mpeg4"}，实际 ${outVideo.getString("codec")}")
             expect(outVideo.getInt("width") == 320 && outVideo.getInt("height") == 180,
                 "分辨率应为 320x180，实际 ${outVideo.getInt("width")}x${outVideo.getInt("height")}")
             "decode→filter→encode ${mb(stat.length())}MB " +
