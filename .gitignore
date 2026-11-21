@@ -69,3 +69,5 @@ Thumbs.db
 
 # Gradle build log written by scripts/run-android-app-selftest.sh
 /platforms/android/build-app.log
+# Kotlin incremental-compile cache written by AGP
+/platforms/android/.kotlin/

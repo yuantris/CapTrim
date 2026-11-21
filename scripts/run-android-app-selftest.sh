@@ -29,7 +29,12 @@ done
 # Locate the Android SDK: prefer explicit vars, else derive from the NDK path.
 SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 if [ -z "$SDK_DIR" ] && [ -n "${ANDROID_NDK_HOME:-}" ]; then
-    SDK_DIR="${ANDROID_NDK_HOME%/ndk/*}"
+    # ANDROID_NDK_HOME is set in Windows form (D:\Android\Sdk\ndk\27.x) just as
+    # often as in MSYS form; strip the ndk suffix only after normalising, or
+    # the pattern never matches and ANDROID_HOME ends up pointing at the NDK,
+    # which makes Gradle look for licences under the NDK instead of the SDK.
+    ndk_unix="$(cygpath -u -- "$ANDROID_NDK_HOME" 2>/dev/null || printf '%s' "$ANDROID_NDK_HOME")"
+    SDK_DIR="${ndk_unix%/ndk/*}"
 fi
 [ -n "$SDK_DIR" ] || SDK_DIR="/d/Android/Sdk"
 export ANDROID_HOME="$(cygpath -m -- "$SDK_DIR" 2>/dev/null || printf '%s' "$SDK_DIR")"

@@ -18,6 +18,10 @@ serde_json = "1"
 # Pure-Rust TTF/TTC rasteriser: keeps text out of the cross-compiled FFmpeg and
 # out of the platform's native code, so preview and export share one bitmap.
 fontdue = "0.9"
+# Same parser fontdue uses internally: CapTrim only needs the table directory
+# to refuse CFF-outline fonts (fontdue cannot rasterise them and would draw a
+# blank subtitle instead of failing).
+ttf-parser = "0.25"
 # Only the exporter writes PNGs; the decoder side stays FFmpeg's business.
 png = "0.18"
 # Image and sticker layers decode in Rust, not through FFmpeg: the decoder is

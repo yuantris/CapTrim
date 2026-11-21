@@ -205,9 +205,10 @@ fn clamp_source_us(clip: &Clip, source_us: i64) -> i64 {
 /// this one ends *and* carries a transition -- so moving, trimming or
 /// removing either clip turns the cross-dissolve back into a plain cut (or a
 /// fade from black) with no bookkeeping in those commands. The source time
-/// runs past `out_us` here on purpose; `clamp_source_us` freezes it on the
-/// last frame, and the audio plan never sees the extension, so sound still
-/// cuts exactly at the edit point.
+/// runs past `out_us` here on purpose; `clamp_source_us` freezes the *picture*
+/// on the last frame, while the audio plan uses the same window to crossfade
+/// (the outgoing clip keeps reading its media past the cut point), so the seam
+/// sounds like a dissolve instead of a hard cut.
 fn video_extension_us(track: &Track, clip: &Clip) -> i64 {
     track
         .clips
@@ -226,11 +227,35 @@ fn video_extension_us(track: &Track, clip: &Clip) -> i64 {
 /// outgoing layer as well would square the falloff and show the background
 /// through the middle of the dissolve.
 fn transition_opacity(clip: &Clip, t_us: i64) -> f32 {
-    let Some((window_start, window_end)) = clip.transition_window_us() else {
-        return 1.0;
-    };
+    transition_progress(clip, t_us).unwrap_or(1.0)
+}
+
+/// Progress inside the dissolve window this clip opens with, or `None` when
+/// `t_us` is outside it. `u` runs 0 -> 1 across the window.
+fn transition_progress(clip: &Clip, t_us: i64) -> Option<f32> {
+    let (window_start, window_end) = clip.transition_window_us()?;
+    if t_us < window_start || t_us >= window_end {
+        return None;
+    }
     let span = (window_end - window_start).max(1) as f64;
-    ((t_us - window_start) as f64 / span).clamp(0.0, 1.0) as f32
+    Some(((t_us - window_start) as f64 / span).clamp(0.0, 1.0) as f32)
+}
+
+/// Progress through the held tail that the *next* clip's dissolve gives this
+/// clip, or `None` when it has none or `t_us` is not inside it.
+///
+/// The window is `[clip.end, clip.end + next.transition_in.duration)`: exactly
+/// the span [`video_extension_us`] keeps this clip's picture on screen.
+fn outgoing_tail_progress(track: &Track, clip: &Clip, t_us: i64) -> Option<f32> {
+    let extension = video_extension_us(track, clip);
+    if extension <= 0 {
+        return None;
+    }
+    let end = clip.end_us();
+    if t_us < end || t_us >= end.saturating_add(extension) {
+        return None;
+    }
+    Some(((t_us - end) as f64 / extension as f64).clamp(0.0, 1.0) as f32)
 }
 
 /// Audio contributors at an arbitrary instant, without frame quantisation.
@@ -241,6 +266,14 @@ fn transition_opacity(clip: &Clip, t_us: i64) -> f32 {
 /// source positions jump by a third of a frame. This function deliberately
 /// takes the raw `t_us`; frame plans reuse it with a snapped instant so both
 /// paths read the same clip boundaries and speed maps.
+///
+/// A dissolve crossfades instead of cutting. Inside its window both clips
+/// report a contributor: the incoming one at gain `u` reading from its own in
+/// point, the outgoing one at gain `1 - u` reading *past* its out point — the
+/// same overlap the picture already uses, so the two gains sum to 1 and the
+/// mix holds level. Reading past the out point relies on the source having
+/// material there; when the file ends the decoder reports EOF and the tail
+/// simply fades out into silence, which is still better than a click.
 pub fn plan_audio_at(timeline: &Timeline, t_us: i64) -> Vec<AudioMix> {
     let mut audio = Vec::new();
     for track in &timeline.tracks {
@@ -252,13 +285,34 @@ pub fn plan_audio_at(timeline: &Timeline, t_us: i64) -> Vec<AudioMix> {
             continue;
         }
         for clip in &track.clips {
-            if !clip.contains(t_us)
-                || clip.volume <= 0.0
-                || !source_may_have(timeline, clip.source, false)
-            {
+            if clip.volume <= 0.0 || !source_may_have(timeline, clip.source, false) {
                 continue;
             }
-            let source_us = clamp_source_us(clip, clip.to_source_us(t_us));
+            let inside = clip.contains(t_us);
+            let tail = if inside {
+                None
+            } else {
+                outgoing_tail_progress(track, clip, t_us)
+            };
+            if !inside && tail.is_none() {
+                continue;
+            }
+            let (gain, source_us) = if inside {
+                // Head fade of this clip's own transition (1.0 when none),
+                // normal clamping: inside the clip the source never runs out.
+                (
+                    transition_progress(clip, t_us).unwrap_or(1.0),
+                    clamp_source_us(clip, clip.to_source_us(t_us)),
+                )
+            } else {
+                // Held tail: fade out, and keep the source running forward past
+                // `out_us` so the outgoing audio stays intelligible under the
+                // incoming one instead of freezing on one sample.
+                (
+                    1.0 - tail.unwrap_or(1.0),
+                    clip.to_source_us(t_us).max(clip.in_us),
+                )
+            };
             let uri = timeline
                 .media
                 .iter()
@@ -270,7 +324,7 @@ pub fn plan_audio_at(timeline: &Timeline, t_us: i64) -> Vec<AudioMix> {
                 source_id: clip.source,
                 uri,
                 source_us,
-                volume: clip.volume,
+                volume: clip.volume * gain,
             });
         }
     }
@@ -449,6 +503,96 @@ mod tests {
         assert_eq!(at_end.len(), 1);
         assert!(at_end[0].source_us <= 1_000_000);
         assert!(plan_audio_at(&t, 1_000_000).is_empty());
+    }
+
+    #[test]
+    fn dissolve_crossfades_audio_across_the_cut() {
+        // Two adjacent clips on one picture track, the second carrying a half
+        // second fade: the picture holds the outgoing frame, the sound must
+        // crossfade over the same window.
+        let mut t = Timeline {
+            frame_rate: Rational::new(30, 1).unwrap(),
+            ..Timeline::default()
+        };
+        t.media.push(MediaSource {
+            id: 1,
+            uri: "file:///v.mp4".into(),
+            info: None,
+        });
+        let mut outgoing = Clip::new(1, 0, 2_000_000, 0);
+        outgoing.id = 1;
+        let mut incoming = Clip::new(1, 4_000_000, 6_000_000, 2_000_000);
+        incoming.id = 2;
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 500_000,
+        });
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![outgoing, incoming],
+        });
+
+        // Quarter of the way into the window: 25% incoming, 75% outgoing.
+        let mid = plan_audio_at(&t, 2_125_000);
+        assert_eq!(mid.len(), 2, "both clips must sound inside the window");
+        assert_eq!(mid[0].clip_id, 1);
+        assert!((mid[0].volume - 0.75).abs() < 1e-6, "{}", mid[0].volume);
+        assert_eq!(mid[1].clip_id, 2);
+        assert!((mid[1].volume - 0.25).abs() < 1e-6, "{}", mid[1].volume);
+        // The outgoing tail keeps running past its out point instead of holding
+        // one sample: at the cut it is exactly 2 s into the source.
+        assert_eq!(mid[0].source_us, 2_125_000);
+        // The incoming clip reads from its own in point.
+        assert_eq!(mid[1].source_us, 4_125_000);
+
+        // Just before the cut the old clip is still alone and at full gain.
+        let before = plan_audio_at(&t, 1_900_000);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].clip_id, 1);
+        assert!((before[0].volume - 1.0).abs() < 1e-6);
+
+        // Just after the window only the incoming clip is left, at full gain.
+        let after = plan_audio_at(&t, 2_600_000);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].clip_id, 2);
+        assert!((after[0].volume - 1.0).abs() < 1e-6);
+        assert_eq!(after[0].source_us, 4_600_000);
+    }
+
+    #[test]
+    fn dissolve_without_audio_keeps_the_picture_extension() {
+        // A transition must not invent sound where there is none: the outgoing
+        // clip's media reports no audio stream, so the window is silent for it
+        // and only the incoming clip fades in.
+        let mut t = Timeline {
+            frame_rate: Rational::new(30, 1).unwrap(),
+            ..Timeline::default()
+        };
+        t.media.push(MediaSource {
+            id: 1,
+            uri: "file:///silent.mp4".into(),
+            info: None,
+        });
+        let mut outgoing = Clip::new(1, 0, 2_000_000, 0);
+        outgoing.id = 1;
+        outgoing.volume = 0.0;
+        let mut incoming = Clip::new(1, 0, 2_000_000, 2_000_000);
+        incoming.id = 2;
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::Fade,
+            duration_us: 500_000,
+        });
+        t.tracks.push(Track {
+            id: 1,
+            kind: TrackKind::MainVideo,
+            clips: vec![outgoing, incoming],
+        });
+
+        let mid = plan_audio_at(&t, 2_250_000);
+        assert_eq!(mid.len(), 1, "a muted clip contributes no audio item");
+        assert_eq!(mid[0].clip_id, 2);
+        assert!((mid[0].volume - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -705,14 +849,19 @@ mod tests {
     }
 
     #[test]
-    fn audio_cuts_at_the_edit_point_while_the_picture_dissolves() {
+    fn audio_crossfades_across_the_edit_point_while_the_picture_dissolves() {
         let t = dissolve_timeline(10);
-        // Mid-window the outgoing clip's sound is gone even though its
-        // picture is still on screen: audio follows `contains`, never the
-        // video extension, so a dissolve cannot double-play two clips.
+        // Mid-window both clips sound: the outgoing tail still reading past its
+        // out point at 1 - u, the incoming one at u. Their gains sum to 1, so
+        // the mix holds level across the splice instead of clicking.
         let mid = plan_frame(&t, 2_500_000);
-        assert_eq!(mid.audio.len(), 1);
-        assert_eq!(mid.audio[0].clip_id, 11);
+        assert_eq!(mid.audio.len(), 2, "both contributors must be planned");
+        assert_eq!(mid.audio[0].clip_id, 10);
+        assert!((mid.audio[0].volume - 0.5).abs() < 1e-3);
+        assert_eq!(mid.audio[1].clip_id, 11);
+        assert!((mid.audio[1].volume - 0.5).abs() < 1e-3);
+        // The held tail is not frozen for sound: it keeps advancing.
+        assert!(mid.audio[0].source_us > 1_999_999);
         let before = plan_frame(&t, 1_966_666); // frame 59
         assert_eq!(before.audio.len(), 1);
         assert_eq!(before.audio[0].clip_id, 10);

@@ -1,6 +1,12 @@
 package io.captrim.selfcheck
 
 import android.app.Activity
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Typeface
 import android.os.Bundle
 import android.util.Log
@@ -13,6 +19,7 @@ import io.captrim.ProgressCallback
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
 
 // Kotlin/JNI layer self-check, the Android twin of platforms/ohos
@@ -164,6 +171,113 @@ private class Runner(private val filesDir: String) {
 
     private fun delete(name: String) {
         File(filesDir, name).delete()
+    }
+
+    /**
+     * A ring on a transparent background, drawn with the platform's own canvas
+     * and encoded as PNG.
+     *
+     * The core decodes it in Rust (the same bytes the device would hand a
+     * user-picked sticker), and the hole in the middle is what makes a
+     * flattened alpha obvious: it would come out as a solid orange square.
+     */
+    private fun writeSticker(): File {
+        val file = File(filesDir, "sticker.png")
+        if (file.length() > 0) return file
+        val bitmap = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(255, 122, 69)
+        }
+        canvas.drawCircle(128f, 128f, 118f, paint)
+        paint.color = Color.TRANSPARENT
+        paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+        canvas.drawCircle(128f, 128f, 64f, paint)
+        FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        bitmap.recycle()
+        expect(file.length() > 0, "贴纸 PNG 没有写出来")
+        return file
+    }
+
+    /** Ink statistics of a PAM the core wrote: alpha coverage and white fill. */
+    private data class Ink(val total: Int, val bright: Int, val partial: Int)
+
+    /**
+     * Count ink in a PAM (P7, RGB_ALPHA). Reading it back in the app is the
+     * half FFmpeg cannot report: the pixels the overlay will consume.
+     */
+    private fun pamInk(path: File): Ink {
+        val bytes = path.readBytes()
+        val tag = "ENDHDR\n".toByteArray(Charsets.US_ASCII)
+        var headerEnd = -1
+        for (i in 0..bytes.size - tag.size) {
+            var match = true
+            for (j in tag.indices) {
+                if (bytes[i + j] != tag[j]) {
+                    match = false
+                    break
+                }
+            }
+            if (match) {
+                headerEnd = i + tag.size
+                break
+            }
+        }
+        expect(headerEnd > 0, "${path.name} 没有 PAM 头")
+        var total = 0
+        var bright = 0
+        var partial = 0
+        var p = headerEnd
+        while (p + 3 < bytes.size) {
+            val alpha = bytes[p + 3].toInt() and 0xFF
+            if (alpha != 0) {
+                total++
+                if (alpha < 255) partial++
+                if ((bytes[p].toInt() and 0xFF) > 200 &&
+                    (bytes[p + 1].toInt() and 0xFF) > 200 &&
+                    (bytes[p + 2].toInt() and 0xFF) > 200
+                ) {
+                    bright++
+                }
+            }
+            p += 4
+        }
+        return Ink(total, bright, partial)
+    }
+
+    /** Subtitles and a sticker on a 540x960 canvas: the burn fixture. */
+    private fun burnFixture(engine: CapTrim): Pair<Long, Long> {
+        engine.apply(
+            """{"type":"set_canvas","width":540,"height":960,"frame_rate":{"num":30,"den":1}}""",
+        )
+        val subtitleTrack = engine.apply("""{"type":"add_track","kind":"subtitle"}""")!!
+        val caption = engine.apply(
+            JSONObject()
+                .put("type", "insert_text_clip")
+                .put("track_id", subtitleTrack)
+                .put("text", "字幕烧录 · Overlay")
+                .put("start_us", 400_000)
+                .put("duration_us", 1_200_000)
+                .toString(),
+        )!!
+        val imageTrack = engine.apply("""{"type":"add_track","kind":"image"}""")!!
+        val sticker = writeSticker()
+        val still = engine.apply(
+            JSONObject()
+                .put("type", "insert_image_clip")
+                .put("track_id", imageTrack)
+                .put("uri", "file://${sticker.absolutePath}")
+                .put("start_us", 400_000)
+                .put("duration_us", 1_200_000)
+                .toString(),
+        )!!
+        // Top-right, a quarter size: clear of the caption, and the same
+        // placement the OHOS self-check uses.
+        engine.apply(
+            """{"type":"set_transform","clip_id":$still,""" +
+                """"transform":{"scale":0.25,"dx":0.3,"dy":-0.35,"rotation_deg":0}}""",
+        )
+        return Pair(caption, still)
     }
 
     fun runAll() {
@@ -336,6 +450,179 @@ private class Runner(private val filesDir: String) {
             val empty = CapTrim.effectsToFilterDesc()
             expect(empty.isEmpty(), "空 effects 应翻译为空串，实际 \"$empty\"")
             "blur/invert/hflip → $desc；空数组 → 空串"
+        }
+
+        check("字幕与贴图数据层（图层种类 + 草稿往返）") {
+            CapTrim.create().use { engine ->
+                val (captionId, stillId) = burnFixture(engine)
+                // t = 1.0s sits inside both windows (0.4s..1.6s).
+                val plan = JSONObject(engine.planFrameAt(30))
+                val layers = plan.getJSONArray("layers")
+                // planFrameAt carries the kind as its name ("subtitle", "image"),
+                // not the C enum number.
+                val kinds = mutableSetOf<String>()
+                for (i in 0 until layers.length()) {
+                    kinds.add(layers.getJSONObject(i).getString("kind"))
+                }
+                expect("subtitle" in kinds, "帧计划里没有字幕层：$kinds")
+                expect("image" in kinds, "帧计划里没有图片层：$kinds")
+
+                // The draft has to carry both payloads, or a reloaded session
+                // would lose the sticker's file and its intrinsic size.
+                val tracks = JSONObject(engine.draft()).getJSONArray("tracks")
+                var captionText: String? = null
+                var imageSize: String? = null
+                for (t in 0 until tracks.length()) {
+                    val clips = tracks.getJSONObject(t).getJSONArray("clips")
+                    for (c in 0 until clips.length()) {
+                        val clip = clips.getJSONObject(c)
+                        if (clip.getLong("id") == captionId) captionText = clip.getString("text")
+                        if (clip.getLong("id") == stillId) {
+                            val image = clip.getJSONObject("image")
+                            imageSize = "${image.getInt("width")}x${image.getInt("height")}"
+                        }
+                    }
+                }
+                expect(captionText == "字幕烧录 · Overlay", "草稿里的字幕文本丢了：$captionText")
+                expect(imageSize == "256x256", "草稿里的贴图尺寸不对：$imageSize")
+                "图层 1/3 都在，草稿保留文本与 256x256 贴图尺寸"
+            }
+        }
+
+        check("字幕与贴图烧录（PAM + overlay）") {
+            CapTrim.create().use { engine ->
+                val dst = "$filesDir/burn.mp4"
+                val base = "$filesDir/burn-base.mp4"
+                val workDir = File(filesDir, "burn")
+                delete("burn.mp4")
+                delete("burn-base.mp4")
+                // A stale directory would make the PAM counts describe an
+                // earlier run with different clip ids.
+                workDir.deleteRecursively()
+                workDir.mkdirs()
+                burnFixture(engine)
+
+                val prefix = "trim=duration=2,setpts=PTS-STARTPTS," +
+                    "scale=540:960:force_original_aspect_ratio=decrease," +
+                    "pad=540:960:(ow-iw)/2:(oh-ih)/2"
+                val ticks = mutableListOf<Float>()
+                engine.exportBurnSubtitles(
+                    src(), dst, prefix, "fps=15", workDir.absolutePath, "libx264",
+                    ProgressCallback { v -> ticks.add(v); true },
+                )
+                val burned = File(dst).length()
+                expect(burned > 0, "烧录产物为空")
+
+                // Same picture pipeline without the layers: if the overlays did
+                // anything the encoded result cannot match.
+                engine.exportTranscode(src(), base, "$prefix,fps=15", "libx264",
+                    ProgressCallback { _ -> true })
+                val plain = File(base).length()
+                expect(plain > 0, "基线产物为空")
+                expect(burned != plain, "烧录前后文件大小相同 ($burned bytes)，overlay 没生效")
+
+                val outVideo = firstVideo(JSONObject(engine.probe("file://$dst")))
+                expect(outVideo.getInt("width") == 540 && outVideo.getInt("height") == 960,
+                    "分辨率应为 540x960，实际 ${outVideo.getInt("width")}x${outVideo.getInt("height")}")
+
+                val pams = workDir.listFiles()?.filter { it.name.endsWith(".pam") } ?: emptyList()
+                val captions = pams.filter { it.name.startsWith("sub_") }
+                val stills = pams.filter { it.name.startsWith("img_") }
+                expect(captions.size == 1, "应渲染 1 张字幕 PAM，实际 ${captions.size}")
+                expect(stills.size == 1, "应渲染 1 张贴图 PAM，实际 ${stills.size}")
+
+                val captionInk = pamInk(captions[0])
+                expect(captionInk.total > 500, "字幕 PAM 只有 ${captionInk.total} 个墨迹像素")
+                expect(captionInk.bright > 300, "字幕 PAM 只有 ${captionInk.bright} 个白色像素")
+
+                // 256x256 fitted into 540x960 (2.1x) then drawn at 0.25 => 135px;
+                // the ring covers ~47% of that. Partial alpha at its edge is what
+                // proves the PNG's alpha survived decode and resample.
+                val stillInk = pamInk(stills[0])
+                expect(stillInk.total > 3000, "贴图 PAM 只有 ${stillInk.total} 个墨迹像素")
+                expect(stillInk.partial > 200,
+                    "贴图 PAM 只有 ${stillInk.partial} 个半透明边缘像素，alpha 可能被压平")
+
+                "540x960 burn ${mb(burned)}MB vs base ${mb(plain)}MB，PAM ${pams.size} 张 " +
+                    "(字幕 ${captionInk.bright} 白 / ${captionInk.total} 墨迹，贴图 " +
+                    "${stillInk.total} 墨迹 / ${stillInk.partial} 半透明)，进度 ${ticks.size} 次"
+            }
+        }
+
+        check("转场期音频交叉渐变（导出计划增益互补）") {
+            CapTrim.create().use { engine ->
+                val media = engine.addMedia(src())
+                engine.setMediaInfo(media, mediaInfo(src(), 22_000_000))
+                val track = engine.apply("""{"type":"add_track","kind":"main_video"}""")!!
+                val outgoing = engine.apply(
+                    JSONObject()
+                        .put("type", "insert_clip")
+                        .put("track_id", track)
+                        .put("clip", clipOf(media, 0, 2_000_000, 0))
+                        .toString(),
+                )!!
+                val incoming = engine.apply(
+                    JSONObject()
+                        .put("type", "insert_clip")
+                        .put("track_id", track)
+                        .put("clip", clipOf(media, 2_000_000, 4_000_000, 2_000_000))
+                        .toString(),
+                )!!
+                // Half a second of dissolve: the window is [2.0s, 2.5s).
+                engine.apply(
+                    """{"type":"set_transition","clip_id":$incoming,""" +
+                        """"transition":{"kind":"fade","duration_us":500000}}""",
+                )
+
+                val segments = JSONObject(engine.exportPlan()).getJSONArray("segments")
+                var ramp: JSONObject? = null
+                for (i in 0 until segments.length()) {
+                    val segment = segments.getJSONObject(i)
+                    if (segment.getLong("start_frame") == 60L) {
+                        ramp = segment
+                        break
+                    }
+                }
+                expect(ramp != null, "导出计划里没有从第 60 帧开始的转场段")
+                val audio = ramp!!.getJSONArray("audio")
+                expect(audio.length() == 2, "转场段应有 2 个音频贡献，实际 ${audio.length()}")
+
+                val old = audio.getJSONObject(0)
+                val new = audio.getJSONObject(1)
+                expect(old.getLong("clip_id") == outgoing, "第 1 个贡献应是被替换的片段")
+                expect(new.getLong("clip_id") == incoming, "第 2 个贡献应是新片段")
+                // Starts complementary, and both ramp the other way.
+                val oldStart = old.getDouble("volume")
+                val newStart = new.getDouble("volume")
+                expect(kotlin.math.abs(oldStart + newStart - 1.0) < 1e-3,
+                    "窗口起点增益应为 1：$oldStart + $newStart")
+                expect(old.getDouble("volume_end") < oldStart, "旧片段增益应递减")
+                expect(new.getDouble("volume_end") > newStart, "新片段增益应递增")
+
+                // Mid-window both are audible and still sum to one: a crossfade,
+                // not a gap and not a doubled mix.
+                val midOld = oldStart + (old.getDouble("volume_end") - oldStart) * 0.5
+                val midNew = newStart + (new.getDouble("volume_end") - newStart) * 0.5
+                expect(midOld > 0.3 && midNew > 0.3,
+                    "窗口中点两边都应可闻：$midOld / $midNew")
+                expect(kotlin.math.abs(midOld + midNew - 1.0) < 1e-3,
+                    "窗口中点增益和应为 1：$midOld + $midNew")
+
+                // The tail reads past its out point instead of freezing on one
+                // sample; the incoming one starts at its own in point.
+                expect(old.getLong("source_end_us") > 2_000_000,
+                    "旧片段尾部应继续读源：${old.getLong("source_end_us")}")
+                expect(new.getLong("source_start_us") == 2_000_000L,
+                    "新片段应从 in 点开始读取：${new.getLong("source_start_us")}")
+
+                String.format(
+                    Locale.US,
+                    "60..%d 帧双贡献，旧 %.2f→%.2f / 新 %.2f→%.2f",
+                    ramp!!.getLong("end_frame"),
+                    oldStart, old.getDouble("volume_end"),
+                    newStart, new.getDouble("volume_end"),
+                )
+            }
         }
 
         // ---- FFmpeg 软件后端 ------------------------------------------------

@@ -4,7 +4,7 @@ Android 和鸿蒙共用的视频剪辑核心 SDK。Rust 描述时间线，FFmpeg
 
 一份 Rust 核心 + 一份 C ABI，两端只做薄桥接（Android JNI、鸿蒙 Node-API），业务 API 只定义一次。目标是覆盖剪映的基础剪辑能力：导入探测、分割、删除、排序、裁剪、变速、音量、音画分离、转场、滤镜、字幕、画中画、比例裁剪、导出。
 
-现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 19/19，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 17/17，明细见[验证状态](#验证状态)。字幕与图片/贴纸图层是「没有解码器也得画出来」的两类：文字在 Rust 核心里光栅化、图片在 Rust 核心里解码并缩放旋转，产出的位图预览当纹理上传、导出写成 PAM 交给 `overlay`，两块都在鸿蒙 Mate 60 上验证过。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
+现在的状态：P0 骨架、P1 调度内核、鸿蒙硬解 + GL 多图层合成、FFmpeg 复杂剪辑软链路、「硬解 → FFmpeg 复杂命令处理 → 硬编 → mp4」三段式导出，双端真机都跑通了——鸿蒙自检 19/19，Android native 自检 18/18（含 P2 音频 5 项），Android Kotlin 层自检 20/20，明细见[验证状态](#验证状态)。字幕与图片/贴纸图层是「没有解码器也得画出来」的两类：文字在 Rust 核心里光栅化、图片在 Rust 核心里解码并缩放旋转，产出的位图预览当纹理上传、导出写成 PAM 交给 `overlay`，两块在鸿蒙 Mate 60 与小米 2211133C（Android 16）上都验证过。转场（`Fade`）的画面与声音都在核心里：画面把后一段的透明度按窗口线性拉起来、前一段续画到窗口结束，声音在同一窗口做真正的交叉渐变（两个源同时出声、增益互补）。P2 音频输出与 hold-and-present 已在鸿蒙 HAP 真机验证：音频位置/帧数持续增长，播放头与音频主时钟差 7~25 ms，`held` 随预读增长。三段式的首尾两段各自独立回退到 FFmpeg 软解/软编，中间段两端共用一份实现，只靠弱符号工厂切换。OHOS 的同步/回调两种 Buffer 模式、Android 的 AMediaCodec Buffer 模式都在真机验证过，`fallback=[none]`，产物能被 FFmpeg 软解复验。预览的帧计划、时钟、状态机在 Rust 核心里，有测试覆盖。鸿蒙侧每层一个硬解码器，输出进各自的 `OH_NativeImage`，GLES 按 transform 合成到 XComponent，画中画双路解码也是实时的。
 
 ---
 
@@ -101,7 +101,7 @@ crates/captrim-core/      纯 Rust 核心：时间、模型、命令、草稿（
 crates/captrim-ffi/       稳定 C ABI + 后端抽象（captrim.h 是唯一契约）
 native/                   FFmpeg C shim（probe / remux / 滤镜转码）+ 三段式管线 + 双端硬段工厂
 platforms/android/        Gradle AAR + CMake + JNI + Kotlin
-platforms/android/app/    Kotlin 层真机自检 App（17 项，结果写 logcat）
+platforms/android/app/    Kotlin 层真机自检 App（20 项，结果写 logcat）
 platforms/ohos/           HAR 工程 + CMake + Node-API + ArkTS + .d.ts
 platforms/ohos/entry/     真机自检 App（18 项检查，结果写 hilog）
 scripts/                  FFmpeg 裁剪编译、Rust 双端构建、ABI 校验、HAP 构建、双端真机自检、本地 CI 全套（check.sh）
@@ -164,7 +164,7 @@ bash scripts/build-rust.sh android
 
 ```bash
 bash scripts/run-android-selftest.sh        # native 层 18 项，推 /data/local/tmp 跑
-bash scripts/run-android-app-selftest.sh    # Kotlin/JNI 层 17 项，装 App 跑
+bash scripts/run-android-app-selftest.sh    # Kotlin/JNI 层 20 项，装 App 跑
 ```
 
 **5. 鸿蒙真机自检**
@@ -383,14 +383,14 @@ FFmpeg 走 YUV、着色器走 RGB，两边是**近似相等**而非逐位相等�
 - 双端工程：AAR（JNI + Kotlin）、HAR（Node-API + ArkTS + `.d.ts`）
 - 鸿蒙真机自检 App：19 项端到端检查，含 29.97fps 帧栅格、丢帧统计、编辑后重绘、滤镜 v1（effect 位 + filter_desc 翻译）、三段式管线的软件基线 / 同步硬段 / 回调式硬段与回退、硬编产物的 FFmpeg 软解复验，以及字幕与贴图烧录（字幕/贴图 PAM 的墨迹与半透明像素数 + 烧录/基线产物对比）；P2 音频输出与 hold-and-present 另有真机日志验证
 - Android native 自检：18 项，含 P2 音频解码/重采样/seek/音量/静音、真实 x265 HEVC 编码复探和 AMediaCodec 硬解硬编链路（`scripts/run-android-selftest.sh`）
-- Android Kotlin/JNI 层自检 App：17 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）
+- Android Kotlin/JNI 层自检 App：20 项，走 `CapTrim.kt` 公开 API，和鸿蒙 `SelfCheck.ets` 同构（`scripts/run-android-app-selftest.sh`）；其中「字幕与贴图数据层」「字幕与贴图烧录」「转场期音频交叉渐变」三项是 2026-11-21 在小米 2211133C 上补的
 - 鸿蒙硬解 + GL 多图层合成上屏：每层一个解码器（`SourceSlot`：demuxer + codec + NativeImage + texture），解码器输出到各自的 `OH_NativeImage`（等同 Android SurfaceTexture），`gl_compositor` 用 EGL/GLES3 按 z 序把每层画成带缩放/平移/旋转/透明度的 quad，native 渲染线程 + 命令队列；源切换、跳转、暂停落点、transform、画中画双路实时播放都在真机验证过
 - 构建与校验脚本：FFmpeg 裁剪 configure、双端 Rust 交叉编译、ABI/NAPI 漂移检查、HAP 打包、本地 CI 全套
 
 **未完成（按优先级）**
 
-- 字幕与图片/贴纸图层都已在鸿蒙真机跑通（`fontdue` 光栅化 / 纯 Rust 图片解码 → 预览走 `GL_TEXTURE_2D`、导出走 PAM + `overlay`）；Android 侧这两块只有编译级接线（本轮没有 Android 设备）。按既定顺序，下一项是转场后续：转场期音频交叉渐变、更多转场类型、handle material
-- 转场后续：转场期音频交叉渐变（v1 刻意硬切）、更多转场类型（擦除/推拉等，复用同一窗口模型）、前驱素材越出裁剪点时用 handle material 代替冻结帧
+- 字幕与图片/贴纸图层都在鸿蒙 Mate 60 与小米 2211133C 上跑通（`fontdue` 光栅化 / 纯 Rust 图片解码 → 预览走 `GL_TEXTURE_2D`、导出走 PAM + `overlay`）。Android 侧验的是数据层、位图 ABI 消费路径与烧录产物（20/20，含两张 PAM 的墨迹/半透明像素数），预览渲染仍是契约层，没有 GL 实现
+- 转场后续：转场期音频交叉渐变已完成（两条音轨同窗口、增益互补，导出计划带 `volume`/`volume_end` 线性 ramp）；剩下「更多转场类型（擦除/推拉等，复用同一窗口模型）」与「前驱素材越出裁剪点时用 handle material 代替冻结帧」。音频的交叉渐变已按源越出裁剪点读取：素材还有内容就继续出声，文件读完就自然淡入静音
 - P3：变速保调、功耗与机型兼容矩阵、崩溃符号化
 - 倒放：要求反向解码 + 全段帧缓存，复杂度约等于其余功能之和，明确留给 v2
 

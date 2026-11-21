@@ -14,7 +14,7 @@
 //! one frame of a clip before it begins.
 
 use crate::model::{Id, Timeline, Transform};
-use crate::render::{frame_pts_us, plan_frame_at_index, LayerKind};
+use crate::render::{frame_pts_us, plan_audio_at, plan_frame_at_index, LayerKind};
 use crate::time::Rational;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -66,7 +66,18 @@ pub struct ExportAudioItem {
     pub source_start_us: i64,
     pub source_end_us: i64,
     pub speed: Rational,
+    /// Gain at the segment's first frame. Equal to the clip's `volume` outside
+    /// a dissolve; inside one it is a point on the crossfade ramp.
     pub volume: f32,
+    /// Gain just after the segment's last frame. A segment boundary is always
+    /// placed at a dissolve window edge, so a linear ramp between the two
+    /// reproduces the preview's per-sample gain exactly.
+    #[serde(default = "full_gain")]
+    pub volume_end: f32,
+}
+
+fn full_gain() -> f32 {
+    1.0
 }
 
 /// A frame-aligned range whose active sources do not change.
@@ -269,12 +280,27 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
             });
         }
 
+        // Gain at the last audible instant of the segment. Sampling a whole
+        // frame past the end would land exactly on a window edge, where the
+        // outgoing tail has already dropped out (its range is half-open), and
+        // the fade-out would be reported as a flat full-gain segment.
+        let end_us = frame_pts_us(&timeline.frame_rate, end_frame);
+        let end_audio = plan_audio_at(timeline, end_us.saturating_sub(1).max(plan.t_us));
         for mix in &plan.audio {
             let Some((_, clip)) = timeline.find_clip(mix.clip_id) else {
                 continue;
             };
-            let source_end_us =
-                source_at_or_clamped(clip, frame_pts_us(&timeline.frame_rate, end_frame));
+            // Audio items must be able to keep reading past `out_us` inside a
+            // dissolve window (that is how the outgoing tail crossfades), so
+            // their source range is not clamped the way the picture is.
+            let source_end_us = clip
+                .to_source_us(frame_pts_us(&timeline.frame_rate, end_frame))
+                .max(clip.in_us);
+            let volume_end = end_audio
+                .iter()
+                .find(|end_mix| end_mix.clip_id == mix.clip_id)
+                .map(|end_mix| end_mix.volume)
+                .unwrap_or(0.0);
             audio.push(ExportAudioItem {
                 clip_id: mix.clip_id,
                 source_id: mix.source_id,
@@ -283,6 +309,7 @@ pub fn plan_export(timeline: &Timeline) -> ExportPlan {
                 source_end_us,
                 speed: clip.speed,
                 volume: mix.volume,
+                volume_end,
             });
         }
 
@@ -565,6 +592,52 @@ mod tests {
             (after.video[0].opacity_start, after.video[0].opacity_end),
             (1.0, 1.0)
         );
+    }
+
+    #[test]
+    fn dissolve_audio_ramps_match_the_preview() {
+        let t = dissolve_timeline();
+        let plan = t.export_plan();
+        let ramp = &plan.segments[1];
+        assert_eq!((ramp.start_frame, ramp.end_frame), (60, 90));
+
+        let held = ramp.audio.iter().find(|i| i.clip_id == 10).unwrap();
+        let incoming = ramp.audio.iter().find(|i| i.clip_id == 11).unwrap();
+        // The outgoing tail fades out while still reading forward past its out
+        // point (not frozen), the incoming clips ramps up from silence.
+        assert!(held.volume > 0.99, "{}", held.volume);
+        assert!(held.volume_end < 0.01, "{}", held.volume_end);
+        assert!(held.source_end_us > held.source_start_us);
+        assert!(incoming.volume < 0.01, "{}", incoming.volume);
+        assert!(incoming.volume_end > 0.99, "{}", incoming.volume_end);
+
+        for frame in ramp.start_frame..ramp.end_frame {
+            let pos = (frame - ramp.start_frame) as f32 / ramp.frame_count() as f32;
+            let preview = plan_frame_at_index(&t, frame).audio;
+            for item in [held, incoming] {
+                let exported = item.volume + (item.volume_end - item.volume) * pos;
+                let expected = preview
+                    .iter()
+                    .find(|mix| mix.clip_id == item.clip_id)
+                    .map(|mix| mix.volume)
+                    .unwrap_or(0.0);
+                assert!(
+                    (exported - expected).abs() < 1e-4,
+                    "frame {frame} clip {}: exported {exported} vs preview {expected}",
+                    item.clip_id
+                );
+            }
+        }
+
+        // Outside the window the audio is a plain full-gain item on each side.
+        let plain = plan.segments[0]
+            .audio
+            .iter()
+            .find(|i| i.clip_id == 10)
+            .unwrap();
+        assert_eq!((plain.volume, plain.volume_end), (1.0, 1.0));
+        let after = &plan.segments[2].audio[0];
+        assert_eq!((after.volume, after.volume_end), (1.0, 1.0));
     }
 
     #[test]

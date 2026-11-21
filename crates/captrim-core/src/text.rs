@@ -16,9 +16,10 @@
 //! # Fonts
 //!
 //! No font is bundled: CJK fonts are 10-20 MB and the platforms already ship
-//! good ones (`HarmonyOS_Sans_SC` on HarmonyOS, `NotoSansCJK` on Android). The
-//! caller may name a font explicitly ([`FontSpec`]); otherwise
-//! [`resolve_default_font`] probes the well-known system paths in order.
+//! good ones (`HarmonyOS_Sans_SC` on HarmonyOS, `MiSansVF` on MIUI/Android).
+//! The caller may name a font explicitly ([`FontSpec`]); otherwise
+//! [`resolve_default_font`] probes the well-known system paths in order and
+//! skips any face fontdue cannot rasterise (see [`has_truetype_outlines`]).
 
 use crate::{Error, Result};
 use fontdue::{Font, FontSettings};
@@ -53,13 +54,24 @@ impl FontSpec {
 /// Candidate fonts, most specific first.
 ///
 /// HarmonyOS ships `HarmonyOS_Sans_SC.ttf` (Simplified Chinese, TTF, no
-/// collection); Android ships `NotoSansCJK-Regular.ttc` (collection, face 2 is
-/// the Simplified Chinese one in AOSP's CJK collection layout). Host builds on
-/// Windows find Microsoft YaHei so `cargo test` and the demo tools can render
-/// text without a device.
+/// collection). Android's picture is messier and was measured on the Xiaomi
+/// 2211133C (Android 16): `NotoSansCJK-Regular.ttc` is there but its faces are
+/// **CFF/OpenType collections**, and fontdue rasterises TrueType `glyf`
+/// outlines only — it parses the metrics and cmap happily, then returns an
+/// empty bitmap, which surfaced as an all-transparent subtitle PAM on device.
+/// MIUI's `MiSansVF.ttf` is a TrueType variable font with full CJK coverage and
+/// does rasterise (3512 ink pixels for the self-check caption), so it goes
+/// first; `NotoSansCJK` stays in the list only so the "tried" report can name
+/// it when a device has nothing else.
+///
+/// Host builds on Windows find Microsoft YaHei so `cargo test` and the demo
+/// tools can render text without a device.
 pub fn default_font_specs() -> Vec<FontSpec> {
     let mut out = vec![
         FontSpec::new("/system/fonts/HarmonyOS_Sans_SC.ttf"),
+        FontSpec::new("/system/fonts/MiSansVF.ttf"),
+        FontSpec::new("/product/fonts/MiSansRoundedSC.ttf"),
+        FontSpec::new("/system/fonts/MiSansC_3.005.ttf"),
         FontSpec::new("/system/fonts/NotoSansCJK-Regular.ttc").with_collection_index(2),
         FontSpec::new("/system/fonts/NotoSansSC-Regular.otf"),
         FontSpec::new("/system/fonts/DroidSansFallback.ttf"),
@@ -72,19 +84,40 @@ pub fn default_font_specs() -> Vec<FontSpec> {
     out
 }
 
-/// First candidate that exists on disk. Reported as `NotFound` when none do,
-/// which on a device means "this build was shipped without a system font" and
-/// the renderer should skip text rather than draw boxes.
+/// True when the face carries TrueType `glyf` outlines — the only outline
+/// format fontdue can turn into pixels. CFF/CFF2 faces have to be refused up
+/// front: they load without error and then draw nothing, so a wrong font path
+/// would show up as a subtitle that silently vanishes instead of an error.
+pub fn has_truetype_outlines(bytes: &[u8], collection_index: u32) -> bool {
+    ttf_parser::Face::parse(bytes, collection_index)
+        .map(|face| face.tables().glyf.is_some())
+        .unwrap_or(false)
+}
+
+/// First candidate that exists on disk *and* can actually be rasterised.
+/// Reported as `NotFound` when none can, which on a device means "this build
+/// was shipped without a usable system font" and the renderer should skip text
+/// rather than draw nothing.
 pub fn resolve_default_font() -> Result<FontSpec> {
     let mut tried = Vec::new();
     for spec in default_font_specs() {
-        if std::fs::metadata(&spec.path)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
+        let bytes = match std::fs::read(&spec.path) {
+            Ok(bytes)
+                if std::fs::metadata(&spec.path)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false) =>
+            {
+                bytes
+            }
+            _ => {
+                tried.push(spec.path);
+                continue;
+            }
+        };
+        if has_truetype_outlines(&bytes, spec.collection_index) {
             return Ok(spec);
         }
-        tried.push(spec.path);
+        tried.push(format!("{} (CFF outlines, not rasterisable)", spec.path));
     }
     Err(Error::not_found(format!(
         "no usable system font (tried {})",
@@ -116,6 +149,13 @@ pub fn load_font(spec: &FontSpec) -> Result<Arc<Font>> {
 
     let bytes = std::fs::read(&spec.path)
         .map_err(|e| Error::Io(format!("cannot read font {}: {e}", spec.path)))?;
+    if !has_truetype_outlines(&bytes, spec.collection_index) {
+        return Err(Error::Decode(format!(
+            "cannot rasterise font {} (face {}): no TrueType glyf outlines \
+             (CFF/OpenType fonts load but draw nothing in fontdue)",
+            spec.path, spec.collection_index
+        )));
+    }
     let settings = FontSettings {
         collection_index: spec.collection_index,
         // The rasteriser is told up front which pixel size it is aiming at; the
