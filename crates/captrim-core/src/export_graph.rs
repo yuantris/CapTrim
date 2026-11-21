@@ -59,6 +59,11 @@ pub struct ExportGraph {
     pub filter_complex: String,
     /// Output label to `-map`, always `vout`.
     pub video_label: String,
+    /// Output audio label, `None` when the timeline carries no audio at all.
+    pub audio_label: Option<String>,
+    /// Exact output length. Passed as `-t` so the container cannot end on an
+    /// AAC encoder tail one frame past the last planned picture frame.
+    pub duration_us: i64,
     pub codec: String,
 }
 
@@ -78,6 +83,16 @@ impl ExportGraph {
             args.push("-c:v".to_string());
             args.push(self.codec.clone());
         }
+        if let Some(audio_label) = &self.audio_label {
+            args.push("-map".to_string());
+            args.push(format!("[{audio_label}]"));
+            args.push("-c:a".to_string());
+            args.push("aac".to_string());
+            args.push("-b:a".to_string());
+            args.push("192k".to_string());
+        }
+        args.push("-t".to_string());
+        args.push(seconds(self.duration_us));
         args.push("-y".to_string());
         args.push(dst.to_string());
         args
@@ -99,6 +114,12 @@ pub fn compile(
 
     let mut inputs: Vec<String> = Vec::new();
     let mut chains: Vec<String> = Vec::new();
+    // Audio is compiled only when the timeline has any: an all-silent project
+    // must not gain an empty AAC track.
+    let has_audio = plan
+        .segments
+        .iter()
+        .any(|segment| !segment.audio.is_empty());
 
     for segment in &plan.segments {
         if segment.video.is_empty() {
@@ -245,6 +266,10 @@ pub fn compile(
         }
 
         chains.push(format!("[{base}]format=yuv420p[seg{i}]"));
+
+        if has_audio {
+            audio_chains(segment, &mut inputs, &mut chains, i, duration_s)?;
+        }
     }
 
     let mut filter = String::new();
@@ -260,8 +285,15 @@ pub fn compile(
         filter.push(';');
         for segment in &plan.segments {
             filter.push_str(&format!("[seg{}]", segment.index));
+            if has_audio {
+                filter.push_str(&format!("[aud{}]", segment.index));
+            }
         }
-        filter.push_str(&format!("concat=n={}:v=1:a=0[joined]", plan.segments.len()));
+        filter.push_str(&format!(
+            "concat=n={}:v=1:a={}[joined][jaudio]",
+            plan.segments.len(),
+            u8::from(has_audio)
+        ));
         "joined".to_string()
     };
 
@@ -283,16 +315,149 @@ pub fn compile(
     };
     filter.push_str(&format!("[{retimed}]trim=end_frame={total_frames}[vout]"));
 
+    let audio_label = has_audio.then(|| {
+        let joined_audio = if plan.segments.len() == 1 {
+            format!("aud{}", plan.segments[0].index)
+        } else {
+            "jaudio".to_string()
+        };
+        // Every segment already carries 48k stereo, but the seam between two
+        // segments can still land mid-sample; one last resample pins the rate
+        // before AAC sees it.
+        filter.push_str(&format!(";[{joined_audio}]aresample=48000[aout]"));
+        "aout".to_string()
+    });
+
     Ok(ExportGraph {
         inputs,
         filter_complex: filter,
         video_label: "vout".to_string(),
+        audio_label,
+        duration_us: plan
+            .segments
+            .last()
+            .map(|segment| segment.end_us)
+            .unwrap_or(0),
         codec: settings.codec.clone(),
     })
 }
 
 fn seconds(us: i64) -> String {
     format!("{:.6}", us as f64 / 1_000_000.0)
+}
+
+/// Audio for one segment: every contributor trimmed to its source range, sped
+/// to the clip's speed, gained by its own (possibly ramping) volume, mixed
+/// without normalisation, then padded/trimmed to the segment's exact duration
+/// so `concat` sees picture and sound of the same length.
+fn audio_chains(
+    segment: &crate::export::ExportSegment,
+    inputs: &mut Vec<String>,
+    chains: &mut Vec<String>,
+    i: u32,
+    duration_s: f64,
+) -> crate::Result<()> {
+    let mut labels = Vec::new();
+    for (n, item) in segment.audio.iter().enumerate() {
+        let input = inputs
+            .iter()
+            .position(|uri| uri == &item.uri)
+            .unwrap_or_else(|| {
+                inputs.push(item.uri.clone());
+                inputs.len() - 1
+            });
+        // Audio keeps reading past an out point inside a dissolve window, so
+        // the range is normally non-empty; a collapsed one still needs a
+        // sample to stay on the timeline rather than shifting the mix.
+        let start = item.source_start_us;
+        let end = item.source_end_us.max(start.saturating_add(1));
+        let mut chain = format!(
+            "[{input}:a]atrim=start={}:end={},asetpts=PTS-STARTPTS",
+            seconds(start),
+            seconds(end),
+        );
+        if item.speed != Rational::ONE {
+            chain.push(',');
+            chain.push_str(&atempo_chain(&item.speed)?);
+        }
+        if let Some(gain) = gain_filter(item.volume, item.volume_end, duration_s)? {
+            chain.push(',');
+            chain.push_str(&gain);
+        }
+        let label = format!("au{i}_{n}");
+        chain.push_str(&format!("[{label}]"));
+        chains.push(chain);
+        labels.push(label);
+    }
+
+    let mixed = match labels.len() {
+        0 => {
+            chains.push(format!(
+                "anullsrc=r=48000:cl=stereo,atrim=duration={duration_s:.6}[mix{i}]"
+            ));
+            format!("mix{i}")
+        }
+        1 => labels.pop().expect("one label"),
+        _ => {
+            let pads: String = labels.iter().map(|label| format!("[{label}]")).collect();
+            chains.push(format!(
+                "{pads}amix=inputs={}:normalize=0:duration=longest[mix{i}]",
+                labels.len()
+            ));
+            format!("mix{i}")
+        }
+    };
+    chains.push(format!(
+        "[{mixed}]aresample=48000,aformat=channel_layouts=stereo,apad,\
+         atrim=duration={duration_s:.6}[aud{i}]"
+    ));
+    Ok(())
+}
+
+/// `atempo` only accepts 0.5..=2.0 per instance, so a 4x clip becomes two
+/// instances. Speed is applied here, not by resampling, which keeps pitch.
+fn atempo_chain(speed: &Rational) -> crate::Result<String> {
+    let mut factor = speed.num as f64 / speed.den as f64;
+    if !factor.is_finite() || factor <= 0.0 {
+        return Err(Error::InvalidArgument(format!(
+            "clip speed {} is not usable for audio",
+            speed.num as f64 / speed.den as f64
+        )));
+    }
+    let mut parts = Vec::new();
+    while factor > 2.0 {
+        parts.push("atempo=2.0".to_string());
+        factor /= 2.0;
+    }
+    while factor < 0.5 {
+        parts.push("atempo=0.5".to_string());
+        factor /= 0.5;
+    }
+    parts.push(format!("atempo={factor:.6}"));
+    Ok(parts.join(","))
+}
+
+/// Gain for one contributor over one segment. The preview ramps solve's audio
+/// gain linearly in time, so a segment whose endpoints differ gets the same
+/// ramp here; a constant volume needs no expression at all.
+fn gain_filter(start: f32, end: f32, duration_s: f64) -> crate::Result<Option<String>> {
+    for value in [start, end] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "audio gain {value} is not a finite, non-negative number"
+            )));
+        }
+    }
+    if (start - end).abs() <= 1e-6 {
+        return Ok(if (start - 1.0).abs() <= 1e-6 {
+            None
+        } else {
+            Some(format!("volume={start:.4}"))
+        });
+    }
+    Ok(Some(format!(
+        "volume=eval=frame:volume='{start:.4}+({end:.4}-{start:.4})*(t/{duration_s:.6})'"
+    )))
 }
 
 /// Even pixel size for a `scale` target: odd sizes break 4:2:0 chroma.
@@ -430,7 +595,7 @@ mod tests {
             graph.filter_complex
         );
         assert!(
-            graph.filter_complex.contains("concat=n=2:v=1:a=0"),
+            graph.filter_complex.contains("concat=n=2:v=1:a=1"),
             "{}",
             graph.filter_complex
         );
@@ -507,6 +672,11 @@ mod tests {
             "the outgoing picture must hold its last frame: {filter}"
         );
         // Its frame count is the fade's duration: 0.5s at 30fps.
+        // Inside the window both clips sound: the outgoing gain ramps 1 -> 0
+        // while the incoming ramps 0 -> 1, so neither sum nor normalisation
+        // may touch the levels.
+        assert!(filter.contains("amix=inputs=2:normalize=0"), "{filter}");
+        assert!(filter.contains("volume=eval=frame:volume='"), "{filter}");
         assert!(
             window.end_frame - window.start_frame == 15,
             "window should be 15 frames, got {}",
@@ -634,6 +804,57 @@ mod tests {
         let plan = plan_export(&timeline);
         let err = compile(&timeline, &plan, &GraphSettings::default()).unwrap_err();
         assert!(err.to_string().contains("burned"), "{err}");
+    }
+
+    #[test]
+    fn an_extra_audio_track_is_mixed_without_normalisation() {
+        let mut timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0)]);
+        let mut music = clip(1, 9, 0, 2_000_000, 0);
+        music.volume = 0.4;
+        timeline.tracks.push(Track {
+            id: 10,
+            kind: TrackKind::Audio,
+            clips: vec![music],
+        });
+        let plan = plan_export(&timeline);
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        let filter = &graph.filter_complex;
+        assert_eq!(graph.audio_label.as_deref(), Some("aout"));
+        assert!(filter.contains("amix=inputs=2:normalize=0"), "{filter}");
+        assert!(filter.contains("volume=0.4000"), "{filter}");
+        assert!(filter.contains("aresample=48000"), "{filter}");
+        let args = graph.args("out.mp4");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-map" && w[1] == "[aout]"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_timeline_gets_no_audio_track() {
+        // A picture-only source (no audio stream in the probe) must not gain
+        // an empty AAC track just because the graph has room for one.
+        let mut timeline = timeline(vec![clip(1, 3, 0, 2_000_000, 0)]);
+        let mut info = crate::media::MediaInfo {
+            uri: "file:///v.mp4".into(),
+            duration_us: 4_000_000,
+            ..crate::media::MediaInfo::default()
+        };
+        info.streams.push(crate::media::StreamInfo {
+            kind: crate::media::StreamKind::Video,
+            width: Some(640),
+            height: Some(360),
+            ..crate::media::StreamInfo::default()
+        });
+        timeline.media[0].info = Some(info);
+        let plan = plan_export(&timeline);
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        assert!(graph.audio_label.is_none());
+        assert!(!graph.filter_complex.contains("concat=n=1:v=1:a=1"));
     }
 
     // The planner already drops a layer whose scale is not positive, so the

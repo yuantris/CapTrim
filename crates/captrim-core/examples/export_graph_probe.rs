@@ -35,6 +35,21 @@ fn run(exe: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn run_stderr(exe: &Path, args: &[&str]) -> String {
+    let out = Command::new(exe)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", exe.display()));
+    assert!(
+        out.status.success(),
+        "{} {:?} failed:\n{}",
+        exe.display(),
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 fn base_timeline(a: &Path, b: &Path) -> Timeline {
     let mut timeline = Timeline {
         width: 540,
@@ -135,6 +150,71 @@ fn render_scene(
         "duration {duration} must match the plan"
     );
 
+    // Audio is part of the same render, so check the encoded track rather than
+    // the plan: 48k stereo, and audible inside the window we care about.
+    let planned_audio = plan.segments.iter().any(|s| !s.audio.is_empty());
+    if planned_audio {
+        let aprobe = run(
+            ffprobe,
+            &[
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate,channels",
+                "-of",
+                "default=nw=1",
+                dst.to_str().unwrap(),
+            ],
+        );
+        let (mut rate, mut channels) = (0u32, 0u32);
+        for line in aprobe.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k {
+                    "sample_rate" => rate = v.trim().parse().unwrap_or(0),
+                    "channels" => channels = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!((rate, channels), (48_000, 2), "audio must be 48k stereo");
+        let loud = run_stderr(
+            ffmpeg,
+            &[
+                "-v",
+                "info",
+                "-i",
+                dst.to_str().unwrap(),
+                "-af",
+                &format!(
+                    "atrim=start={}:end={},volumedetect",
+                    0.4 * planned_end_us as f64 / 1e6,
+                    0.4 * planned_end_us as f64 / 1e6 + 0.5
+                ),
+                "-f",
+                "null",
+                "-",
+            ],
+        );
+        let mean = loud
+            .lines()
+            .find_map(|line| line.split("mean_volume:").nth(1))
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_end_matches(" dB")
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            })
+            .unwrap_or(f64::NAN);
+        println!("audio window mean_volume: {mean:.1} dB");
+        assert!(
+            mean.is_finite() && mean > -45.0,
+            "the window must contain audible programme, not silence ({mean} dB)"
+        );
+    }
+
     for (t, suffix) in frames_to_grab {
         let out = work.join(format!("{name}-{suffix}.png"));
         run(
@@ -156,6 +236,37 @@ fn render_scene(
     }
 }
 
+fn window_mean_db(ffmpeg: &Path, file: &Path, start_s: f64, dur_s: f64) -> f64 {
+    let filter = format!(
+        "atrim=start={start_s:.3}:end={dur:.3},volumedetect",
+        dur = start_s + dur_s
+    );
+    let log = run_stderr(
+        ffmpeg,
+        &[
+            "-v",
+            "info",
+            "-i",
+            file.to_str().unwrap(),
+            "-af",
+            &filter,
+            "-f",
+            "null",
+            "-",
+        ],
+    );
+    log.lines()
+        .find_map(|line| line.split("mean_volume:").nth(1))
+        .and_then(|rest| {
+            rest.trim()
+                .trim_end_matches(" dB")
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .unwrap_or(f64::NAN)
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let bin = PathBuf::from(
@@ -175,10 +286,14 @@ fn main() {
         "ffprobe"
     });
 
-    // Two distinct sources so a wrong trim shows up as the wrong picture.
+    // Two distinct sources so a wrong trim shows up as the wrong picture, each
+    // with its own tone so a wrong audio range or a lost channel is audible.
     let a = work.join("graph-a.mp4");
     let b = work.join("graph-b.mp4");
-    for (dst, pattern) in [(&a, "testsrc2"), (&b, "smptebars")] {
+    for (dst, pattern, tone) in [
+        (&a, "testsrc2", "sine=frequency=440:sample_rate=48000"),
+        (&b, "smptebars", "sine=frequency=880:sample_rate=48000"),
+    ] {
         let src = format!("{pattern}=size=640x360:rate=30:duration=4");
         run(
             &ffmpeg,
@@ -189,10 +304,17 @@ fn main() {
                 "lavfi",
                 "-i",
                 &src,
+                "-f",
+                "lavfi",
+                "-i",
+                tone,
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
                 "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
                 "-y",
                 dst.to_str().unwrap(),
             ],
@@ -245,6 +367,9 @@ fn main() {
     });
     let mut pip = Clip::new(2, 0, 4_000_000, 0);
     pip.id = 6;
+    // Silent: the PiP stands in for a sticker-like insert. Its own audio would
+    // sum with the main track and hide the crossfade we are measuring.
+    pip.volume = 0.0;
     pip.transform = Transform {
         scale: 0.25,
         dx: 0.30,
@@ -266,4 +391,22 @@ fn main() {
     );
 
     println!("\nOK");
+
+    // The dissolve window is 2.0 -> 2.5s. Two uncorrelated tones at
+    // complementary gains sum to sqrt((1-u)^2 + u^2), which dips by ~2 dB in
+    // the middle of the window. A hard cut (one source only) would stay flat,
+    // so this is the real proof that both clips sound through the seam.
+    let scene2_file = work.join("scene2.mp4");
+    let edge = window_mean_db(&ffmpeg, &scene2_file, 2.03, 0.08).min(window_mean_db(
+        &ffmpeg,
+        &scene2_file,
+        2.42,
+        0.08,
+    ));
+    let mid = window_mean_db(&ffmpeg, &scene2_file, 2.22, 0.06);
+    println!("crossfade window: edges {edge:.1} dB, middle {mid:.1} dB");
+    assert!(
+        mid.is_finite() && edge.is_finite() && mid < edge - 1.0,
+        "the window must mix both sources (edges {edge}, middle {mid})"
+    );
 }
