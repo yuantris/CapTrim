@@ -8,8 +8,9 @@
 //!
 //! Scope of the first slice, deliberately narrow and honest:
 //!
-//! * one picture layer per segment (no `overlay` stacking yet),
-//! * identity `Transform` (fit + pad only; scale/rotation/offset come next),
+//! * one picture layer per segment (no `overlay` stacking of clips yet),
+//! * identity or single-layer `Transform` (fit, scale, rotate, offset all
+//!   translated; multi-layer z-order comes next),
 //! * constant opacity (a dissolve segment is refused, not silently flattened),
 //! * audio is not compiled yet (the audio mixer is the next step).
 //!
@@ -120,10 +121,17 @@ pub fn compile(
             )));
         }
         let layer = &segment.video[0];
-        if layer.transform != Transform::default() {
+        let transform = &layer.transform;
+        if !transform.scale.is_finite() || transform.scale <= 0.0 {
             return Err(Error::InvalidArgument(format!(
-                "segment {} uses a non-identity transform; scale/rotation/offset are not compiled yet",
-                segment.index
+                "segment {} has scale {}; it must be a positive number",
+                segment.index, transform.scale
+            )));
+        }
+        if !transform.rotation_deg.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "segment {} has rotation {}",
+                segment.index, transform.rotation_deg
             )));
         }
 
@@ -146,16 +154,64 @@ pub fn compile(
             chain.push(',');
             chain.push_str(&effects);
         }
-        // Same geometry as the preview: fit inside the canvas, letterbox the
-        // rest. Scale/rotation are refused above, so this is the whole story.
+        if *transform == Transform::default() {
+            // Same geometry as the preview: fit inside the canvas, letterbox
+            // the rest. The identity transform is the common case, and this
+            // chain needs no overlay, so keep it exact and cheap.
+            chain.push_str(&format!(
+                ",scale={w}:{h}:force_original_aspect_ratio=decrease,\
+                 pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[seg{i}]",
+                w = timeline.width,
+                h = timeline.height,
+                i = segment.index
+            ));
+            chains.push(chain);
+            continue;
+        }
+
+        // Geometry contract (model::Transform docs, and the GL compositor):
+        // fit -> scale -> rotate -> translate, translation in canvas units.
+        //
+        // `scale=W*scale:H*scale:decrease` reproduces fit*scale without knowing
+        // the source size, because the filter fits the input into that box.
+        // Rotation then grows the box to the rotated extent (the preview draws
+        // the rotated quad, corners and all), and `overlay` places that box's
+        // centre at the canvas centre plus (dx, dy), cropping whatever leaves
+        // the canvas exactly as the viewport does.
+        let scale = transform.scale as f64;
+        let box_w = ceil_px(timeline.width as f64 * scale);
+        let box_h = ceil_px(timeline.height as f64 * scale);
         chain.push_str(&format!(
-            ",scale={w}:{h}:force_original_aspect_ratio=decrease,\
-             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1[seg{i}]",
+            ",scale={box_w}:{box_h}:force_original_aspect_ratio=decrease,setsar=1,format=rgba"
+        ));
+        let radians = transform.rotation_deg as f64 * std::f64::consts::PI / 180.0;
+        if transform.rotation_deg != 0.0 {
+            chain.push_str(&format!(
+                ",rotate={radians}:ow='abs(iw*cos({r}))+abs(ih*sin({r}))':\
+                 oh='abs(iw*sin({r}))+abs(ih*cos({r}))':c=none",
+                r = radians
+            ));
+        }
+        let i = segment.index;
+        let frames = (segment.end_frame - segment.start_frame).max(1);
+        chain.push_str(&format!("[lay{i}]"));
+        chains.push(chain);
+        // The backdrop is cut to the segment's exact frame count: an endless
+        // `color` plus `shortest=1` ends one frame early, which shaves a frame
+        // off the joined picture and desyncs audio later on.
+        chains.push(format!(
+            "color=black:s={w}x{h}:r={rate},trim=end_frame={frames}[bg{i}]",
             w = timeline.width,
             h = timeline.height,
-            i = segment.index
+            rate = rate_string(&timeline.frame_rate),
         ));
-        chains.push(chain);
+        chains.push(format!(
+            "[bg{i}][lay{i}]overlay=x='(main_w-overlay_w)/2+({dx})*main_w':\
+             y='(main_h-overlay_h)/2+({dy})*main_h':format=auto[ov{i}]",
+            dx = transform.dx,
+            dy = transform.dy,
+        ));
+        chains.push(format!("[ov{i}]format=yuv420p[seg{i}]"));
     }
 
     let mut filter = String::new();
@@ -193,6 +249,25 @@ pub fn compile(
 
 fn seconds(us: i64) -> String {
     format!("{:.6}", us as f64 / 1_000_000.0)
+}
+
+/// Even pixel size for a `scale` target: odd sizes break 4:2:0 chroma.
+fn ceil_px(size: f64) -> u32 {
+    let rounded = size.ceil() as u32;
+    if rounded.is_multiple_of(2) {
+        rounded
+    } else {
+        rounded + 1
+    }
+}
+
+/// `30` or `30000/1001`, the form `color=`/`fps=` accept.
+fn rate_string(rate: &Rational) -> String {
+    if rate.den == 1 {
+        rate.num.to_string()
+    } else {
+        format!("{}/{}", rate.num, rate.den)
+    }
 }
 
 /// `setpts` for a clip's speed: timeline time = source time / speed, so the
@@ -330,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn non_identity_transform_is_refused_until_geometry_lands() {
+    fn scale_places_a_fitted_layer_inside_a_scaled_canvas() {
         let mut clip = clip(1, 3, 0, 2_000_000, 0);
         clip.transform = Transform {
             scale: 0.5,
@@ -338,7 +413,61 @@ mod tests {
         };
         let timeline = timeline(vec![clip]);
         let plan = plan_export(&timeline);
-        let err = compile(&timeline, &plan, &GraphSettings::default()).unwrap_err();
-        assert!(err.to_string().contains("transform"), "{err}");
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        let filter = &graph.filter_complex;
+        // fit(540x960) * 0.5 == fit into 270x480, so the filter does the work
+        // and the compiler never needs the source size.
+        assert!(
+            filter.contains("scale=270:480:force_original_aspect_ratio=decrease"),
+            "{filter}"
+        );
+        assert!(filter.contains("color=black:s=540x960:r=30"), "{filter}");
+        assert!(
+            filter.contains("overlay=x='(main_w-overlay_w)/2+(0)*main_w'"),
+            "{filter}"
+        );
     }
+
+    #[test]
+    fn rotation_is_clockwise_and_keeps_the_whole_quad() {
+        let mut clip = clip(1, 3, 0, 2_000_000, 0);
+        clip.transform = Transform {
+            rotation_deg: 30.0,
+            ..Transform::default()
+        };
+        let timeline = timeline(vec![clip]);
+        let plan = plan_export(&timeline);
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        let filter = &graph.filter_complex;
+        let radians = 30.0_f64 * std::f64::consts::PI / 180.0;
+        assert!(filter.contains(&format!("rotate={radians}:")), "{filter}");
+        assert!(
+            filter.contains("ow='abs(iw*cos(") && filter.contains("oh='abs(iw*sin("),
+            "rotation must grow the box to the rotated extent: {filter}"
+        );
+        assert!(
+            filter.contains(":c=none"),
+            "rotated corners stay transparent: {filter}"
+        );
+    }
+
+    #[test]
+    fn offset_is_canvas_normalised_with_down_positive() {
+        let mut clip = clip(1, 3, 0, 2_000_000, 0);
+        clip.transform = Transform {
+            dx: 0.25,
+            dy: -0.1,
+            ..Transform::default()
+        };
+        let timeline = timeline(vec![clip]);
+        let plan = plan_export(&timeline);
+        let graph = compile(&timeline, &plan, &GraphSettings::default()).unwrap();
+        let filter = &graph.filter_complex;
+        assert!(filter.contains("+(0.25)*main_w"), "{filter}");
+        assert!(filter.contains("+(-0.1)*main_h"), "{filter}");
+    }
+
+    // The planner already drops a layer whose scale is not positive, so the
+    // guard in `compile` is defence in depth for hand-built plans and has no
+    // timeline-level test.
 }

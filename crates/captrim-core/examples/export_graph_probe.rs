@@ -8,7 +8,7 @@
 //! does not depend on any sample media.
 
 use captrim_core::export::plan_export;
-use captrim_core::model::{Clip, MediaSource, Timeline, Track, TrackKind};
+use captrim_core::model::{Clip, MediaSource, Timeline, Track, TrackKind, Transform};
 use captrim_core::time::Rational;
 use captrim_core::{compile_export_graph, GraphSettings};
 use std::path::{Path, PathBuf};
@@ -94,10 +94,20 @@ fn main() {
     fast.speed = Rational::new(2, 1).unwrap();
     let mut first = Clip::new(1, 0, 2_000_000, 0);
     first.id = 3;
+    // Third segment exercises the geometry path: half size, turned 30 degrees
+    // clockwise and nudged right/up, all in canvas units.
+    let mut spun = Clip::new(1, 0, 2_000_000, 3_000_000);
+    spun.id = 5;
+    spun.transform = Transform {
+        scale: 0.5,
+        dx: 0.15,
+        dy: -0.10,
+        rotation_deg: 30.0,
+    };
     timeline.tracks.push(Track {
         id: 2,
         kind: TrackKind::MainVideo,
-        clips: vec![first, fast],
+        clips: vec![first, fast, spun],
     });
 
     let plan = plan_export(&timeline);
@@ -174,8 +184,13 @@ fn main() {
     );
 
     // Frames from each segment, for the eye: segment 0 is testsrc2 at 0.5s,
-    // segment 1 is smptebars at 2.5s (its 2x source window).
-    for (t, name) in [("0.5", "graph-frame-a.png"), ("2.5", "graph-frame-b.png")] {
+    // segment 1 is smptebars at 2.5s (its 2x source window), segment 2 is the
+    // transformed testsrc2 at 4.0s.
+    for (t, name) in [
+        ("0.5", "graph-frame-a.png"),
+        ("2.5", "graph-frame-b.png"),
+        ("4.0", "graph-frame-c.png"),
+    ] {
         let out = work.join(name);
         run(
             &ffmpeg,
