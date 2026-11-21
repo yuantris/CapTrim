@@ -897,10 +897,23 @@ mod tests {
         )
         .unwrap();
         let args = graph.args("out.mp4");
-        assert!(args.windows(2).any(|w| w[0] == "-crf" && w[1] == "23"), "{args:?}");
-        assert!(args.windows(2).any(|w| w[0] == "-preset" && w[1] == "medium"), "{args:?}");
-        assert!(args.windows(2).any(|w| w[0] == "-b:a" && w[1] == "128k"), "{args:?}");
-        assert!(args.windows(2).any(|w| w[0] == "-t"), "exact duration: {args:?}");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-crf" && w[1] == "23"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-preset" && w[1] == "medium"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-b:a" && w[1] == "128k"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "-t"),
+            "exact duration: {args:?}"
+        );
 
         let hardware = compile(
             &timeline,
@@ -912,7 +925,10 @@ mod tests {
         )
         .unwrap();
         let args = hardware.args("out.mp4");
-        assert!(!args.iter().any(|a| a == "-crf"), "hardware encoder: {args:?}");
+        assert!(
+            !args.iter().any(|a| a == "-crf"),
+            "hardware encoder: {args:?}"
+        );
     }
 
     // The planner already drops a layer whose scale is not positive, so the
